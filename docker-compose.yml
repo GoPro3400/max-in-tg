@@ -1,0 +1,24 @@
+services:
+  max-in-tg:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./tmp:/app/tmp
+      - ./logs:/app/logs
+    shm_size: 1gb
+    # This is the file the installer runs, so the everyday deployment needs
+    # these two here and not only in docker-compose.prod.yml.
+    # Chromium's renderer grows over hours; without a ceiling it takes the
+    # whole host down instead of just restarting itself.
+    mem_limit: 2048m
+    # Docker keeps container logs forever by default. This bridge is chatty and
+    # long-lived, so an unbounded json-file log eventually fills the disk —
+    # which on a small VPS takes the bridge with it.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'

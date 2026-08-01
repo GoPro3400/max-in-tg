@@ -1,0 +1,86 @@
+name: Баг / Bug report
+description: Что-то работает не так — мост молчит, сообщение не дошло, медиа потерялось
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Пиши по-русски или по-английски — оба варианта нормально. / Russian or English, both fine.
+
+        ⚠️ **Никогда не выкладывай сюда токен бота, QR-код входа в MAX и неотредактированные
+        файлы `/diagnostics`** — скриншот диагностики показывает открытую переписку как есть.
+        Логи перед вставкой просмотри глазами: в них встречаются названия чатов.
+
+        Нашёл уязвимость? Не открывай issue — [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Что происходит
+      description: Что ты сделал, что ожидал и что получил вместо этого.
+      placeholder: |
+        Отправил фото в тему «Иван Петров» — бот ответил «Failed to send to MAX»,
+        в самом MAX сообщение не появилось.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия
+      description: "Вывод `git rev-parse --short HEAD` в каталоге проекта."
+      placeholder: f347381
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Вывод /status и /check
+      description: Отправь боту обе команды и вставь ответы сюда. Это первое, что отвечает на половину вопросов.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи
+      description: |
+        `docker compose logs --tail=50` из каталога проекта.
+        **Убери токен бота**, если он попал в вывод.
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: relay
+    attributes:
+      label: Группа-релей
+      description: В `/status` видно, подключена ли она.
+      options:
+        - Приватная супергруппа с включёнными Темами, бот админ
+        - Группа есть, но Темы выключены или бот не админ
+        - Группы нет — работаю через личный чат с ботом
+        - Не знаю
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Окружение
+      description: ОС сервера, архитектура, как запущено.
+      placeholder: "Debian 12, amd64, docker compose (обычный docker-compose.yml), 2 ГБ RAM"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Проверил перед отправкой
+      options:
+        - label: В тексте issue нет токена бота, QR-кода и чужой переписки
+          required: true
+        - label: Контейнер перезапускался по cron раз в 2 часа (см. SETUP_GUIDE §11.1) или проблема воспроизводится сразу после рестарта
+          required: false

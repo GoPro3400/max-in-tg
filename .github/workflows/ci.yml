@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Tests never launch a browser; skip the Chromium download to keep installs fast.
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # `npm ci`, not `npm install`: it installs exactly what package-lock.json
+      # pins and fails loudly if the lockfile has drifted from package.json.
+      # The Docker build uses `npm ci` too, so a PR that passes here cannot
+      # break the image for a lockfile reason.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Syntax check
+        run: |
+          for f in $(find src tests -name '*.js'); do
+            node --check "$f"
+          done
+
+      - name: Run tests
+        run: npm test

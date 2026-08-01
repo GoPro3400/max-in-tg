@@ -1,0 +1,70 @@
+FROM node:20-bookworm-slim
+
+ENV NODE_ENV=production
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+WORKDIR /app
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    chromium \
+    g++ \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnss3 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    make \
+    python3 \
+    xdg-utils \
+    xvfb \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY package*.json ./
+# npm ci = reproducible install pinned by package-lock.json (fails loudly if
+# the lockfile and package.json ever drift apart).
+RUN npm ci --omit=dev
+
+COPY . .
+RUN groupadd --system --gid 10001 app \
+  && useradd --system --uid 10001 --gid app --home-dir /app app \
+  && mkdir -p /app/data /app/tmp/media /app/logs \
+  && chown -R app:app /app
+
+USER app
+
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV XDG_CONFIG_HOME=/app/data/.config
+ENV XDG_CACHE_HOME=/app/data/.cache
+
+# Liveness only — deliberately not a claim about the bridge being healthy.
+#
+# The bridge serves no HTTP port and writes no heartbeat, so there is no
+# in-band signal to probe without changing the app. What this checks:
+#   1. PID 1 is still the Node process (start.sh execs node, so PID 1 is node
+#      itself; a shell left behind after node died would not match).
+#   2. The SQLite file is there, i.e. storage opened at boot and the data
+#      volume is really mounted — the most common broken-deploy shape, and the
+#      one that otherwise only shows up as silently lost history.
+# What it deliberately does NOT check: that polling is still progressing. A
+# wedged bridge (e.g. a stalled browser lock) keeps its event loop and its
+# database file, so it will still report healthy here. Use /status or /check in
+# Telegram for that. Do not tighten this into an mtime freshness test: an idle
+# bridge legitimately writes nothing for hours, and false "unhealthy" restarts
+# would be worse than no signal at all.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=3 \
+  CMD grep -qa node /proc/1/cmdline && [ -f "${SQLITE_PATH:-./data/max-in-tg.sqlite}" ]
+
+# Runs MAX under a virtual X display (Xvfb) — see scripts/start.sh. Requires
+# MAX_HEADLESS=false so Chromium launches against the display.
+CMD ["sh", "scripts/start.sh"]

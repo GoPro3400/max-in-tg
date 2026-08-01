@@ -1,0 +1,34 @@
+node_modules/
+.cache/
+npm-debug.log*
+.claude/
+
+# Runtime state. The defaults are data/ tmp/ logs/, but .env.example lets every
+# one of those paths be repointed, so the patterns below catch the contents
+# wherever they end up. This is not build output: it is a live MAX session, a
+# database of real conversations, and page dumps of them.
+data/
+tmp/
+logs/
+chrome-profile/
+diagnostics/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Secrets. Plain `.env` matched that exact name only, so a stray .env.local or
+# a hand-made backup was committable.
+.env*
+*.env
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+cookies.json
+
+# Editor and rescue copies — a common way for a real .env to reach a commit.
+*.bak
+*.orig
+*~

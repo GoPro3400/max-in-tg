@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Уязвимость в безопасности / Security vulnerability
+    url: https://github.com/GoPro3400/max-in-tg/security/advisories/new
+    about: Не открывай публичный issue — сообщи приватно. Подробности в SECURITY.md.
+  - name: Инструкция по настройке / Setup guide
+    url: https://github.com/GoPro3400/max-in-tg/blob/main/docs/SETUP_GUIDE.md
+    about: Разделы «Частые ошибки» и «Полезные команды Docker» закрывают большинство вопросов установки.

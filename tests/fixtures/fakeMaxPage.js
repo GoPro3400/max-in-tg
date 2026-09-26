@@ -113,7 +113,10 @@ window.renderChats = function renderChats() {
     + '<span class="text">' + (c.typing ? '<span class="typing"><span class="text"></span> <span class="lottie"></span> ' + esc(c.typing) + '</span>' : esc(c.preview || '')) + '</span>'
     + '</button></div>').join('');
   list.querySelectorAll('.item').forEach((item) => item.querySelector('button').addEventListener('click', () => {
-    window.__active = window.__chats[Number(item.getAttribute('data-index'))].title;
+    const opened = window.__chats[Number(item.getAttribute('data-index'))];
+    window.__active = opened.title;
+    // Like MAX: the address names the open chat (/<id>).
+    if (opened.maxId) history.pushState({}, '', '/web.max.ru/' + opened.maxId);
     document.getElementById('main-header-title').textContent = 'Окно чата с ' + window.__active;
     document.querySelector('main .header .title').textContent = window.__active;
     window.renderMessages();

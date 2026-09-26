@@ -104,6 +104,8 @@ const REACTION_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
 const TYPING_SCAN_INTERVAL_MS = 1500;
 const TYPING_REPEAT_MS = 4000;
 
+const PLACEHOLDER_CHAT_TITLES = new Set(['Чат не найден', 'Chat not found']);
+
 // The reaction the bot shows in Telegram for a MAX message: the most used one
 // OTHER people put on it (MAX lists chips most used first; a chip marked as
 // ours counts one less) that a bot is allowed to set. null for none.
@@ -1034,8 +1036,15 @@ export class BridgeService {
         // A successful read means the chat is reachable again (e.g. it scrolled
         // back into the virtualized list) — stop excluding it from round-robin.
         this.chronicallyUnreachableChatIds.delete(chat.id);
-        const backlog = this.historyBacklog(chat, messages);
-        const adoptUpTo = this.legacyAdoptionEnd(messages, firstTimedRead);
+        // A renamed chat carries on in its old topic, with its history.
+        const renamed = await this.noteMaxChatId(chat);
+        const adoptUpTo = this.legacyAdoptionEnd(messages, firstTimedRead || renamed);
+        // A renamed chat's history is on record under its old name: above the
+        // last bubble recognised from it everything is old (on record or not),
+        // below it new — no need to guess by the unread count.
+        const backlog = renamed && adoptUpTo >= 0
+          ? new Set(messages.slice(0, adoptUpTo + 1).map((message) => message.id))
+          : this.historyBacklog(chat, messages);
         let readThrough = true;
         for (const [index, message] of messages.entries()) {
           // Dedup by exact id only — see the isKnown note above. Collapsing a
@@ -1096,7 +1105,7 @@ export class BridgeService {
           }
           // Otherwise leave it unseen so the next poll retries it.
         }
-        if (firstTimedRead && readThrough && messages.length) this.db.setSetting(`timed_ids:${chat.id}`, '1');
+        if ((firstTimedRead || renamed) && readThrough && messages.length) this.db.setSetting(`timed_ids:${chat.id}`, '1');
         await this.syncReactionsFromMax(chat);
       }
       // If every reachable chat failed, this is a real problem (expired session,
@@ -1182,9 +1191,98 @@ export class BridgeService {
     return end;
   }
 
+  // The record of this bubble under an id it had before: its old id (without
+  // the time), or its id in this chat under its previous name (see
+  // noteMaxChatId).
   legacyRecordOf(message) {
     const legacyRawId = message.metadata?.legacyId;
-    return legacyRawId ? this.db.getMessage(stableId('max', message.chatId, legacyRawId)) : null;
+    const previousChatId = this.db.getSetting(`renamed_from:${message.chatId}`, '') || null;
+    const candidates = [
+      legacyRawId && [message.chatId, legacyRawId],
+      previousChatId && [previousChatId, message.sourceMessageId],
+      previousChatId && legacyRawId && [previousChatId, legacyRawId]
+    ].filter(Boolean);
+    for (const [chatId, rawId] of candidates) {
+      const record = this.db.getMessage(stableId('max', chatId, rawId));
+      if (record) return record;
+    }
+    return null;
+  }
+
+  // MAX gives every chat a numeric id (the page's address shows it), while
+  // chats here are known by their titles — so a renamed contact or group
+  // looked like a new chat: a new topic, and the old one left behind. A title
+  // that turns up with the id of a chat known under another title is that
+  // chat renamed: it carries on in the old topic, which takes the new name,
+  // and its messages keep their Telegram links. True when it was renamed.
+  async noteMaxChatId(chat) {
+    const maxId = this.maxClient.activeChatId === chat.id ? this.maxClient.activeMaxChatId : null;
+    if (!maxId) return false;
+    // What MAX shows for a chat it has not loaded is not a new name.
+    if (PLACEHOLDER_CHAT_TITLES.has(chat.title)) return false;
+    const key = `max_chat:${maxId}`;
+    const known = this.db.getSetting(key, '');
+    if (known === chat.id) return false;
+    this.db.setSetting(key, chat.id);
+    if (!known) return false;
+    return this.carryOnRenamedChat(known, chat);
+  }
+
+  async carryOnRenamedChat(oldChatId, chat) {
+    const oldMapping = this.db.getChatMapping(oldChatId);
+    logger.info({ from: oldChatId, to: chat.id, hasRoute: Boolean(oldMapping) }, 'MAX chat renamed');
+    // Its messages are looked up under the old name too (legacyRecordOf),
+    // and the next read adopts them.
+    this.db.setSetting(`renamed_from:${chat.id}`, oldChatId);
+    this.db.setSetting(`timed_ids:${chat.id}`, '');
+    if (this.mutedChatIds.has(oldChatId) && !this.mutedChatIds.has(chat.id)) {
+      this.db.setChatMuted(chat.id, true);
+      this.mutedChatIds.add(chat.id);
+    }
+    if (!oldMapping) return true;
+
+    const ownMapping = this.db.getChatMapping(chat.id);
+    const sameTopic = ownMapping && ownMapping.telegramChatId === oldMapping.telegramChatId
+      && ownMapping.telegramThreadId === oldMapping.telegramThreadId;
+    // The old name's route is retired first: one topic has one owner.
+    this.db.upsertChatMapping({
+      ...oldMapping,
+      enabled: false,
+      metadata: { ...oldMapping.metadata, mergedInto: chat.id, renamedTo: chat.id, renamedAt: Date.now() }
+    });
+    this.db.upsertChatMapping({
+      maxChatId: chat.id,
+      telegramChatId: oldMapping.telegramChatId,
+      telegramThreadId: oldMapping.telegramThreadId,
+      title: chat.title,
+      enabled: true,
+      metadata: {
+        ...oldMapping.metadata,
+        renamedFrom: oldChatId,
+        // A topic already made for the new name, now left unused.
+        abandonedThreadId: !sameTopic && ownMapping?.telegramThreadId ? ownMapping.telegramThreadId : undefined,
+        mergedInto: undefined,
+        renamedTo: undefined,
+        renamedAt: undefined
+      }
+    });
+
+    const title = this.mutedChatIds.has(chat.id) ? `🔇 ${chat.title}` : chat.title;
+    try {
+      await this.telegramBot.renameTopic(oldMapping.telegramThreadId, title);
+    } catch (error) {
+      logger.warn({ err: error?.message, threadId: oldMapping.telegramThreadId }, 'Failed to rename the topic of a renamed chat');
+    }
+    const route = { telegramChatId: oldMapping.telegramChatId, telegramThreadId: oldMapping.telegramThreadId };
+    await this.telegramBot.sendText(`✏️ В MAX этот чат теперь называется «${chat.title}» (раньше «${oldChatId}») — переписка продолжается здесь.`, route)
+      .catch((error) => logger.warn({ err: error?.message }, 'Failed to announce a renamed chat'));
+    if (!sameTopic && ownMapping?.telegramThreadId) {
+      await this.telegramBot.sendText(
+        `✏️ Это тот же чат MAX, что «${oldChatId}» (его переименовали) — переписка продолжается в его прежней теме, эта больше не нужна.`,
+        { telegramChatId: ownMapping.telegramChatId, telegramThreadId: ownMapping.telegramThreadId }
+      ).catch(() => null);
+    }
+    return true;
   }
 
   adoptLegacyId(message) {

@@ -154,6 +154,8 @@ export class MaxWebClient {
     this.page = null;
     this.activeChatId = null;
     this.activeChatTitle = null;
+    // The open chat's own id in MAX (see currentMaxChatId), when known.
+    this.activeMaxChatId = null;
     // The chat whose network traffic media captures are attributed to (set
     // when a chat is being opened, before it is verified — see selectChat).
     this.captureChatId = null;
@@ -626,8 +628,10 @@ export class MaxWebClient {
     // under the click) cannot leave activeChatId naming a chat that is not on
     // screen — readMessages/sendText skip re-selection when the ids match, and
     // would then read or type into whatever chat the page actually shows.
+    const maxIdBefore = await this.currentMaxChatId();
     this.activeChatId = null;
     this.activeChatTitle = null;
+    this.activeMaxChatId = null;
     this.captureChatId = chat.id;
 
     // Clicked inside the page: no ElementHandles, so nothing is pinned (see
@@ -662,6 +666,10 @@ export class MaxWebClient {
       this.selectors.activeChatTitle
     );
     await this.verifyActiveChat(chat);
+    // Its id in MAX — only once the address has changed with the switch, so
+    // it can never be the previous chat's.
+    const maxIdAfter = await this.currentMaxChatId();
+    this.activeMaxChatId = maxIdAfter && maxIdAfter !== maxIdBefore ? maxIdAfter : null;
 
     // Mark the chat active BEFORE the scroll below. Scrolling lazy-loads message
     // bubbles and triggers MAX to fetch their media (e.g. sticker Lottie); those
@@ -681,6 +689,19 @@ export class MaxWebClient {
 
     logger.debug({ chatId: chat.id, title: chat.title }, 'Selected Max chat');
     return chat;
+  }
+
+  // The open chat's own id in MAX: while a chat is open the page's address
+  // is /<id> (a number; negative for groups and channels) — the page carries
+  // no chat id anywhere else, and chats are otherwise known by their titles.
+  async currentMaxChatId() {
+    let pathname = '';
+    try {
+      pathname = await this.page.evaluate(() => location.pathname);
+    } catch {
+      return null;
+    }
+    return String(pathname || '').split('/').find((segment) => /^-?\d+$/.test(segment)) || null;
   }
 
   // Scrolls every scrollable message-list container to the bottom (newest
@@ -2595,6 +2616,7 @@ export class MaxWebClient {
     this.page = null;
     this.activeChatId = null;
     this.activeChatTitle = null;
+    this.activeMaxChatId = null;
     this.captureChatId = null;
     this.clearMediaCaches();
     if (!browser) return;
@@ -2646,6 +2668,7 @@ export class MaxWebClient {
     await this.ensurePage();
     this.activeChatId = null;
     this.activeChatTitle = null;
+    this.activeMaxChatId = null;
     this.captureChatId = null;
     this.clearMediaCaches();
     // A beforeunload prompt would block the reload forever.

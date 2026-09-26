@@ -185,14 +185,14 @@ export class TelegramBotAdapter {
     this.onReactionHandler = handler;
   }
 
-  // Sets the bot's reaction on a message (null clears it). Only emoji from
-  // Telegram's fixed list are accepted — see domain/reactions.js.
   // "typing…" (or "recording a voice message"…) in a chat's topic; Telegram
   // shows it for about 5 seconds.
   async sendChatAction(route, action = 'typing') {
     await this.bot.telegram.sendChatAction(route.telegramChatId, action, threadExtra(route));
   }
 
+  // Sets the bot's reaction on a message (null clears it). Only emoji from
+  // Telegram's fixed list are accepted — see domain/reactions.js.
   async setReaction(chatId, messageId, emoji) {
     await this.bot.telegram.setMessageReaction(chatId, messageId, emoji ? [{ type: 'emoji', emoji }] : []);
   }

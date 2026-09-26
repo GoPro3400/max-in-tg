@@ -23,6 +23,7 @@ const chrome = findChrome();
 const chats = () => ([
   {
     title: 'Bob',
+    maxId: '1001',
     messages: [
       { id: 'm1', time: '12:00', text: ['Привет ', { emoji: '😀' }], reactions: [{ emoji: '👍', count: 1 }] },
       { id: 'm2', time: '12:01', text: ['Огонь ', { animoji: '🔥' }] },
@@ -38,6 +39,7 @@ const chats = () => ([
   },
   {
     title: 'Group',
+    maxId: '-2002',
     messages: [
       { id: 'g1', time: '13:00', author: 'Анна', media: '/photo/p2.png?r=TOKEN2&fn=w_1280' },
       { id: 'g2', time: '13:01', author: 'Анна', text: ['Всем привет ', { emoji: '👋' }] },
@@ -252,6 +254,20 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     expect(at('14:05')).toMatchObject({ type: 'text', mediaUrl: null });
     // What cannot be carried over is named, not dropped (nor sent as "14:07").
     expect(at('14:07')).toMatchObject({ type: 'text', text: '📍 Геопозиция — открой в MAX' });
+    await openChat('Bob');
+  });
+
+  it('knows the open chat\'s own id in MAX from the address, never the previous chat\'s', async () => {
+    await openChat('Group');
+    expect(client.activeMaxChatId).toBe('-2002');
+    await openChat('Bob');
+    expect(client.activeMaxChatId).toBe('1001');
+    // Opened again without the address changing: not trusted.
+    await openChat('Bob');
+    expect(client.activeMaxChatId).toBeNull();
+    // A chat whose address says nothing.
+    await openChat('Files');
+    expect(client.activeMaxChatId).toBeNull();
     await openChat('Bob');
   });
 

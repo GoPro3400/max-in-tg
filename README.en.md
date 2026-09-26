@@ -389,11 +389,11 @@ topics for every current chat.
 | 2 | **Stickers** | Network intercept of the Lottie/sticker asset, then a canvas screenshot; if neither works the message arrives as the text `[Стикер]` |
 | 3 | **Chromium memory** | The leak that grew the renderer to ~2 GB in ~3 hours is fixed. As a safety net the bridge reloads the MAX tab above 900 MB and relaunches Chromium above 1300 MB or every 6 hours, between poll cycles (`MAX_PAGE_RELOAD_MEMORY_MB`, `MAX_BROWSER_MEMORY_LIMIT_MB`, `MAX_BROWSER_RECYCLE_MINUTES`); the Telegram bot stays online and no cron job is needed — [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
 | 4 | **At-least-once** | Possible duplicates if process crashes between send and SQLite write |
-| 5 | **Chat identity** | By title/index — same-named chats may be confused |
+| 5 | **Chat identity** | By title — same-named chats are confused (a warning is logged). A rename is recognised by MAX's own chat id — the chat stays in its topic |
 | 6 | **Single user** | Self-hosted for one Max account |
-| 7 | **No retry policy** | Failed deliveries are not automatically retried |
+| 7 | **Retries** | MAX→Telegram is retried on the next polls up to `MAX_DELIVERY_ATTEMPTS` (no backoff); Telegram→MAX with the "🔁 Повторить" button under the notice |
 | 8 | **Media reply matching accuracy** | Best-effort: photos match by dHash (most reliable), other types only when a CDN token for the original is available; messages forwarded before this update have no hash and won't be matched retroactively; if matching isn't confident, no quote is attached |
-| 9 | **Telegram→MAX replies** | Works for replies to text and media MAX originals, and to your own previously Telegram-sent text messages; replies to your own non-text messages (photos etc.) aren't resolved yet. Always best-effort: if the bot can't locate the target bubble in MAX Web, the message is sent without a quote rather than failing |
+| 9 | **Telegram→MAX replies** | Works for replies to text and media MAX originals, and to your own messages sent from Telegram (text, photos, files). Always best-effort: if the bot can't locate the target bubble in MAX Web, the message is sent without a quote rather than failing |
 | 10 | **Reactions** | A Telegram bot can set only one reaction, from Telegram's list — the most used one (or its nearest stand-in) is shown. Reactions work on messages that are on screen in MAX Web; the reaction markup is taken from MAX Web's own code — if it changes, see `/diagnostics` and the reaction `MAX_SELECTORS_*` |
 
 ---
@@ -404,12 +404,12 @@ topics for every current chat.
 
 - [ ] **`/new <phone|name>`** — start a new Max chat from Telegram with candidate confirmation
 - [ ] **Extended contact card** — avatar, phone, username, metadata
-- [ ] **Chat fingerprint** — stronger identification (avatar hash instead of title)
+- [ ] **MAX chat ids instead of titles** — tell same-named chats apart (renames are already recognised by the id in the page's address)
 
 ### P2 (After P1)
 
-- [ ] Retry policy for failed deliveries
-- [ ] Integration Puppeteer fixture tests (selector checks against a mock DOM)
+- [x] ~~Retry policy for failed deliveries~~ — MAX→Telegram retries and the "🔁 Повторить" button
+- [x] ~~Integration Puppeteer fixture tests~~ — `tests/browser`
 - [ ] Admin/status Mini App
 
 > Full roadmap: **[docs/ROADMAP.md](docs/ROADMAP.md)**

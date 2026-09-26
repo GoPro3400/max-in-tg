@@ -28,19 +28,31 @@ const bridge = new BridgeService({
 });
 
 let stopping = false;
-const shutdown = async (signal) => {
+const shutdown = async (signal, exitCode = 0) => {
   if (stopping) return;
   stopping = true;
   logger.info({ signal }, 'Shutting down');
-  const forceExit = setTimeout(() => process.exit(1), 10000);
+  // bridge.stop() may spend up to 8 s draining in-flight browser work and up
+  // to 15 s closing Chromium; the compose files give the container 30 s.
+  const forceExit = setTimeout(() => process.exit(exitCode || 1), 25000);
   try {
     await bridge.stop(signal);
   } catch (error) {
     logger.error({ err: error }, 'Shutdown failed');
   }
   clearTimeout(forceExit);
-  process.exit(0);
+  process.exit(exitCode);
 };
+
+// Failures the process cannot recover from by itself end it with a non-zero
+// code, so the container's restart policy brings up a fresh one instead of
+// leaving a live-looking process that no longer bridges anything.
+const fatal = (reason) => (error) => {
+  logger.fatal({ err: error, reason }, 'Unrecoverable failure — exiting so the container is restarted');
+  shutdown(reason, 1);
+};
+bridge.onFatal = fatal('max-browser-launch');
+telegramBot.onFatal(fatal('telegram-polling-stopped'));
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -48,11 +60,15 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('unhandledRejection', (error) => {
   logger.error({ err: error }, 'Unhandled promise rejection');
 });
+process.on('uncaughtException', fatal('uncaught-exception'));
 
 try {
   await bridge.start();
 } catch (error) {
-  logger.error({ err: error }, 'Startup failed');
-  await bridge.stop('startup-error').catch(() => {});
-  process.exit(1);
+  // A SIGTERM during startup (e.g. while waiting for /pair or the QR scan)
+  // makes start() fail too; the shutdown already under way owns the exit.
+  if (!stopping) {
+    logger.error({ err: error }, 'Startup failed');
+    await shutdown('startup-error', 1);
+  }
 }

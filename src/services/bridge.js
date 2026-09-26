@@ -63,6 +63,8 @@ const ECHO_GUARD_WINDOW_MS = 20000;
 // While waiting to be signed in, remind the owner at most this often — the QR
 // photo itself is updated silently in place.
 const LOGIN_REMINDER_INTERVAL_MS = 30 * 60 * 1000;
+// Failed browser relaunches in a row after which the process gives up.
+const MAX_CONSECUTIVE_LAUNCH_FAILURES = 3;
 // Consecutive failed QR captures (each ~LOGIN_POLL_INTERVAL_MS apart) after
 // which the page is taken for dead — e.g. a crashed renderer, which leaves the
 // browser connected — and the browser is relaunched.
@@ -89,6 +91,15 @@ const echoKey = (text) => String(text ?? '').replace(/\s+/g, '');
 // deleted or turned into another chat) — not a temporary restriction.
 const isChatGoneError = (reason) => /kicked|not a member|chat not found|group chat was (deleted|upgraded)|CHANNEL_PRIVATE/i
   .test(String(reason || ''));
+
+// The number on MAX's unread badge for a chat ("3", "99+"), 1 for a badge
+// without a number, 0 without a badge.
+const unreadCount = (chat) => {
+  const digits = String(chat?.metadata?.unreadText || '').replace(/\D+/g, '');
+  const count = Number.parseInt(digits, 10);
+  if (Number.isFinite(count) && count > 0) return count;
+  return chat?.metadata?.unread ? 1 : 0;
+};
 
 // Seconds Telegram asked us to wait (429 Too Many Requests), or 0.
 export const telegramRetryAfter = (error) => {
@@ -178,6 +189,11 @@ export class BridgeService {
     this.telegramPausedUntil = 0;
     // A transient createForumTopic failure: no new topic before this time.
     this.topicCreationRetryAt = 0;
+    // Browser relaunches that failed in a row (see relaunchMaxClient), and
+    // what to call when the bridge cannot recover by itself (index.js exits
+    // so Docker restarts the container).
+    this.consecutiveLaunchFailures = 0;
+    this.onFatal = null;
   }
 
   async start() {
@@ -353,7 +369,21 @@ export class BridgeService {
   // maxLock: both halves drive the page.
   async relaunchMaxClient() {
     await this.maxClient.stop().catch(() => null);
-    await this.startMaxClient();
+    try {
+      await this.startMaxClient();
+      this.consecutiveLaunchFailures = 0;
+    } catch (error) {
+      // A browser that cannot be launched at all (e.g. the X display is gone)
+      // is not fixed by trying again every poll forever — the process stays
+      // up, the healthcheck green, and nothing is delivered. After a few
+      // attempts, let the supervisor restart the whole container.
+      this.consecutiveLaunchFailures += 1;
+      if (this.consecutiveLaunchFailures >= MAX_CONSECUTIVE_LAUNCH_FAILURES) {
+        logger.fatal({ err: error, attempts: this.consecutiveLaunchFailures }, 'MAX browser cannot be launched — giving up so the container is restarted');
+        this.onFatal?.(error);
+      }
+      throw error;
+    }
     // The new page has no chat list yet: re-read it on the next poll.
     this.lastChatRefreshAt = 0;
   }
@@ -854,6 +884,7 @@ export class BridgeService {
         // A successful read means the chat is reachable again (e.g. it scrolled
         // back into the virtualized list) — stop excluding it from round-robin.
         this.chronicallyUnreachableChatIds.delete(chat.id);
+        const backlog = this.historyBacklog(chat, messages);
         for (const message of messages) {
           // Dedup by exact id only — see the isKnown note above. Collapsing a
           // "#vN" id onto its base id would drop a genuine second media message
@@ -865,6 +896,10 @@ export class BridgeService {
           // Stop at the first message that cannot go out while Telegram's
           // flood control lasts, so the rest of the chat keeps its order.
           if (this.telegramPaused()) break;
+          if (backlog.has(message.id)) {
+            this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
+            continue;
+          }
           // Grace for lazily-rendered reply quotes. The .link container and the
           // quoted author render synchronously with the bubble, but a quoted
           // media thumbnail's URL loads ~seconds later. So forward plain messages
@@ -942,6 +977,21 @@ export class BridgeService {
         await this.ensureMaxLogin({ reason: 'session-expired' });
       }
     }
+  }
+
+  // Old history MAX shows in a chat the database knows nothing about, on a
+  // bridge that has run before: the chat is new, or it was renamed in MAX
+  // (chat ids are titles, so every bubble gets a new id), or it was scrolled
+  // out of view when the first run primed history. All of it looked new and
+  // was forwarded at once — dozens of old messages, for a renamed contact
+  // into a freshly created duplicate topic. Only the newest are new to the
+  // owner: as many as MAX's unread badge counts, and at least one.
+  historyBacklog(chat, messages) {
+    if (!this.config.startupPrimeExistingMessages) return new Set();
+    if (this.db.hasMessagesInChat(chat.id)) return new Set();
+    const unknown = messages.filter((message) => !this.db.hasMessage(message.id));
+    const fresh = Math.max(1, unreadCount(chat));
+    return new Set(unknown.slice(0, Math.max(0, unknown.length - fresh)).map((message) => message.id));
   }
 
   async primeExistingMaxMessages(chats = []) {

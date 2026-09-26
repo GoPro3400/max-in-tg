@@ -96,23 +96,41 @@ describe('/pair ownership claim', () => {
     expect(makeAdapter().adapter.startPairing()).not.toBe(code);
   });
 
-  it('rotates the code after repeated wrong attempts instead of allowing endless guesses', async () => {
+  it('locks out a user after repeated wrong attempts, without letting them lock out anyone else', async () => {
+    // The code used to be ROTATED after 5 wrong attempts from anyone: a
+    // stranger hammering /pair kept changing it faster than the operator
+    // could copy it out of the logs. With 64 random bits guessing is hopeless
+    // anyway, so only the guesser is slowed down.
     const { adapter, api } = makeAdapter();
     const code = adapter.startPairing();
 
     for (let attempt = 0; attempt < 5; attempt++) {
-      await adapter.bot.handleUpdate(commandUpdate('/pair wrong-guess', { chatId: OWNER_ID, fromId: OWNER_ID }));
+      await adapter.bot.handleUpdate(commandUpdate('/pair wrong-guess', { chatId: STRANGER_ID, fromId: STRANGER_ID }));
     }
+    // Locked out: even the right code is not accepted from this account now.
+    await adapter.bot.handleUpdate(commandUpdate(`/pair ${code}`, { chatId: STRANGER_ID, fromId: STRANGER_ID }));
+    expect(adapter.config.ownerId).toBeNull();
+    expect(adapter.pairingCode).toBe(code);
 
-    expect(adapter.config.ownerId).toBeNull();
-    expect(adapter.pairingCode).not.toBe(code);
-    // The old code is dead: a guesser who eventually lands on it gets nothing.
+    // The real operator is unaffected.
     await adapter.bot.handleUpdate(commandUpdate(`/pair ${code}`, { chatId: OWNER_ID, fromId: OWNER_ID }));
-    expect(adapter.config.ownerId).toBeNull();
-    // ...while the freshly issued one still works for the real operator.
-    await adapter.bot.handleUpdate(commandUpdate(`/pair ${adapter.pairingCode}`, { chatId: OWNER_ID, fromId: OWNER_ID }));
     expect(adapter.config.ownerId).toBe(OWNER_ID);
     expect(api.sendMessage).toHaveBeenCalled();
+  });
+
+  it('adopts a group added before pairing only if the new owner added it', async () => {
+    const { adapter, api } = makeAdapter();
+    const code = adapter.startPairing();
+    api.getChat = vi.fn(async (chatId) => ({ id: chatId, type: 'supergroup', is_forum: true, title: 'g' }));
+    api.getChatMember = vi.fn(async () => ({ status: 'administrator' }));
+    Object.assign(adapter.bot.telegram, { getChat: api.getChat, getChatMember: api.getChatMember });
+
+    // The owner adds the bot to their group; a stranger then adds it to theirs.
+    await adapter.bot.handleUpdate(membershipUpdate({ chatId: RELAY_ID, fromId: OWNER_ID }));
+    await adapter.bot.handleUpdate(membershipUpdate({ chatId: OTHER_GROUP_ID, fromId: STRANGER_ID }));
+    await adapter.bot.handleUpdate(commandUpdate(`/pair ${code}`, { chatId: OWNER_ID, fromId: OWNER_ID }));
+
+    expect(adapter.config.relayChatId).toBe(RELAY_ID);
   });
 
   it('the right code binds the sender as owner and reports the identity', async () => {
@@ -357,5 +375,66 @@ describe('losing the relay group', () => {
     expect(lost).not.toHaveBeenCalled();
     expect(adapter.config.relayChatId).toBe(RELAY_ID);
     expect(identities).toEqual([]);
+  });
+});
+
+describe('outbound message order', () => {
+  const messageUpdate = (message) => ({
+    update_id: ++updateId,
+    message: {
+      message_id: 2000 + updateId,
+      date: 1700000000,
+      chat: { id: OWNER_ID, type: 'private' },
+      from: { id: OWNER_ID, is_bot: false, first_name: 'owner' },
+      ...message
+    }
+  });
+
+  it('delivers in the order sent even when an earlier photo is still downloading', async () => {
+    // Telegraf runs a whole getUpdates batch concurrently; the photo waits for
+    // its download, the text does not — it used to reach MAX first.
+    const { adapter } = makeAdapter({ ownerId: OWNER_ID });
+    adapter.mediaService = {
+      telegramFileToLocal: vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return '/tmp/photo.jpg';
+      })
+    };
+    const delivered = [];
+    adapter.onMessage(async (message) => { delivered.push(message.type); });
+
+    await Promise.all([
+      adapter.bot.handleUpdate(messageUpdate({ photo: [{ file_id: 'p1', width: 1, height: 1 }] })),
+      adapter.bot.handleUpdate(messageUpdate({ text: 'what do you think?' }))
+    ]);
+
+    expect(delivered).toEqual(['photo', 'text']);
+  });
+
+  it('forwards audio files, and tells the owner about types MAX cannot take', async () => {
+    const { adapter, api } = makeAdapter({ ownerId: OWNER_ID });
+    adapter.mediaService = { telegramFileToLocal: vi.fn(async (ctx, fileId, name) => `/tmp/${name}`) };
+    const delivered = [];
+    adapter.onMessage(async (message) => { delivered.push(message); });
+
+    await adapter.bot.handleUpdate(messageUpdate({ audio: { file_id: 'a1', duration: 3, file_name: 'song.mp3' }, caption: 'listen' }));
+    await adapter.bot.handleUpdate(messageUpdate({ location: { latitude: 1, longitude: 2 } }));
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ type: 'document', text: 'listen', mediaPath: '/tmp/song.mp3' });
+    expect(api.sendMessage).toHaveBeenCalledWith(OWNER_ID, expect.stringContaining('не пересылается'), expect.anything());
+  });
+
+  it('sends the static preview of an animated sticker, or its emoji', async () => {
+    const { adapter } = makeAdapter({ ownerId: OWNER_ID });
+    adapter.mediaService = { telegramFileToLocal: vi.fn(async (ctx, fileId) => `/tmp/${fileId}`) };
+    const delivered = [];
+    adapter.onMessage(async (message) => { delivered.push(message); });
+
+    await adapter.bot.handleUpdate(messageUpdate({ sticker: { file_id: 'tgs', is_animated: true, thumbnail: { file_id: 'thumb' }, emoji: '😀' } }));
+    await adapter.bot.handleUpdate(messageUpdate({ sticker: { file_id: 'webm', is_video: true, emoji: '🔥' } }));
+
+    expect(delivered[0]).toMatchObject({ type: 'sticker', mediaPath: '/tmp/thumb' });
+    expect(delivered[1]).toMatchObject({ type: 'text', text: '🔥' });
   });
 });

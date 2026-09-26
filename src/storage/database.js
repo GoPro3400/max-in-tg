@@ -267,6 +267,7 @@ export class AppDatabase {
     `);
 
     this.hasMessageStmt = this.db.prepare('SELECT 1 FROM messages WHERE id = ? LIMIT 1');
+    this.hasMessagesInChatStmt = this.db.prepare('SELECT 1 FROM messages WHERE chat_id = ? LIMIT 1');
     this.setSettingStmt = this.db.prepare(`
       INSERT INTO settings (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -522,6 +523,12 @@ export class AppDatabase {
 
   hasMessage(id) {
     return Boolean(this.hasMessageStmt.get(id));
+  }
+
+  // True once anything from this MAX chat has been stored (forwarded, primed
+  // or sent into it).
+  hasMessagesInChat(chatId) {
+    return this.hasMessagesInChatStmt.get(chatId) !== undefined;
   }
 
   // True on a brand-new database — nothing has ever been forwarded or primed.

@@ -223,9 +223,9 @@ until it has an owner it runs nothing but `/pair`) and send the code:
 
 The bot confirms that you now own this bridge. Until an owner exists, it executes no
 other command from anyone — `/pair` in a private chat is the only thing that gets
-through, and a wrong code is logged as a rejected attempt. After five wrong attempts the
-code is regenerated: the new one goes into the same log line, so a guessing attacker
-starts from zero while you just read the fresh code.
+through, and a wrong code is logged as a rejected attempt. After five wrong attempts
+that Telegram account is locked out of `/pair` for 10 minutes; the code itself stays the
+same, so a stranger guessing at it cannot keep you from pairing.
 
 Why the code is long and random (8 random bytes in base64url, like `k3Jq7Rr2_bA`): an
 unclaimed bot accepts `/pair` from anyone, and a bot's @username is globally searchable

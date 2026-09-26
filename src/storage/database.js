@@ -166,6 +166,19 @@ export class AppDatabase {
         console.error('Failed to migrate legacy message_deliveries rows; legacy table kept:', error);
       }
     }
+
+    // Again after the rebuild: the renamed legacy table kept these index
+    // NAMES, so the CREATE INDEX IF NOT EXISTS above skipped them, and they
+    // were dropped together with the legacy table — the delivery table of a
+    // migrated database had no indexes at all, and every retry count scanned
+    // all of it. Idempotent, so it also repairs a database migrated earlier.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_deliveries_status
+        ON message_deliveries(status);
+
+      CREATE INDEX IF NOT EXISTS idx_deliveries_message
+        ON message_deliveries(message_id);
+    `);
   }
 
   prepare() {
@@ -352,7 +365,7 @@ export class AppDatabase {
         AND text IS NOT NULL AND text <> ''
         AND (text = ? OR text LIKE ? ESCAPE '\\')
         AND (telegram_message_id IS NOT NULL OR direction = 'tg_to_max')
-      ORDER BY created_at DESC
+      ORDER BY (text = ?) DESC, created_at DESC
       LIMIT 1
     `);
 
@@ -542,7 +555,9 @@ export class AppDatabase {
     // otherwise match a different message and attach the reply to the wrong
     // original (the same class of bug already guarded in hasForwardedMediaCopy).
     const snippetPrefix = String(snippet ?? '').replace(/[\\%_]/g, '\\$&') + '%';
-    const row = this.findRepliedMessageStmt.get(chatId, snippet, snippetPrefix);
+    // An exact match wins over a newer message that merely starts the same
+    // way ("Да" vs "Да, конечно").
+    const row = this.findRepliedMessageStmt.get(chatId, snippet, snippetPrefix, snippet);
     return row ? rowToMessage(row) : null;
   }
 

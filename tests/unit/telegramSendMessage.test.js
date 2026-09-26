@@ -145,3 +145,69 @@ describe('TelegramBotAdapter.sendStickerFile', () => {
     await expect(flooded.adapter.sendStickerFile('/tmp/s.webm', {})).rejects.toThrow('429');
   });
 });
+
+describe('Telegram size limits for bots', () => {
+  const sparseFile = (name, bytes) => {
+    const filePath = path.join(tmpDir, name);
+    fs.writeFileSync(filePath, '');
+    fs.truncateSync(filePath, bytes);
+    return filePath;
+  };
+
+  it('says what a file over 50 MB was instead of failing on every retry', async () => {
+    const { adapter, api } = makeAdapter();
+    adapter.bot.telegram.sendDocument = api.sendDocument = vi.fn();
+    const filePath = sparseFile('big.zip', 51 * 1024 * 1024);
+
+    await adapter.sendMessage({ type: 'document', mediaPath: filePath, originalFilename: 'Архив.zip', text: 'вот' }, { telegramChatId: -100, telegramThreadId: 5 });
+
+    expect(api.sendDocument).not.toHaveBeenCalled();
+    const [chatId, text, extra] = api.sendMessage.mock.calls[0];
+    expect(chatId).toBe(-100);
+    expect(text).toContain('«Архив.zip»');
+    expect(text).toContain('51,0 МБ');
+    expect(text).toContain('вот');
+    expect(extra.message_thread_id).toBe(5);
+  });
+
+  it('sends a photo over 10 MB as a file', async () => {
+    const { adapter, api } = makeAdapter();
+    adapter.bot.telegram.sendDocument = api.sendDocument = vi.fn(async () => ({ message_id: 1 }));
+    const filePath = sparseFile('huge.jpg', 11 * 1024 * 1024);
+
+    await adapter.sendMessage({ type: 'photo', mediaPath: filePath }, { telegramChatId: -100 });
+
+    expect(api.sendPhoto).not.toHaveBeenCalled();
+    expect(api.sendDocument).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Telegram -> MAX: files Telegram will not hand to a bot', () => {
+  it('explains the 20 MB limit instead of "file is too big"', async () => {
+    const adapter = new TelegramBotAdapter({ token: 'test:token', ownerId: 1, relayChatId: null, useTopics: false }, {
+      telegramFileToLocal: vi.fn(async () => '/tmp/never')
+    });
+    adapter.bot.botInfo = { id: 9, is_bot: true, username: 'testbot', first_name: 'test' };
+    const reply = vi.fn(async () => ({ message_id: 1 }));
+    adapter.bot.context.telegram = { sendMessage: reply };
+    const outbound = vi.fn(async () => {});
+    adapter.onMessage(outbound);
+
+    await adapter.bot.handleUpdate({
+      update_id: 1,
+      message: {
+        message_id: 7,
+        date: 1700000000,
+        chat: { id: 1, type: 'private' },
+        from: { id: 1, is_bot: false, first_name: 'owner' },
+        document: { file_id: 'F', file_unique_id: 'U', file_name: 'Видео.mp4', file_size: 25 * 1024 * 1024 }
+      }
+    });
+
+    expect(outbound).not.toHaveBeenCalled();
+    expect(adapter.mediaService.telegramFileToLocal).not.toHaveBeenCalled();
+    const text = reply.mock.calls[0][1];
+    expect(text).toMatch(/^⚠️ Файл «Видео\.mp4» весит 25,0 МБ/);
+    expect(text).toContain('до 20 МБ');
+  });
+});

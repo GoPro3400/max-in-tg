@@ -127,6 +127,17 @@ describe('MAX -> Telegram', () => {
     expect(telegramBot.setReaction).toHaveBeenCalledWith(12345, 601, '🤣');
   });
 
+  it('finds the owner\'s own file by its media token', async () => {
+    const { bridge, db, maxClient, telegramBot } = setup();
+    linkChat(db, 'chat-a');
+    ownSent(db, 'chat-a', { telegramMessageId: 602, maxFingerprint: 'media-token:PIC1', telegramChatId: 12345 });
+    maxClient.readReactions.mockResolvedValue([row('12:07|https://i.oneme.ru/i?r=PIC1&sig=x', [{ emoji: '🔥', count: 1, active: false }], { outgoing: true, mediaToken: 'PIC1' })]);
+
+    await bridge.syncReactionsFromMax({ id: 'chat-a' });
+
+    expect(telegramBot.setReaction).toHaveBeenCalledWith(12345, 602, '🔥');
+  });
+
   it('skips bubbles that were never delivered to Telegram', async () => {
     const { bridge, db, maxClient, telegramBot } = setup();
     linkChat(db, 'chat-a');

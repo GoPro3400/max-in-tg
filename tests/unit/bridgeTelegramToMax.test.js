@@ -382,3 +382,18 @@ describe('Telegram stickers into MAX', () => {
     expect(maxClient.sendText).toHaveBeenCalledWith('max-1', '😂');
   });
 });
+
+describe('handleTelegramMessage: files remember their MAX bubble', () => {
+  it('stores the media token of the file just sent, for later replies and reactions', async () => {
+    const { bridge, db, maxClient } = makeBridge({
+      maxClient: makeFakeMaxClient({ getLastOutgoingMediaFingerprint: vi.fn(async () => 'media-token:NEW1') })
+    });
+    linkChat(db, 'chat-a', { telegramThreadId: 77 });
+    const message = telegramMessage('tg-501', { type: 'photo', text: '', mediaPath: '/tmp/p.jpg', telegramThreadId: 77 });
+
+    await bridge.handleTelegramMessage(message);
+
+    expect(maxClient.getLastOutgoingMediaFingerprint).toHaveBeenCalledWith('chat-a');
+    expect(db.getTgToMaxMessageBySourceId(501).maxFingerprint).toBe('media-token:NEW1');
+  });
+});

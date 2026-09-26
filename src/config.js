@@ -1,14 +1,33 @@
 import 'dotenv/config';
 import path from 'node:path';
 
-const bool = (value, fallback = false) => {
+// Values that could not be read as meant, for index.js to log at startup
+// (the logger is not available here). "TELEGRAM_USE_TOPICS=ture" used to
+// quietly mean false, and "POLL_INTERVAL_MS=1s" quietly meant 1 ms.
+export const configWarnings = [];
+
+const bool = (name, fallback = false) => {
+  const value = process.env[name];
   if (value == null || value === '') return fallback;
-  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  configWarnings.push(`${name}=${value} is neither true nor false — using ${fallback}`);
+  return fallback;
 };
 
-const int = (value, fallback) => {
+const int = (name, fallback) => {
+  const value = process.env[name];
+  if (value == null || String(value).trim() === '') return fallback;
   const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  if (!Number.isFinite(parsed)) {
+    configWarnings.push(`${name}=${value} is not a number — using ${fallback}`);
+    return fallback;
+  }
+  if (!/^\s*-?\d+\s*$/.test(String(value))) {
+    configWarnings.push(`${name}=${value} read as ${parsed} (whole numbers only, no units)`);
+  }
+  return parsed;
 };
 
 const required = (name) => {
@@ -51,19 +70,19 @@ export const config = {
     // telegramBot /pair and my_chat_member) and persisted in the settings
     // table, so a fresh install only needs TELEGRAM_BOT_TOKEN.
     ownerId: optionalPositiveInt('TELEGRAM_OWNER_ID'),
-    relayChatId: int(process.env.TELEGRAM_RELAY_CHAT_ID, 0) || null,
-    useTopics: bool(process.env.TELEGRAM_USE_TOPICS, true),
-    autoCreateTopics: bool(process.env.TELEGRAM_AUTO_CREATE_TOPICS, true)
+    relayChatId: int('TELEGRAM_RELAY_CHAT_ID', 0) || null,
+    useTopics: bool('TELEGRAM_USE_TOPICS', true),
+    autoCreateTopics: bool('TELEGRAM_AUTO_CREATE_TOPICS', true)
   },
   max: {
     webUrl: process.env.MAX_WEB_URL || 'https://web.max.ru/',
     userDataDir: resolveFromRoot(process.env.MAX_USER_DATA_DIR || './data/chrome-profile'),
-    headless: bool(process.env.MAX_HEADLESS, false),
-    protocolTimeoutMs: int(process.env.MAX_PROTOCOL_TIMEOUT_MS, 180000),
+    headless: bool('MAX_HEADLESS', false),
+    protocolTimeoutMs: int('MAX_PROTOCOL_TIMEOUT_MS', 180000),
     // Keep MAX's animated emoji still, as the plain emoji picture it shows
     // while loading — the only form in which a reaction says which emoji it
     // is (see STATIC_ANIMOJI_SCRIPT in maxWebClient.js). Stickers stay animated.
-    staticAnimoji: bool(process.env.MAX_STATIC_ANIMOJI, true),
+    staticAnimoji: bool('MAX_STATIC_ANIMOJI', true),
     selectors: {
       chatList: process.env.MAX_SELECTORS_CHAT_LIST || 'aside[aria-labelledby="aside-header-title"] .scrollListContent',
       chatItem: process.env.MAX_SELECTORS_CHAT_ITEM || 'aside[aria-labelledby="aside-header-title"] .item[data-index]',
@@ -122,29 +141,29 @@ export const config = {
   sqlitePath: resolveFromRoot(process.env.SQLITE_PATH || './data/max-in-tg.sqlite'),
   mediaDir: resolveFromRoot(process.env.MEDIA_DIR || './tmp/media'),
   diagnosticDir: resolveFromRoot(process.env.DIAGNOSTIC_DIR || './logs/diagnostics'),
-  diagnosticFilesLimit: int(process.env.DIAGNOSTIC_FILES_LIMIT, 4),
-  diagnosticRetentionFiles: int(process.env.DIAGNOSTIC_RETENTION_FILES, 80),
+  diagnosticFilesLimit: int('DIAGNOSTIC_FILES_LIMIT', 4),
+  diagnosticRetentionFiles: int('DIAGNOSTIC_RETENTION_FILES', 80),
   // Diagnostic HTML dumps are full captures of the live MAX page and therefore
   // contain private conversation text. Redacted by default; set to false only
   // for a deliberate, short-lived debugging session.
-  diagnosticRedactText: bool(process.env.DIAGNOSTIC_REDACT_TEXT, true),
-  startupPrimeExistingMessages: bool(process.env.STARTUP_PRIME_EXISTING_MESSAGES, true),
+  diagnosticRedactText: bool('DIAGNOSTIC_REDACT_TEXT', true),
+  startupPrimeExistingMessages: bool('STARTUP_PRIME_EXISTING_MESSAGES', true),
   // 0 (the default) = prime every chat seen at startup. A positive value caps
   // it, which on a first run means the chats beyond the cap deliver their
   // existing history to Telegram — see primeExistingMaxMessages.
-  startupPrimeChatsLimit: int(process.env.STARTUP_PRIME_CHATS_LIMIT, 0),
-  pollIntervalMs: int(process.env.POLL_INTERVAL_MS, 650),
-  historyLimit: int(process.env.HISTORY_LIMIT, 50),
-  maxChatsPerPoll: int(process.env.MAX_CHATS_PER_POLL, 4),
-  maxPollFailuresBeforeRestart: int(process.env.MAX_POLL_FAILURES_BEFORE_RESTART, 5),
+  startupPrimeChatsLimit: int('STARTUP_PRIME_CHATS_LIMIT', 0),
+  pollIntervalMs: int('POLL_INTERVAL_MS', 650),
+  historyLimit: int('HISTORY_LIMIT', 50),
+  maxChatsPerPoll: int('MAX_CHATS_PER_POLL', 4),
+  maxPollFailuresBeforeRestart: int('MAX_POLL_FAILURES_BEFORE_RESTART', 5),
   // Keeping Chromium's memory in check replaces the external cron restart (see
   // BridgeService.maybeRecycleBrowser): the MAX page is reloaded above
   // pageReloadMemoryMb, the browser relaunched above browserMemoryLimitMb or
   // after browserRecycleMinutes. 0 disables that trigger.
-  pageReloadMemoryMb: Math.max(0, int(process.env.MAX_PAGE_RELOAD_MEMORY_MB, 900)),
-  browserMemoryLimitMb: Math.max(0, int(process.env.MAX_BROWSER_MEMORY_LIMIT_MB, 1300)),
-  browserRecycleMinutes: Math.max(0, int(process.env.MAX_BROWSER_RECYCLE_MINUTES, 360)),
-  maxDeliveryAttempts: Math.max(1, int(process.env.MAX_DELIVERY_ATTEMPTS, 5)),
+  pageReloadMemoryMb: Math.max(0, int('MAX_PAGE_RELOAD_MEMORY_MB', 900)),
+  browserMemoryLimitMb: Math.max(0, int('MAX_BROWSER_MEMORY_LIMIT_MB', 1300)),
+  browserRecycleMinutes: Math.max(0, int('MAX_BROWSER_RECYCLE_MINUTES', 360)),
+  maxDeliveryAttempts: Math.max(1, int('MAX_DELIVERY_ATTEMPTS', 5)),
   // Mirror reactions between MAX and Telegram (see BridgeService).
-  reactionsEnabled: bool(process.env.SYNC_REACTIONS, true)
+  reactionsEnabled: bool('SYNC_REACTIONS', true)
 };

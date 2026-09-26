@@ -1,11 +1,13 @@
 import fs from 'node:fs';
-import { config } from './config.js';
+import { config, configWarnings } from './config.js';
 import { logger } from './logger.js';
 import { MaxWebClient } from './adapters/maxWebClient.js';
 import { TelegramBotAdapter } from './adapters/telegramBot.js';
 import { AppDatabase } from './storage/database.js';
 import { MediaService } from './services/mediaService.js';
 import { BridgeService } from './services/bridge.js';
+
+for (const warning of configWarnings) logger.warn(`Configuration: ${warning}`);
 
 fs.mkdirSync(config.mediaDir, { recursive: true });
 fs.mkdirSync(config.diagnosticDir, { recursive: true });

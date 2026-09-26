@@ -380,6 +380,17 @@ export class MediaService {
           }
         }
       }));
+
+    // Chromium's download folder: when a document is captured from the
+    // network, the browser still saves its own copy there, and nothing else
+    // ever removed those (nor interrupted .crdownload files).
+    const downloadsDir = path.join(this.mediaDir, 'downloads');
+    const downloads = await fsp.readdir(downloadsDir, { withFileTypes: true }).catch(() => []);
+    await Promise.all(downloads.filter((entry) => entry.isFile()).map(async (entry) => {
+      const filePath = path.join(downloadsDir, entry.name);
+      const stat = await fsp.stat(filePath).catch(() => null);
+      if (stat && now - stat.mtimeMs > maxAgeMs) await fsp.rm(filePath, { force: true }).catch(() => {});
+    }));
   }
 }
 
@@ -393,8 +404,10 @@ const STICKER_MAX_BYTES = 256 * 1024;
 // and Telegram) and lands on the container's small bind-mounted volume, which
 // also holds the SQLite DB, the Chromium profile and the logs — a single
 // oversized file could fill it and take all of those down together. Telegram
-// itself refuses documents over 50 MB, so nothing legitimate is lost here.
-const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+// takes at most 50 MB from a bot, so a bigger file could not be delivered
+// anyway: it is not downloaded at all (the error says so, see EFILETOOBIG).
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
+const tooBigError = (message, bytes) => Object.assign(new Error(message), { code: 'EFILETOOBIG', bytes });
 // Downloads run inside the bridge's global maxLock (forwardMaxMessage is
 // called from the poll), so a stalled transfer wedges polling AND both send
 // directions. No byte for this long — headers included — aborts it...
@@ -535,7 +548,7 @@ const downloadToFile = async (url, target, { validateUrl = null } = {}) => {
 
     const declared = Number(response.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES) {
-      throw new Error(`Refusing to download ${redactUrl(current)}: ${declared} bytes exceeds the ${MAX_DOWNLOAD_BYTES} byte limit`);
+      throw tooBigError(`Refusing to download ${redactUrl(current)}: ${declared} bytes exceeds the ${MAX_DOWNLOAD_BYTES} byte limit`, declared);
     }
 
     const body = typeof response.body.getReader === 'function'
@@ -549,7 +562,7 @@ const downloadToFile = async (url, target, { validateUrl = null } = {}) => {
       armIdle();
       received += chunk.length;
       if (received > MAX_DOWNLOAD_BYTES) {
-        body.destroy(new Error(`Download of ${redactUrl(current)} exceeded the ${MAX_DOWNLOAD_BYTES} byte limit`));
+        body.destroy(tooBigError(`Download of ${redactUrl(current)} exceeded the ${MAX_DOWNLOAD_BYTES} byte limit`, received));
       }
     });
     if (controller.signal.aborted) throw failure || new Error('Download aborted');

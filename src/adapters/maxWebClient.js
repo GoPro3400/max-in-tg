@@ -110,6 +110,7 @@ const REACTION_SCAN_MAX_AGE_MS = 5000;
 const reactionRowOf = (row) => ({
   rawId: row.rawId,
   outgoing: Boolean(row.outgoing),
+  mediaToken: (/[?&]r=([^&]+)/.exec(row.mediaUrl || '') || [])[1] || null,
   reactions: (row.reactions || []).map(({ emoji, count, active }) => ({ emoji, count, active: Boolean(active) })),
   reactionsUnknown: Boolean(row.reactionsUnknown)
 });
@@ -1005,6 +1006,23 @@ export class MaxWebClient {
     }
   }
 
+  // After a file went out: how to find that bubble again later (a reply or a
+  // reaction to it from Telegram) — by its CDN token, the part of the media
+  // URL that survives MAX re-signing its URLs on every page load. The bubble
+  // shows a local preview until the upload finishes, so this waits for the
+  // token. null when there is none (never an id that would not last).
+  async getLastOutgoingMediaFingerprint(chatId, { timeoutMs = 5000 } = {}) {
+    if (chatId && this.activeChatId !== chatId) return null;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const rows = await this.scrapeMessageRows().catch(() => []);
+      const token = mediaTokenOf(rows.filter((row) => row.outgoing).at(-1)?.mediaUrl);
+      if (token) return `media-token:${token}`;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+    return null;
+  }
+
   async readMessages(chatId, { isKnown = null } = {}) {
     await this.ensurePage();
     if (chatId && this.activeChatId !== chatId) {
@@ -1098,7 +1116,7 @@ export class MaxWebClient {
     }
 
     if (rawMessages.length > 0 && filtered.length === 0) {
-      await this.captureDiagnostics(`empty-filter-${chatId}`, { throttleMs: 60000 }).catch(() => null);
+      await this.captureDiagnostics(`empty-filter-${chatTag(chatId)}`, { throttleMs: 60000 }).catch(() => null);
       const bubbleHtml = await this.page.evaluate((sel) => {
         const el = document.querySelector(sel);
         return el ? el.innerHTML.substring(0, 3000) : 'not found';
@@ -1112,7 +1130,7 @@ export class MaxWebClient {
     }
 
     if (stickerIndices.length > 0) {
-      await this.captureDiagnostics(`sticker-detected-${chatId}`, { throttleMs: 60000 }).catch(() => null);
+      await this.captureDiagnostics(`sticker-detected-${chatTag(chatId)}`, { throttleMs: 60000 }).catch(() => null);
       const stickerHtmls = await this.page.$$eval(selectors.messageItem, (nodes, indices) => {
         return indices.map((idx) => {
           const node = nodes[idx];
@@ -2640,6 +2658,10 @@ const normalizeEmojiInPage = (emoji) => String(emoji ?? '')
   .replace(/[\uFE0E\uFE0F]/gu, '')
   .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '')
   .trim();
+
+// A chat in a diagnostic file name: a short hash, not the contact's name —
+// /diagnostics uploads these files, names included, to the asking chat.
+const chatTag = (chatId) => crypto.createHash('sha256').update(String(chatId ?? '')).digest('hex').slice(0, 8);
 
 // The CDN identity of a MAX media URL (its r= parameter): the same for every
 // size of a picture, and across the re-signing of URLs on page loads.

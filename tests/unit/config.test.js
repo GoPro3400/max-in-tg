@@ -148,4 +148,27 @@ describe('config helpers', () => {
       expect(config.max.webUrl).toBe('https://custom.max.ru/');
     });
   });
+
+  describe('values that cannot be read as meant', () => {
+    it('keeps the default for a misspelled boolean and says so', async () => {
+      process.env.TELEGRAM_USE_TOPICS = 'ture';
+      const { config, configWarnings } = await import('../../src/config.js?' + Date.now() + 'w1');
+      expect(config.telegram.useTopics).toBe(true);
+      expect(configWarnings.some((warning) => warning.startsWith('TELEGRAM_USE_TOPICS=ture'))).toBe(true);
+    });
+
+    it('warns about a number with a unit', async () => {
+      process.env.POLL_INTERVAL_MS = '1s';
+      const { config, configWarnings } = await import('../../src/config.js?' + Date.now() + 'w2');
+      expect(config.pollIntervalMs).toBe(1);
+      expect(configWarnings.some((warning) => warning.includes('POLL_INTERVAL_MS=1s'))).toBe(true);
+    });
+
+    it('stays quiet for clean values', async () => {
+      process.env.POLL_INTERVAL_MS = '800';
+      process.env.TELEGRAM_USE_TOPICS = 'off';
+      const { configWarnings } = await import('../../src/config.js?' + Date.now() + 'w3');
+      expect(configWarnings).toEqual([]);
+    });
+  });
 });

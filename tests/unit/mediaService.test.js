@@ -477,3 +477,30 @@ describe('isPrivateAddress: IPv6 forms that carry an IPv4 address', () => {
     }
   });
 });
+
+describe('MediaService.cleanupOlderThan: Chromium download folder', () => {
+  it('removes old copies the browser saved in downloads/, keeps fresh ones', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'media-dl-'));
+    try {
+      const service = new MediaService(dir);
+      const downloads = path.join(dir, 'downloads');
+      await fsp.mkdir(downloads, { recursive: true });
+      const old = path.join(downloads, 'Отчёт.pdf');
+      const partial = path.join(downloads, 'x.pdf.crdownload');
+      const fresh = path.join(downloads, 'new.pdf');
+      for (const file of [old, partial, fresh]) await fsp.writeFile(file, 'x');
+      const hourAgo = new Date(Date.now() - 2 * 3600000);
+      await fsp.utimes(old, hourAgo, hourAgo);
+      await fsp.utimes(partial, hourAgo, hourAgo);
+
+      await service.cleanupOlderThan(3600000);
+
+      expect(fs.existsSync(old)).toBe(false);
+      expect(fs.existsSync(partial)).toBe(false);
+      expect(fs.existsSync(fresh)).toBe(true);
+      expect(fs.existsSync(downloads)).toBe(true);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+});

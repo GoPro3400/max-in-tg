@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { Telegraf } from 'telegraf';
 import { Direction, MessageType, stableId } from '../domain/messages.js';
 import { logger } from '../logger.js';
@@ -349,6 +351,15 @@ export class TelegramBotAdapter {
       return await this.sendTextChunks(chatId, message.text || `[${message.type}] ${message.mediaUrl || ''}`, route, replyExtra);
     }
 
+    // Telegram takes at most 50 MB from a bot. A bigger upload failed on every
+    // retry until the message was given up on; say what it was right away.
+    const size = await fsp.stat(filePath).then((stat) => stat.size, () => 0);
+    if (size > TELEGRAM_UPLOAD_LIMIT_BYTES) {
+      const name = documentDisplayName(message.originalFilename, filePath) || path.basename(filePath);
+      const notice = `📎 «${name}» — ${formatMb(size)}: больше 50 МБ, столько бот в Telegram отправить не может. Файл можно открыть в MAX.`;
+      return await this.sendTextChunks(chatId, message.text ? `${notice}\n\n${message.text}` : notice, route, replyExtra);
+    }
+
     // Telegram rejects the whole upload when a caption is over 1024 characters
     // — on every retry, until the message was given up on and dropped. A
     // longer text is sent right after the media instead, as a reply to it.
@@ -405,6 +416,9 @@ export class TelegramBotAdapter {
         return await this.bot.telegram.sendDocument(chatId, { source: filePath }, extra);
       }
     } else if (message.type === MessageType.PHOTO || message.type === MessageType.STICKER) {
+      // A photo over 10 MB is refused as a photo, but fine as a file.
+      const size = await fsp.stat(filePath).then((stat) => stat.size, () => 0);
+      if (size > TELEGRAM_PHOTO_LIMIT_BYTES) return await this.bot.telegram.sendDocument(chatId, { source: filePath }, extra);
       return await this.bot.telegram.sendPhoto(chatId, { source: filePath }, extra);
     } else if (message.type === MessageType.VOICE) {
       return await this.bot.telegram.sendVoice(chatId, { source: filePath }, extra);
@@ -511,9 +525,10 @@ export class TelegramBotAdapter {
 
     this.bot.command('select', async (ctx) => {
       try {
-        const [, arg] = ctx.message.text.split(/\s+/, 2);
+        // Everything after the command: a chat name can have spaces in it.
+        const arg = ctx.message.text.replace(/^\/select(@\w+)?/i, '').trim();
         if (!arg) {
-          await ctx.reply('Usage: /select <number>', threadExtraFromContext(ctx));
+          await ctx.reply('Usage: /select <номер из /chats или название чата>', threadExtraFromContext(ctx));
           return;
         }
         const text = await this.onChatSelectRequested?.(arg);
@@ -709,9 +724,17 @@ export class TelegramBotAdapter {
         this.config.relayChatId = chat.id;
         await this.onIdentityDiscoveredHandler?.({ relayChatId: chat.id });
         logger.info({ relayChatId: chat.id, previous, title: chat.title }, 'Relay group set via /relay');
-        await ctx.reply(previous && previous !== chat.id
+        const lines = [previous && previous !== chat.id
           ? '✅ Теперь чаты MAX идут сюда. Темы, созданные в прошлой группе, там и останутся — новые появятся здесь.'
-          : '✅ Эта группа подключена — чаты MAX будут появляться здесь отдельными темами.');
+          : '✅ Эта группа подключена — чаты MAX будут появляться здесь отдельными темами.'];
+        // The environment wins over what /relay stores (see restoreIdentity):
+        // without this the bridge went back to the old group on the next
+        // restart, silently.
+        const pinned = Number.parseInt(process.env.TELEGRAM_RELAY_CHAT_ID || '', 10);
+        if (pinned && pinned !== chat.id) {
+          lines.push('', `⚠️ В .env задан TELEGRAM_RELAY_CHAT_ID=${pinned}: после перезапуска мост вернётся в ту группу. Убери эту строку из .env или впиши туда ${chat.id}.`);
+        }
+        await ctx.reply(lines.join('\n'));
       } catch (error) {
         logger.error({ err: error }, 'Command /relay failed');
         await ctx.reply(`⚠️ Relay failed: ${error.message}`).catch(() => {});
@@ -877,7 +900,8 @@ export class TelegramBotAdapter {
       }
     } catch (error) {
       logger.error({ err: error, chatId: ctx.chat?.id }, 'Failed to process outbound Telegram message');
-      await ctx.reply(`⚠️ Failed to process message: ${error.message}`, threadExtraFromContext(ctx)).catch(() => {});
+      const text = error?.userFacing ? `⚠️ ${error.message}` : `⚠️ Failed to process message: ${error.message}`;
+      await ctx.reply(text, threadExtraFromContext(ctx)).catch(() => {});
     }
   }
 
@@ -938,34 +962,34 @@ export class TelegramBotAdapter {
 
     if ('photo' in msg) {
       const photo = msg.photo.at(-1);
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, photo.file_id, 'photo');
+      const mediaPath = await this.fetchFile(ctx, photo, 'photo');
       return { ...base, type: MessageType.PHOTO, text: msg.caption, mediaPath };
     }
 
     if ('voice' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.voice.file_id, 'voice');
-      return { ...base, type: MessageType.VOICE, mediaPath };
+      const mediaPath = await this.fetchFile(ctx, msg.voice, 'voice');
+      return { ...base, type: MessageType.VOICE, text: msg.caption, mediaPath };
     }
 
     if ('video' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.video.file_id, msg.video.file_name || 'video');
+      const mediaPath = await this.fetchFile(ctx, msg.video, msg.video.file_name || 'video');
       return { ...base, type: MessageType.VIDEO, text: msg.caption, mediaPath };
     }
 
     if ('video_note' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.video_note.file_id, 'video-note');
+      const mediaPath = await this.fetchFile(ctx, msg.video_note, 'video-note');
       return { ...base, type: MessageType.VIDEO_NOTE, mediaPath };
     }
 
     if ('document' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.document.file_id, msg.document.file_name || 'document');
+      const mediaPath = await this.fetchFile(ctx, msg.document, msg.document.file_name || 'document');
       return { ...base, type: MessageType.DOCUMENT, text: msg.caption, mediaPath };
     }
 
     // Music and other audio files (mp3/m4a) arrive as `audio`, not
     // `document`, and used to disappear without a trace.
     if ('audio' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.audio.file_id, msg.audio.file_name || 'audio');
+      const mediaPath = await this.fetchFile(ctx, msg.audio, msg.audio.file_name || 'audio');
       return { ...base, type: MessageType.DOCUMENT, text: msg.caption, mediaPath };
     }
 
@@ -975,7 +999,7 @@ export class TelegramBotAdapter {
       // or an animated GIF, transparency kept — and sends the emoji instead
       // if that fails.
       const sticker = msg.sticker;
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, sticker.file_id, 'sticker');
+      const mediaPath = await this.fetchFile(ctx, sticker, 'sticker');
       return {
         ...base,
         type: MessageType.STICKER,
@@ -985,6 +1009,15 @@ export class TelegramBotAdapter {
     }
 
     return null;
+  }
+
+  // Telegram hands a bot files of up to 20 MB; for a bigger one getFile fails
+  // with a bare "file is too big". Say it in words the owner can act on.
+  async fetchFile(ctx, file, name) {
+    if (file?.file_size > TELEGRAM_DOWNLOAD_LIMIT_BYTES) {
+      throw userFacingError(`Файл «${name}» весит ${formatMb(file.file_size)}, а Telegram отдаёт ботам файлы только до 20 МБ — в MAX он не ушёл. Отправь его в MAX напрямую или сожми.`);
+    }
+    return this.mediaService.telegramFileToLocal(ctx, file.file_id, name);
   }
 }
 
@@ -999,6 +1032,16 @@ const BOT_COMMANDS = new Set([
 // Wrong /pair codes one user may send before being locked out for a while.
 const MAX_PAIRING_ATTEMPTS = 5;
 const PAIRING_LOCKOUT_MS = 10 * 60 * 1000;
+
+// What Telegram lets a bot upload and download, and send as a photo.
+const TELEGRAM_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
+const TELEGRAM_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
+const TELEGRAM_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024;
+
+const formatMb = (bytes) => `${(bytes / (1024 * 1024)).toFixed(1).replace('.', ',')} МБ`;
+
+// An error whose message is written for the owner, shown to them as is.
+const userFacingError = (message) => Object.assign(new Error(message), { userFacing: true });
 
 // The update types the bot handles. Listing them is required to receive
 // message_reaction at all.

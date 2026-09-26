@@ -350,3 +350,23 @@ describe('computeMediaHash', () => {
     expect(await bridge.computeMediaHash('/tmp/a.jpg', 'photo')).toBeNull();
   });
 });
+
+describe('forwardMaxMessage: files over Telegram\'s limit for bots', () => {
+  it('sends a notice instead of failing on every retry', async () => {
+    const tooBig = Object.assign(new Error('exceeds the 52428800 byte limit'), { code: 'EFILETOOBIG', bytes: 80 * 1024 * 1024 });
+    const { bridge, db, telegramBot, mediaService } = makeBridge();
+    linkChat(db, 'chat-a');
+    mediaService.downloadUrl.mockRejectedValue(tooBig);
+    const message = maxMessage('big-1', 'chat-a', { type: 'document', mediaUrl: 'https://fu.oneme.ru/f?r=T1', text: '' });
+    message.originalFilename = 'Отчёт.pdf';
+
+    await expect(bridge.forwardMaxMessage(message)).resolves.toBe(true);
+
+    expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+    const [sent] = telegramBot.sendMessage.mock.calls[0];
+    expect(sent.type).toBe('text');
+    expect(sent.text).toContain('«Отчёт.pdf»');
+    expect(sent.text).toContain('больше 50 МБ');
+    expect(message.telegramMessageId).toBeTruthy();
+  });
+});

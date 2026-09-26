@@ -542,6 +542,9 @@ export class BridgeService {
       // code is delivered again instead of waiting for the next rotation.
       if (this.resendQr) {
         this.resendQr = false;
+        // If the old message is still there, it shows a code that is about
+        // to go stale — a credential nobody should scan any more.
+        if (qrMessageId) await this.telegramBot.deleteOwnerMessage(qrMessageId).catch(() => null);
         qrMessageId = null;
         lastHash = null;
       }
@@ -1594,6 +1597,25 @@ export class BridgeService {
       logger.info({ messageId: message.id, type: message.type, chatId: message.chatId }, 'Forwarded Max message to Telegram');
       return true;
     } catch (error) {
+      if (error?.code === 'EFILETOOBIG') {
+        // Over Telegram's 50 MB for bots: it would fail on every retry. Say
+        // what it was instead, once. (If even that fails, it is handled below
+        // like any other failure.)
+        try {
+          const notice = await this.telegramBot.sendMessage({
+            ...message,
+            type: MessageType.TEXT,
+            text: `📎 ${message.originalFilename ? `«${message.originalFilename}» ` : ''}— файл больше 50 МБ, столько бот в Telegram отправить не может. Его можно открыть в MAX.${message.text ? `\n\n${message.text}` : ''}`,
+            mediaPath: null
+          }, mapping);
+          message.telegramMessageId = notice?.message_id ?? null;
+          this.db.updateDeliveryStatus(deliveryId, 'sent', 'too big for Telegram: sent a notice');
+          logger.warn({ messageId: message.id, chatId: message.chatId, bytes: error.bytes }, 'MAX file is over the Telegram bot limit — sent a notice instead');
+          return true;
+        } catch (noticeError) {
+          error = noticeError;
+        }
+      }
       const retryAfter = telegramRetryAfter(error);
       if (retryAfter) {
         // Flood control is not a failure of THIS message. Counted as one, the
@@ -1775,6 +1797,10 @@ export class BridgeService {
           const filePath = await this.mediaService.ensureMaxCompatible(enriched.mediaPath, enriched.type);
           await this.maxClient.sendFile(mapping.maxChatId, filePath);
           enriched.mediaPath = filePath;
+          // So a reply or a reaction to this file in Telegram can find it in MAX.
+          if (typeof this.maxClient.getLastOutgoingMediaFingerprint === 'function') {
+            enriched.maxFingerprint = await this.maxClient.getLastOutgoingMediaFingerprint(mapping.maxChatId).catch(() => null);
+          }
           // Hash the media we just sent into MAX so a reply to it can be matched.
           enriched.mediaHash = await this.computeMediaHash(filePath, enriched.type);
           // The attach flow has no caption field the bridge fills in, and the
@@ -1839,8 +1865,9 @@ export class BridgeService {
   //   3. Replies to the user's own previously-sent MAX messages (typed in
   //      Telegram and sent into Max, direction === 'tg_to_max'): quote by the
   //      MAX-side fingerprint captured right after sending and stored as
-  //      max_fingerprint (see handleTelegramMessage / getLastOutgoingFingerprint).
-  //      Text only — a MAX-side fingerprint is not captured for media sends.
+  //      max_fingerprint (see handleTelegramMessage): the bubble's id for a
+  //      text (getLastOutgoingFingerprint), its `media-token:` for a file
+  //      (getLastOutgoingMediaFingerprint).
   // Every branch is guarded against the unstable 'visible-N' index-based
   // fallback id (unmatchable — see maxWebClient.js scrapeMessageRows), and
   // returns null (send as a plain message, no quote) when not resolvable —
@@ -1852,17 +1879,20 @@ export class BridgeService {
 
     const original = this.db.getMessageByTelegramMessageId(replyToTelegramMessageId);
     if (!original || original.direction !== 'max_to_tg') {
-      // Not something the bridge forwarded FROM Max. Check the other case
-      // (v2): replying to one of the user's own earlier messages that was
-      // typed in Telegram and sent into Max — text only, since we only
-      // capture a MAX-side fingerprint for those (see handleTelegramMessage).
+      // Not something the bridge forwarded FROM Max. Check the other case:
+      // replying to one of the user's own earlier messages that was sent
+      // into Max from Telegram (text or file, see handleTelegramMessage).
       const ownSent = this.db.getTgToMaxMessageBySourceId(replyToTelegramMessageId);
-      if (ownSent && ownSent.type === MessageType.TEXT && ownSent.maxFingerprint
+      if (ownSent && ownSent.chatId === message.chatId && ownSent.maxFingerprint
           && !ownSent.maxFingerprint.startsWith('visible-')) {
         return ownSent.maxFingerprint;
       }
       return null;
     }
+    // A message from another MAX chat (a merged topic, or /select pointing
+    // elsewhere) cannot be quoted here — and looking for it scrolled this
+    // chat's history for seconds, with the page locked.
+    if (original.chatId !== message.chatId) return null;
     if (original.type === MessageType.TEXT) {
       if (!original.sourceMessageId || original.sourceMessageId.startsWith('visible-')) return null;
       return original.sourceMessageId;
@@ -1931,7 +1961,9 @@ export class BridgeService {
   // or the owner's own one sent into MAX from Telegram.
   telegramMessageForBubble(chatId, row, mapping) {
     if (row.outgoing) {
-      const own = this.db.getTgToMaxMessageByMaxFingerprint(chatId, row.rawId);
+      // A file we sent is known by its media token (see getLastOutgoingMediaFingerprint).
+      const own = this.db.getTgToMaxMessageByMaxFingerprint(chatId, row.rawId)
+        || (row.mediaToken ? this.db.getTgToMaxMessageByMaxFingerprint(chatId, `media-token:${row.mediaToken}`) : null);
       const telegramMessageId = Number(own?.sourceMessageId) || null;
       const telegramChatId = own?.metadata?.telegramChatId ?? null;
       return telegramMessageId && telegramChatId ? { message: own, telegramChatId, telegramMessageId } : null;
@@ -2094,8 +2126,12 @@ export class BridgeService {
     if (!chats.length) return 'No Max chats found.';
 
     const mappings = new Map(this.db.listChatMappings().map((mapping) => [mapping.maxChatId, mapping]));
+    // /select <number> refers to THIS list. It used to index the database's
+    // own order, so "/select 3" could pick a different chat than line 3.
+    this.lastChatListing = chats.map((chat) => chat.id);
+    const selectedId = this.db.getSelectedChat()?.id;
     return chats.map((chat, index) => {
-      const marker = chat.selected ? '*' : ' ';
+      const marker = chat.id === selectedId ? '*' : ' ';
       const mapped = mappings.has(chat.id) ? 'topic' : 'not linked';
       const unread = chat.metadata?.unread ? ' unread' : '';
       const muted = this.mutedChatIds.has(chat.id) ? ' 🔇 muted' : '';
@@ -2103,11 +2139,27 @@ export class BridgeService {
     }).join('\n');
   }
 
+  // `arg`: a number from the last /chats list, or the chat's name (whole, or
+  // a part that matches only one chat).
   async selectChat(arg) {
+    const query = String(arg ?? '').trim();
     const chats = this.db.listChats();
-    const index = Number.parseInt(arg, 10) - 1;
-    const chat = Number.isInteger(index) && index >= 0 ? chats[index] : chats.find((item) => item.id === arg);
-    if (!chat) return `Chat not found: ${arg}`;
+    let chat = null;
+    if (/^\d+$/.test(query)) {
+      const ids = this.lastChatListing?.length ? this.lastChatListing : chats.map((item) => item.id);
+      const id = ids[Number(query) - 1];
+      chat = chats.find((item) => item.id === id) || null;
+    } else if (query) {
+      const lower = query.toLocaleLowerCase('ru');
+      const titleOf = (item) => String(item.title || item.id).toLocaleLowerCase('ru');
+      chat = chats.find((item) => item.id === query || titleOf(item) === lower) || null;
+      if (!chat) {
+        const partial = chats.filter((item) => titleOf(item).includes(lower));
+        if (partial.length > 1) return `Под «${query}» подходит несколько чатов: ${partial.slice(0, 5).map((item) => item.title).join(', ')}. Уточни или выбери номер из /chats.`;
+        chat = partial[0] || null;
+      }
+    }
+    if (!chat) return `Chat not found: ${query}`;
 
     await this.maxLock.run(() => this.maxClient.selectChat(chat.id));
     this.db.selectChat(chat.id);

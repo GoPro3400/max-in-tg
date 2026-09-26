@@ -138,6 +138,36 @@ describe('MAX -> Telegram', () => {
     expect(telegramBot.setReaction).toHaveBeenCalledWith(12345, 602, '🔥');
   });
 
+  it('finds a message by the id it had before the time was in ids — only one from the bubble\'s minute, and only for a week', async () => {
+    const { bridge, db, maxClient, telegramBot } = setup();
+    linkChat(db, 'chat-a');
+    db.setSetting('timed_ids:chat-a', String(Date.now() - 60000));
+    const at = (hours, minutes) => new Date(2026, 8, 20, hours, minutes, 20).getTime();
+    // The owner's "Ок" sent from Telegram at 12:06, recorded under its old id.
+    db.insertMessage({
+      id: 'tg-own-old', chatId: 'chat-a', direction: 'tg_to_max', type: 'text', text: 'Ок',
+      sourceMessageId: '611', createdAt: at(12, 6), metadata: { telegramChatId: 12345 }, maxFingerprint: 'Ок'
+    });
+    maxClient.readReactions.mockResolvedValue([
+      // That very bubble…
+      row('12:06|Ок', [{ emoji: '👍', count: 1, active: false }], { outgoing: true, legacyRawId: 'Ок', time: '12:06' }),
+      // …and an "Ок" typed straight into MAX at 15:00: not that message.
+      row('15:00|Ок', [{ emoji: '🔥', count: 1, active: false }], { outgoing: true, legacyRawId: 'Ок', time: '15:00' })
+    ]);
+
+    await bridge.syncReactionsFromMax({ id: 'chat-a' });
+    expect(telegramBot.setReaction.mock.calls).toEqual([[12345, 611, '👍']]);
+
+    // A week on, old ids decide nothing.
+    telegramBot.setReaction.mockClear();
+    db.setSetting('timed_ids:chat-a', String(Date.now() - 8 * 24 * 3600 * 1000));
+    maxClient.readReactions.mockResolvedValue([
+      row('12:06|Ок', [{ emoji: '❤️', count: 1, active: false }], { outgoing: true, legacyRawId: 'Ок', time: '12:06' })
+    ]);
+    await bridge.syncReactionsFromMax({ id: 'chat-a' });
+    expect(telegramBot.setReaction).not.toHaveBeenCalled();
+  });
+
   it('skips bubbles that were never delivered to Telegram', async () => {
     const { bridge, db, maxClient, telegramBot } = setup();
     linkChat(db, 'chat-a');

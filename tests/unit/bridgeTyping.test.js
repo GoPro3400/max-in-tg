@@ -66,6 +66,11 @@ describe('typingAction', () => {
     expect(typingAction('отправляет фото')).toBe('upload_photo');
     expect(typingAction('отправляет файл')).toBe('upload_document');
     expect(typingAction('выбирает стикер')).toBe('choose_sticker');
+    expect(typingAction('recording a\u00a0voice message')).toBe('record_voice');
     expect(typingAction('')).toBe('typing');
+    // Names come first, and are not what they do.
+    expect(typingAction('Profile печатает')).toBe('typing');
+    expect(typingAction('Фотограф Анна печатает')).toBe('typing');
+    expect(typingAction('Файлов Иван отправляет фото')).toBe('upload_photo');
   });
 });

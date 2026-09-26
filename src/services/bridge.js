@@ -106,6 +106,10 @@ const TYPING_REPEAT_MS = 4000;
 
 const PLACEHOLDER_CHAT_TITLES = new Set(['Чат не найден', 'Chat not found']);
 
+// How long after a chat's first read with the time in its ids (or after it
+// was renamed) the ids its bubbles had before still count (legacyWindowOpen).
+const LEGACY_ID_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
 // The reaction the bot shows in Telegram for a MAX message: the most used one
 // OTHER people put on it (MAX lists chips most used first; a chip marked as
 // ours counts one less) that a bot is allowed to set. null for none.
@@ -138,6 +142,20 @@ const formatBytes = (bytes) => {
     unit += 1;
   }
   return `${value.toFixed(unit ? 1 : 0).replace('.', ',')} ${units[unit]}`;
+};
+
+// Whether a record made at `timestamp` belongs to a bubble showing the time
+// `clock` ("14:05", "2:05 PM"): made in that minute, up to two after it (or
+// just before it, for a message we sent).
+const sameClockMinute = (clock, timestamp) => {
+  const match = /(\d{1,2}):(\d{2})(?:\s?([AaPp])[Mm])?/.exec(clock || '');
+  if (!match || !timestamp) return false;
+  let hours = Number(match[1]) % (match[3] ? 12 : 24);
+  if (match[3] && /[Pp]/.test(match[3])) hours += 12;
+  const bubble = hours * 60 + Number(match[2]);
+  const made = new Date(timestamp);
+  const diff = (made.getHours() * 60 + made.getMinutes() - bubble + 1440) % 1440;
+  return diff <= 2 || diff === 1439;
 };
 
 // What goes to Telegram in place of a file from MAX that is not delivered.
@@ -991,18 +1009,27 @@ export class BridgeService {
         // Between chats too: reading one takes a few seconds.
         await this.relayTyping();
         let messages;
-        // First read of this chat since ids carry the time: see legacyAdoptionEnd.
-        const firstTimedRead = !this.chatOnTimedIds(chat.id);
+        let renamed = false;
+        let fullAdoption = false;
         try {
+          // Opened before it is read: its id in MAX shows then, so a renamed
+          // chat is recognised before anything of it is fetched or delivered.
+          if (this.maxClient.activeChatId !== chat.id) await this.maxClient.selectChat(chat.id);
+          renamed = await this.noteMaxChatId(chat);
+          // Its first read since ids carry the time, or since it was renamed:
+          // see legacyAdoptionEnd.
+          fullAdoption = renamed || !this.chatOnTimedIds(chat.id);
           messages = await this.maxClient.readMessages(chat.id, {
             // Dedup strictly by the exact message id. We must NOT collapse a
             // disambiguated "#vN" id onto its base id: two distinct media
             // messages sent close together (e.g. two video notes) share the
             // same base rawId, and collapsing would drop all but the first.
-            // A bubble about to be adopted under its old id is known too
-            // (no sticker or file capture for it).
-            isKnown: (id, _sourceMessageId, legacyId) => this.db.hasMessage(id)
-              || Boolean(firstTimedRead && legacyId && this.db.hasMessage(stableId('max', chat.id, legacyId)))
+            // A bubble about to be adopted under an id it had before is known
+            // too (no sticker or file capture for it).
+            // (Never one of the unread: those are new, see legacyAdoptionEnd.)
+            isKnown: (id, sourceMessageId, legacyId, fromEnd) => this.db.hasMessage(id)
+              || Boolean(fullAdoption && (fromEnd === undefined || fromEnd >= unreadCount(chat))
+                && this.legacyRecordOf({ chatId: chat.id, sourceMessageId, metadata: { legacyId } }))
           });
         } catch (error) {
           // A single chat failing to read (e.g. virtual-scroll chat not yet in
@@ -1036,15 +1063,8 @@ export class BridgeService {
         // A successful read means the chat is reachable again (e.g. it scrolled
         // back into the virtualized list) — stop excluding it from round-robin.
         this.chronicallyUnreachableChatIds.delete(chat.id);
-        // A renamed chat carries on in its old topic, with its history.
-        const renamed = await this.noteMaxChatId(chat);
-        const adoptUpTo = this.legacyAdoptionEnd(messages, firstTimedRead || renamed);
-        // A renamed chat's history is on record under its old name: above the
-        // last bubble recognised from it everything is old (on record or not),
-        // below it new — no need to guess by the unread count.
-        const backlog = renamed && adoptUpTo >= 0
-          ? new Set(messages.slice(0, adoptUpTo + 1).map((message) => message.id))
-          : this.historyBacklog(chat, messages);
+        const adoptUpTo = this.legacyAdoptionEnd(chat, messages, fullAdoption);
+        const backlog = this.historyBacklog(chat, messages);
         let readThrough = true;
         for (const [index, message] of messages.entries()) {
           // Dedup by exact id only — see the isKnown note above. Collapsing a
@@ -1054,7 +1074,12 @@ export class BridgeService {
             this.pendingSeenCounts.delete(message.id);
             continue;
           }
-          if (index <= adoptUpTo && this.adoptLegacyId(message)) continue;
+          if (index <= adoptUpTo) {
+            if (this.adoptLegacyId(message)) continue;
+            // Media there may be on record under an id it had before, with a
+            // since re-signed URL (see the re-forward guard).
+            message.legacyMatchable = true;
+          }
           // Stop at the first message that cannot go out while Telegram's
           // flood control lasts, so the rest of the chat keeps its order.
           if (this.telegramPaused()) {
@@ -1105,7 +1130,7 @@ export class BridgeService {
           }
           // Otherwise leave it unseen so the next poll retries it.
         }
-        if ((firstTimedRead || renamed) && readThrough && messages.length) this.db.setSetting(`timed_ids:${chat.id}`, '1');
+        if (fullAdoption && readThrough && messages.length) this.db.setSetting(`timed_ids:${chat.id}`, String(Date.now()));
         await this.syncReactionsFromMax(chat);
       }
       // If every reachable chat failed, this is a real problem (expired session,
@@ -1174,33 +1199,47 @@ export class BridgeService {
   // under its old id is recorded under the new one as well — keeping its
   // Telegram link — instead of being delivered again. But an old id is shared
   // by every repeat of a text, so it only counts where the bubble cannot be
-  // new: on the chat's first read since the change (what is on screen then
-  // is what the old ids saw, up to the last bubble they know), and after it
-  // above the newest bubble known by its new id — history scrolled into
-  // view, never a message that has just arrived.
+  // new (see legacyAdoptionEnd).
+  //
+  // timed_ids:<chat> holds when the chat was first read with the time in ids
+  // (or after it was renamed). "1" was written by a build that did not keep
+  // the moment, and counts as long ago.
   chatOnTimedIds(chatId) {
-    return this.db.getSetting(`timed_ids:${chatId}`, '') === '1';
+    return Boolean(this.db.getSetting(`timed_ids:${chatId}`, ''));
   }
 
-  // Index of the last bubble up to which old ids are trusted, or -1.
-  legacyAdoptionEnd(messages, firstTimedRead) {
+  // For a week after that first read, history scrolling into view may still
+  // be bubbles recorded under an old id; after that the old ids decide nothing.
+  legacyWindowOpen(chatId, now = Date.now()) {
+    const since = Number(this.db.getSetting(`timed_ids:${chatId}`, '')) || 0;
+    return now - since < LEGACY_ID_WINDOW_MS;
+  }
+
+  // Index of the last bubble up to which ids a bubble had before are trusted,
+  // or -1. On a first read (after the update, or of a renamed chat) that is
+  // the last bubble known by any id; later, the newest bubble known by its
+  // own id, and only while legacyWindowOpen. Never one of the newest
+  // `unread` bubbles: MAX counts those as not seen yet, so they are new,
+  // whatever old id they share ("Ок").
+  legacyAdoptionEnd(chat, messages, fullAdoption) {
+    if (!fullAdoption && !this.legacyWindowOpen(chat.id)) return -1;
     let end = -1;
     messages.forEach((message, index) => {
-      if (this.db.hasMessage(message.id) || (firstTimedRead && this.legacyRecordOf(message))) end = index;
+      if (this.db.hasMessage(message.id) || (fullAdoption && this.legacyRecordOf(message))) end = index;
     });
-    return end;
+    return Math.min(end, messages.length - 1 - unreadCount(chat));
   }
 
   // The record of this bubble under an id it had before: its old id (without
-  // the time), or its id in this chat under its previous name (see
-  // noteMaxChatId).
+  // the time), or exactly its id under the chat's previous name (see
+  // noteMaxChatId) — never an old id there: the old chat's history is long,
+  // and an old id is shared by every repeat of a text.
   legacyRecordOf(message) {
     const legacyRawId = message.metadata?.legacyId;
     const previousChatId = this.db.getSetting(`renamed_from:${message.chatId}`, '') || null;
     const candidates = [
       legacyRawId && [message.chatId, legacyRawId],
-      previousChatId && [previousChatId, message.sourceMessageId],
-      previousChatId && legacyRawId && [previousChatId, legacyRawId]
+      previousChatId && message.sourceMessageId && [previousChatId, message.sourceMessageId]
     ].filter(Boolean);
     for (const [chatId, rawId] of candidates) {
       const record = this.db.getMessage(stableId('max', chatId, rawId));
@@ -1223,58 +1262,78 @@ export class BridgeService {
     const key = `max_chat:${maxId}`;
     const known = this.db.getSetting(key, '');
     if (known === chat.id) return false;
+    if (known) {
+      try {
+        await this.carryOnRenamedChat(known, chat);
+      } catch (error) {
+        // Not taken as done: the next read tries again.
+        logger.error({ err: error, from: known, to: chat.id }, 'Failed to carry a renamed MAX chat on in its topic');
+        return false;
+      }
+    }
     this.db.setSetting(key, chat.id);
-    if (!known) return false;
-    return this.carryOnRenamedChat(known, chat);
+    return Boolean(known);
   }
 
   async carryOnRenamedChat(oldChatId, chat) {
     const oldMapping = this.db.getChatMapping(oldChatId);
-    logger.info({ from: oldChatId, to: chat.id, hasRoute: Boolean(oldMapping) }, 'MAX chat renamed');
-    // Its messages are looked up under the old name too (legacyRecordOf),
-    // and the next read adopts them.
-    this.db.setSetting(`renamed_from:${chat.id}`, oldChatId);
-    this.db.setSetting(`timed_ids:${chat.id}`, '');
-    if (this.mutedChatIds.has(oldChatId) && !this.mutedChatIds.has(chat.id)) {
-      this.db.setChatMuted(chat.id, true);
-      this.mutedChatIds.add(chat.id);
-    }
+    const ownMapping = this.db.getChatMapping(chat.id);
+    const sameTopic = Boolean(oldMapping && ownMapping && ownMapping.telegramChatId === oldMapping.telegramChatId
+      && ownMapping.telegramThreadId === oldMapping.telegramThreadId);
+    // A chat /merge-d into another chat's topic stays merged there (that
+    // topic is the other chat's, and keeps its name).
+    const mergedInto = oldMapping?.metadata?.mergedInto && oldMapping.metadata.mergedInto !== chat.id
+      ? oldMapping.metadata.mergedInto
+      : undefined;
+    const oldChat = this.db.listChats().find((item) => item.id === oldChatId);
+    const muted = this.mutedChatIds.has(oldChatId);
+    logger.info({ from: oldChatId, to: chat.id, hasRoute: Boolean(oldMapping), merged: Boolean(mergedInto) }, 'MAX chat renamed');
+
+    this.db.transaction(() => {
+      // Its messages are looked up under the old name too (legacyRecordOf),
+      // and the next read adopts them.
+      this.db.setSetting(`renamed_from:${chat.id}`, oldChatId);
+      this.db.setSetting(`timed_ids:${chat.id}`, '');
+      if (muted) this.db.setChatMuted(chat.id, true);
+      // The old name is no longer in MAX's list: not polled any more.
+      if (oldChat) this.db.upsertChat({ ...oldChat, metadata: { ...oldChat.metadata, unread: false, renamedTo: chat.id } });
+      if (!oldMapping) return;
+      // The old name's route is retired first: one topic has one owner.
+      this.db.upsertChatMapping({
+        ...oldMapping,
+        enabled: false,
+        metadata: { ...oldMapping.metadata, mergedInto: chat.id, renamedTo: chat.id, renamedAt: Date.now() }
+      });
+      this.db.upsertChatMapping({
+        maxChatId: chat.id,
+        telegramChatId: oldMapping.telegramChatId,
+        telegramThreadId: oldMapping.telegramThreadId,
+        title: chat.title,
+        enabled: true,
+        metadata: {
+          ...oldMapping.metadata,
+          mergedInto,
+          renamedFrom: oldChatId,
+          // A topic already made for the new name, now left unused.
+          abandonedThreadId: !sameTopic && ownMapping?.telegramThreadId ? ownMapping.telegramThreadId : undefined,
+          renamedTo: undefined,
+          renamedAt: undefined
+        }
+      });
+    });
+    if (muted) this.mutedChatIds.add(chat.id);
     if (!oldMapping) return true;
 
-    const ownMapping = this.db.getChatMapping(chat.id);
-    const sameTopic = ownMapping && ownMapping.telegramChatId === oldMapping.telegramChatId
-      && ownMapping.telegramThreadId === oldMapping.telegramThreadId;
-    // The old name's route is retired first: one topic has one owner.
-    this.db.upsertChatMapping({
-      ...oldMapping,
-      enabled: false,
-      metadata: { ...oldMapping.metadata, mergedInto: chat.id, renamedTo: chat.id, renamedAt: Date.now() }
-    });
-    this.db.upsertChatMapping({
-      maxChatId: chat.id,
-      telegramChatId: oldMapping.telegramChatId,
-      telegramThreadId: oldMapping.telegramThreadId,
-      title: chat.title,
-      enabled: true,
-      metadata: {
-        ...oldMapping.metadata,
-        renamedFrom: oldChatId,
-        // A topic already made for the new name, now left unused.
-        abandonedThreadId: !sameTopic && ownMapping?.telegramThreadId ? ownMapping.telegramThreadId : undefined,
-        mergedInto: undefined,
-        renamedTo: undefined,
-        renamedAt: undefined
+    if (!mergedInto) {
+      const title = this.mutedChatIds.has(chat.id) ? `🔇 ${chat.title}` : chat.title;
+      try {
+        await this.telegramBot.renameTopic(oldMapping.telegramThreadId, title);
+      } catch (error) {
+        logger.warn({ err: error?.message, threadId: oldMapping.telegramThreadId }, 'Failed to rename the topic of a renamed chat');
       }
-    });
-
-    const title = this.mutedChatIds.has(chat.id) ? `🔇 ${chat.title}` : chat.title;
-    try {
-      await this.telegramBot.renameTopic(oldMapping.telegramThreadId, title);
-    } catch (error) {
-      logger.warn({ err: error?.message, threadId: oldMapping.telegramThreadId }, 'Failed to rename the topic of a renamed chat');
     }
     const route = { telegramChatId: oldMapping.telegramChatId, telegramThreadId: oldMapping.telegramThreadId };
-    await this.telegramBot.sendText(`✏️ В MAX этот чат теперь называется «${chat.title}» (раньше «${oldChatId}») — переписка продолжается здесь.`, route)
+    await this.telegramBot.sendText(`✏️ В MAX чат «${oldChatId}» теперь называется «${chat.title}» — переписка продолжается здесь.`, route)
       .catch((error) => logger.warn({ err: error?.message }, 'Failed to announce a renamed chat'));
     if (!sameTopic && ownMapping?.telegramThreadId) {
       await this.telegramBot.sendText(
@@ -1286,9 +1345,9 @@ export class BridgeService {
   }
 
   adoptLegacyId(message) {
-    // Still waiting for its reply quote, or for another try after a failed
-    // delivery: it is new, whatever its old id says.
-    if (this.pendingSeenCounts.has(message.id) || this.db.countFailedDeliveries(message.id, 'max_to_tg') > 0) return false;
+    // Still waiting for its reply quote or file, or delivering it was tried
+    // (it failed, or was cut short): it is new, whatever its old id says.
+    if (this.pendingSeenCounts.has(message.id) || this.db.hasDelivery(message.id, 'max_to_tg')) return false;
     const legacy = this.legacyRecordOf(message);
     if (!legacy) return false;
     // The same message, delivered (or primed) back then.
@@ -1454,7 +1513,8 @@ export class BridgeService {
     // Muted chats are a hard exclusion — unlike chronically-unreachable ones
     // they do not even keep a spot in the unread bucket: MAX's ad feeds are
     // "unread" almost permanently and would otherwise burn a poll slot.
-    const pollable = chats.filter((chat) => !this.mutedChatIds.has(chat.id));
+    // (A chat renamed in MAX lives on under its new name.)
+    const pollable = chats.filter((chat) => !this.mutedChatIds.has(chat.id) && !chat.metadata?.renamedTo);
     if (!pollable.length) return [];
     const unreadAll = pollable.filter((chat) => chat.metadata?.unread);
     // Chats that keep failing to open still deserve an occasional retry (MAX may
@@ -1498,7 +1558,7 @@ export class BridgeService {
       // with the same chat, so whether the chat is already picked never
       // changes the skip decision (see Fix 9 in the reply-feature review).
       if (this.chronicallyUnreachableChatIds.has(chat.id)) continue;
-      if (this.mutedChatIds.has(chat.id)) continue;
+      if (this.mutedChatIds.has(chat.id) || chat.metadata?.renamedTo) continue;
       picked.set(chat.id, chat);
     }
 
@@ -1801,13 +1861,19 @@ export class BridgeService {
         // swallowed as "already delivered". Only rows from before the current
         // page load count: signed URLs change only across page loads.
         const fingerprintPrefix = fingerprintWithoutMediaUrl(message.sourceMessageId, message.mediaUrl);
-        // Media forwarded before the time was part of ids is on record under
-        // the old id's prefix.
-        const legacyPrefix = message.metadata?.legacyId ? fingerprintWithoutMediaUrl(message.metadata.legacyId, message.mediaUrl) : '';
+        // Where ids a bubble had before still count (see legacyAdoptionEnd),
+        // the media may be on record under its old id's prefix (without the
+        // time — for a group member's photo just their name, so nowhere
+        // else), or under the chat's previous name.
+        const legacyPrefix = message.legacyMatchable && message.metadata?.legacyId
+          ? fingerprintWithoutMediaUrl(message.metadata.legacyId, message.mediaUrl)
+          : '';
+        const previousChatId = message.legacyMatchable ? this.db.getSetting(`renamed_from:${message.chatId}`, '') : '';
         const storedBefore = this.pageLoadedAt || undefined;
         if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix, storedBefore)
             || (legacyPrefix && legacyPrefix !== fingerprintPrefix
-              && this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, legacyPrefix, storedBefore))) {
+              && this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, legacyPrefix, storedBefore))
+            || (previousChatId && this.db.hasForwardedMediaCopy(previousChatId, message.mediaHash, fingerprintPrefix, storedBefore))) {
           this.db.updateDeliveryStatus(deliveryId, 'sent');
           logger.info(
             { messageId: message.id, chatId: message.chatId, mediaHash: message.mediaHash },
@@ -2198,20 +2264,30 @@ export class BridgeService {
     if (row.outgoing) {
       // A file we sent is known by its media token (see getLastOutgoingMediaFingerprint).
       const own = this.db.getTgToMaxMessageByMaxFingerprint(chatId, row.rawId)
-        || (row.legacyRawId ? this.db.getTgToMaxMessageByMaxFingerprint(chatId, row.legacyRawId) : null)
+        || this.legacyRecordForRow(chatId, row, (legacyId) => this.db.getTgToMaxMessageByMaxFingerprint(chatId, legacyId))
         || (row.mediaToken ? this.db.getTgToMaxMessageByMaxFingerprint(chatId, `media-token:${row.mediaToken}`) : null);
       const telegramMessageId = Number(own?.sourceMessageId) || null;
       const telegramChatId = own?.metadata?.telegramChatId ?? null;
       return telegramMessageId && telegramChatId ? { message: own, telegramChatId, telegramMessageId } : null;
     }
     const forwarded = this.db.getMessage(stableId('max', chatId, row.rawId))
-      || (row.legacyRawId ? this.db.getMessage(stableId('max', chatId, row.legacyRawId)) : null);
+      || this.legacyRecordForRow(chatId, row, (legacyId) => this.db.getMessage(stableId('max', chatId, legacyId)));
     if (!forwarded?.telegramMessageId) return null;
     // Older records do not say which Telegram chat they went to; the route's
     // chat is only trusted if the route has not changed since.
     const telegramChatId = forwarded.metadata?.telegramChatId
       ?? (mapping && mapping.updatedAt <= forwarded.createdAt ? mapping.telegramChatId : null);
     return telegramChatId ? { message: forwarded, telegramChatId, telegramMessageId: forwarded.telegramMessageId } : null;
+  }
+
+  // A record under the id a bubble had before (without its time): only while
+  // old ids count, and only one made in the bubble's minute — an old id is
+  // shared by every repeat of a text ("Ок" typed in MAX today is not the
+  // "Ок" sent from Telegram last week).
+  legacyRecordForRow(chatId, row, find) {
+    if (!row.legacyRawId || !this.legacyWindowOpen(chatId)) return null;
+    const record = find(row.legacyRawId);
+    return record && sameClockMinute(row.time, record.createdAt) ? record : null;
   }
 
   async handleTelegramReaction({ telegramChatId, telegramMessageId, emojis = [], previousEmojis = [], otherReactions = 0 }) {

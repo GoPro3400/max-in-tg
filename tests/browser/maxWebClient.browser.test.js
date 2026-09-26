@@ -59,7 +59,10 @@ const chats = () => ([
       { id: 't1', time: '14:04', text: ['Смотри ', { link: 'https://example.com/file/42' }] },
       { id: 't2', time: '14:05', text: ['Статья ', { link: 'https://example.com/a' }], share: { url: 'https://example.com/a', image: '/photo/prev.png' } },
       { id: 'f4', time: '14:06', file: { name: 'IMG_1.jpg', size: '2.00 MB', preview: '/photo/p3.png' } },
-      { id: 'l1', time: '14:07', location: true }
+      { id: 'l1', time: '14:07', location: true },
+      // Ours and theirs, the same minute, the same name: the same id.
+      { id: 'o2', time: '14:08', out: true, file: { name: 'Акт.pdf', size: '0.10 MB' } },
+      { id: 'f5', time: '14:08', file: { name: 'Акт.pdf', size: '0.10 MB' } }
     ]
   }
 ]);
@@ -119,6 +122,8 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     expect(legacy[0]).toBe(`Привет|${origin}/e/1f600.png`);
     expect(legacy[6]).toBe('Моё сообщение');
     expect(legacy.slice(2, 6)).toEqual(ids.slice(2, 6));
+    // The previous build numbered identical bubbles too.
+    expect(legacy.slice(8, 10)).toEqual(['ок', 'ок#d2']);
   });
 
   it('keeps animoji still and stickers animated', async () => {
@@ -248,7 +253,10 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     expect(at('14:02')).toMatchObject({ type: 'document', mediaPath: null });
     expect(at('14:02').metadata).toMatchObject({ fileTooBig: true, fileSize: Math.round(1.5 * 1024 ** 3) });
     expect(at('14:03').metadata.fileUnavailable).toBe(true);
-    expect(await client.page.evaluate(() => window.__downloads)).toEqual(['Отчёт.pdf', 'IMG_1.jpg']);
+    expect(await client.page.evaluate(() => window.__downloads)).toEqual(['Отчёт.pdf', 'IMG_1.jpg', 'Акт.pdf']);
+    // Theirs, not ours.
+    expect(await client.page.evaluate(() => window.__clickedFiles)).toEqual(['f1', 'f4', 'f5']);
+    expect(at('14:08').sourceMessageId).toBe('14:08|Акт.pdf');
     // A link in the text, and a link's preview card, are texts.
     expect(at('14:04')).toMatchObject({ type: 'text', mediaUrl: null, text: 'Смотри https://example.com/file/42' });
     expect(at('14:05')).toMatchObject({ type: 'text', mediaUrl: null });
@@ -284,6 +292,25 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     ]);
     // The chat titles still read the same.
     expect((await client.listChats()).map((chat) => chat.title)).toEqual(['Bob', 'Group', 'Files']);
+  });
+
+  it('learns the id of the open chat when MAX renames it (the address stays the same)', async () => {
+    await openChat('Group');
+    await openChat('Bob');
+    expect(client.activeMaxChatId).toBe('1001');
+    await client.page.evaluate(() => {
+      window.__chats[0].title = 'Bobby';
+      window.renderChats();
+    });
+    // Opened from Bob itself: another chat and back, then the id is sure.
+    await client.selectChat('Bobby');
+    expect(client.activeChatId).toBe('Bobby');
+    expect(client.activeMaxChatId).toBe('1001');
+    await client.page.evaluate(() => {
+      window.__chats[0].title = 'Bob';
+      window.renderChats();
+    });
+    await openChat('Bob');
   });
 
   it('notices a crashed page at once', async () => {

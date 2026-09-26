@@ -165,6 +165,7 @@ document.addEventListener('click', (ev) => {
   if (file && !file.disabled) {
     const name = findMsg(file.getAttribute('data-mid')).file.name;
     window.__downloads = (window.__downloads || []).concat([name]);
+    window.__clickedFiles = (window.__clickedFiles || []).concat([file.getAttribute('data-mid')]);
     const a = document.createElement('a');
     a.href = '/files/' + encodeURIComponent(name);
     a.download = name;

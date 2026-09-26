@@ -142,6 +142,38 @@ describe('forwardMaxMessage', () => {
     expect(telegramBot.sendMessage.mock.calls[0][0].id).toBe('m4b');
   });
 
+  it('re-forward guard: an old id (without the time) only counts where old ids still decide', async () => {
+    // A group member's uncaptioned photo had just her name for its old id's
+    // prefix: every later photo of hers with the same picture matched it.
+    const setup = () => {
+      const made = makeBridge();
+      linkChat(made.db, 'Семья');
+      made.db.insertMessage({
+        ...maxMessage('old-photo', 'Семья', { type: 'photo', sourceMessageId: 'Анна|https://i.oneme.ru/i?r=OLD&fn=w_1280' }),
+        createdAt: Date.now() - 86400000,
+        mediaHash: 'a1b2c3d4e5f60718'
+      });
+      made.bridge.pageLoadedAt = Date.now() - 1000;
+      return made;
+    };
+    const photo = (id) => maxMessage(id, 'Семья', {
+      type: 'photo',
+      mediaUrl: 'https://i.oneme.ru/i?r=NEW&fn=w_1280',
+      sourceMessageId: '13:00|https://i.oneme.ru/i?r=NEW&fn=w_1280',
+      metadata: { legacyId: 'Анна|https://i.oneme.ru/i?r=NEW&fn=w_1280' }
+    });
+
+    // Sent again today, below everything known: new.
+    const fresh = setup();
+    await fresh.bridge.forwardMaxMessage(photo('p-new'));
+    expect(fresh.telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+
+    // Old history on the first read after the update: the same photo.
+    const old = setup();
+    await old.bridge.forwardMaxMessage(Object.assign(photo('p-old'), { legacyMatchable: true }));
+    expect(old.telegramBot.sendMessage).not.toHaveBeenCalled();
+  });
+
   it('re-forward guard ignores copies from the current page load: an identical twin sent the same minute is new', async () => {
     const { bridge, db, telegramBot } = makeBridge();
     linkChat(db, 'chat-4');

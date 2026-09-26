@@ -15,19 +15,23 @@ const bubble = (chatId, time, text) => maxMessage(stableId('max', chatId, `${tim
   metadata: { time }
 });
 
-// A MAX client whose chats have the given ids in MAX and show these bubbles.
+// A MAX client whose chats have the given ids in MAX (known once a chat is
+// opened) and show these bubbles.
 const setup = ({ maxIds, screens }) => {
   const made = makeBridge();
   const { maxClient } = made;
-  maxClient.readMessages.mockImplementation(async (chatId) => {
+  maxClient.selectChat.mockImplementation(async (chatId) => {
     maxClient.activeChatId = chatId;
     maxClient.activeMaxChatId = maxIds[chatId] ?? null;
-    return (screens[chatId] || []).map((make) => make(chatId));
   });
+  maxClient.readMessages.mockImplementation(async (chatId) => (screens[chatId] || []).map((make) => make(chatId)));
   return made;
 };
 
-const listChat = (db, id, unread = true) => db.upsertChat({ id, title: id, lastSeenAt: Date.now(), metadata: { unread } });
+// As MAX's chat list shows it: with how many unread messages.
+const listChat = (db, id, unread = 1) => db.upsertChat({
+  id, title: id, lastSeenAt: Date.now(), metadata: { unread: unread > 0, unreadText: unread ? String(unread) : '' }
+});
 
 describe('a chat renamed in MAX', () => {
   it('carries on in its old topic, renamed, with its messages\' Telegram links', async () => {
@@ -38,8 +42,8 @@ describe('a chat renamed in MAX', () => {
     linkChat(db, OLD, { telegramThreadId: 77 });
     db.insertMessage({ ...bubble(OLD, '10:00', 'Привет'), telegramMessageId: 501 });
     db.setSetting('max_chat:123', OLD);
-    listChat(db, OLD, false);
-    listChat(db, NEW);
+    listChat(db, OLD, 0);
+    listChat(db, NEW, 1);
 
     await bridge.pollMax();
 
@@ -64,7 +68,7 @@ describe('a chat renamed in MAX', () => {
       screens: { [NEW]: [(chat) => bubble(chat, '10:00', 'Привет')] }
     });
     linkChat(db, OLD, { telegramThreadId: 77 });
-    linkChat(db, NEW, { telegramThreadId: 88, unread: true });
+    linkChat(db, NEW, { telegramThreadId: 88 });
     db.insertMessage({ ...bubble(OLD, '10:00', 'Привет'), telegramMessageId: 501 });
     db.setSetting('max_chat:123', OLD);
 
@@ -96,12 +100,73 @@ describe('a chat renamed in MAX', () => {
     expect(telegramBot.renameTopic).toHaveBeenCalledWith(77, `🔇 ${NEW}`);
   });
 
+  it('delivers new messages that repeat old ones, and never guesses by an old id there', async () => {
+    // Renamed, then "Отлично!" and "ок" — and an "ок" from long ago on record
+    // under the old name, by its old id (without the time).
+    const { bridge, db, telegramBot } = setup({
+      maxIds: { [NEW]: '123' },
+      screens: {
+        [NEW]: [
+          (chat) => bubble(chat, '10:00', 'Привет'),
+          (chat) => bubble(chat, '15:00', 'Отлично!'),
+          (chat) => ({ ...bubble(chat, '15:01', 'ок'), metadata: { time: '15:01', legacyId: 'ок' } })
+        ]
+      }
+    });
+    linkChat(db, OLD, { telegramThreadId: 77 });
+    db.insertMessage({ ...bubble(OLD, '10:00', 'Привет'), telegramMessageId: 501 });
+    db.insertMessage({ ...maxMessage(stableId('max', OLD, 'ок'), OLD, { text: 'ок', sourceMessageId: 'ок' }), telegramMessageId: 400 });
+    db.setSetting('max_chat:123', OLD);
+    listChat(db, OLD, 0);
+    listChat(db, NEW, 2);
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage.mock.calls.map(([sent]) => sent.text)).toEqual(['Отлично!', 'ок']);
+  });
+
+  it('keeps a chat merged into another topic merged there', async () => {
+    const { bridge, db, telegramBot } = setup({
+      maxIds: { [NEW]: '123' },
+      screens: { [NEW]: [(chat) => bubble(chat, '10:00', 'Привет')] }
+    });
+    linkChat(db, 'Семья', { telegramThreadId: 55 });
+    linkChat(db, OLD, { telegramThreadId: 77 });
+    bridge.mergeChat(OLD, -100500, 55);
+    db.setSetting('max_chat:123', OLD);
+    listChat(db, NEW, 0);
+
+    await bridge.pollMax();
+
+    const moved = db.getChatMapping(NEW);
+    expect(moved).toMatchObject({ telegramThreadId: 55, metadata: expect.objectContaining({ mergedInto: 'Семья' }) });
+    expect(db.getChatMappingByTelegramThread(-100500, 55).maxChatId).toBe('Семья');
+    // That topic is the other chat's, and keeps its name.
+    expect(telegramBot.renameTopic).not.toHaveBeenCalled();
+    expect(db.getSetting('max_chat:123')).toBe(NEW);
+  });
+
+  it('stops polling the old name', async () => {
+    const { bridge, db } = setup({
+      maxIds: { [NEW]: '123' },
+      screens: { [NEW]: [(chat) => bubble(chat, '10:00', 'Привет')] }
+    });
+    linkChat(db, OLD, { telegramThreadId: 77 });
+    db.setSetting('max_chat:123', OLD);
+    listChat(db, OLD, 0);
+    listChat(db, NEW, 0);
+
+    await bridge.pollMax();
+
+    expect(bridge.pickChatsForPoll().map((chat) => chat.id)).not.toContain(OLD);
+  });
+
   it('only remembers a chat\'s id when it is new, or the same chat\'s', async () => {
     const { bridge, db, telegramBot } = setup({
       maxIds: { [OLD]: '123' },
       screens: { [OLD]: [(chat) => bubble(chat, '10:00', 'Привет')] }
     });
-    linkChat(db, OLD, { telegramThreadId: 77, unread: true });
+    linkChat(db, OLD, { telegramThreadId: 77 });
 
     await bridge.pollMax();
     await bridge.pollMax();

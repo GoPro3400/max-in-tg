@@ -27,10 +27,15 @@ const recordLegacy = (db, text, telegramMessageId) => db.insertMessage({
 
 const sentTexts = (telegramBot) => telegramBot.sendMessage.mock.calls.map(([message]) => message.text);
 
+// What MAX's chat list says: how many of the chat's messages are unread
+// (they are new, whatever old id they share).
+const setUnread = (db, count) => db.upsertChat({ id: CHAT, title: CHAT, lastSeenAt: Date.now(), metadata: { unread: count > 0, unreadText: count ? String(count) : '' } });
+
 describe('message ids with the time in them', () => {
   it('does not deliver history again after the update, and keeps its Telegram links', async () => {
     const { bridge, db, maxClient, telegramBot } = makeBridge();
-    linkChat(db, CHAT, { unread: true });
+    linkChat(db, CHAT);
+    setUnread(db, 1);
     recordLegacy(db, 'Привет', 501);
     recordLegacy(db, 'Как дела', 502);
     maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Привет'), bubble('10:01', 'Как дела'), bubble('10:05', 'Новое')]);
@@ -41,18 +46,32 @@ describe('message ids with the time in them', () => {
     const adopted = db.getMessage(stableId('max', CHAT, '10:00|Привет'));
     expect(adopted.telegramMessageId).toBe(501);
     expect(adopted.metadata.adoptedFrom).toBe(stableId('max', CHAT, 'Привет'));
-    expect(db.getSetting(`timed_ids:${CHAT}`)).toBe('1');
+    expect(Number(db.getSetting(`timed_ids:${CHAT}`))).toBeGreaterThan(Date.now() - 60000);
+  });
+
+  it('never takes one of the unread messages for an old one', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, CHAT);
+    setUnread(db, 1);
+    // "Ок" last week, and "Ок" just now — the same old id.
+    recordLegacy(db, 'Ок', 501);
+    maxClient.readMessages.mockResolvedValue([bubble('09:00', 'Привет', { legacyId: 'Привет' }), bubble('15:00', 'Ок')]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toContain('Ок');
   });
 
   it('delivers a text repeating an older one once the chat is on the new ids', async () => {
     const { bridge, db, maxClient, telegramBot } = makeBridge();
-    linkChat(db, CHAT, { unread: true });
+    linkChat(db, CHAT);
     recordLegacy(db, 'Ок', 501);
     maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Ок')]);
     await bridge.pollMax();
     expect(telegramBot.sendMessage).not.toHaveBeenCalled();
 
     // The same "Ок" again, hours later: its old id is the first one's.
+    setUnread(db, 1);
     maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Ок'), bubble('15:00', 'Ок')]);
     await bridge.pollMax();
 
@@ -60,10 +79,11 @@ describe('message ids with the time in them', () => {
     expect(db.getMessage(stableId('max', CHAT, '15:00|Ок')).telegramMessageId).not.toBe(501);
   });
 
-  it('still recognises old history that scrolls into view above known bubbles', async () => {
+  it('still recognises old history that scrolls into view above known bubbles, for a week', async () => {
     const { bridge, db, maxClient, telegramBot } = makeBridge();
-    linkChat(db, CHAT, { unread: true });
-    db.setSetting(`timed_ids:${CHAT}`, '1');
+    linkChat(db, CHAT);
+    setUnread(db, 1);
+    db.setSetting(`timed_ids:${CHAT}`, String(Date.now() - 60000));
     recordLegacy(db, 'Давнее', 400);
     db.insertMessage(bubble('10:05', 'Новое'));
     maxClient.readMessages.mockResolvedValue([bubble('09:00', 'Давнее'), bubble('10:05', 'Новое'), bubble('10:06', 'Давнее')]);
@@ -76,10 +96,23 @@ describe('message ids with the time in them', () => {
     expect(db.getMessage(stableId('max', CHAT, '10:06|Давнее')).telegramMessageId).not.toBe(400);
   });
 
+  it('lets old ids decide nothing once that week is over', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, CHAT);
+    db.setSetting(`timed_ids:${CHAT}`, String(Date.now() - 8 * 24 * 3600 * 1000));
+    recordLegacy(db, 'Давнее', 400);
+    db.insertMessage(bubble('10:05', 'Новое'));
+    maxClient.readMessages.mockResolvedValue([bubble('09:00', 'Давнее'), bubble('10:05', 'Новое')]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Давнее']);
+  });
+
   it('delivers a message waiting for another try, whatever its old id says', async () => {
     const { bridge, db, maxClient, telegramBot } = makeBridge();
-    linkChat(db, CHAT, { unread: true });
-    db.setSetting(`timed_ids:${CHAT}`, '1');
+    linkChat(db, CHAT);
+    db.setSetting(`timed_ids:${CHAT}`, String(Date.now() - 60000));
     recordLegacy(db, 'Ок', 501);
     const retry = bubble('15:00', 'Ок');
     db.updateDeliveryStatus(db.createDelivery(retry.id, 'max_to_tg'), 'failed', 'Telegram was down');
@@ -91,9 +124,24 @@ describe('message ids with the time in them', () => {
     expect(sentTexts(telegramBot)).toEqual(['Ок']);
   });
 
+  it('delivers a message whose delivery was cut short, whatever its old id says', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, CHAT);
+    db.setSetting(`timed_ids:${CHAT}`, String(Date.now() - 60000));
+    recordLegacy(db, 'Ок', 501);
+    const stuck = bubble('15:00', 'Ок');
+    db.createDelivery(stuck.id, 'max_to_tg'); // still "pending": the process stopped mid-way
+    db.insertMessage(bubble('15:01', 'Потом'));
+    maxClient.readMessages.mockResolvedValue([stuck, bubble('15:01', 'Потом')]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Ок']);
+  });
+
   it('finishes the switch on the next read when flood control cut the first one short', async () => {
     const { bridge, db, maxClient, telegramBot } = makeBridge();
-    linkChat(db, CHAT, { unread: true });
+    linkChat(db, CHAT);
     recordLegacy(db, 'Привет', 501);
     recordLegacy(db, 'Пока', 502);
     const screen = [bubble('10:00', 'Привет'), bubble('10:05', 'Новое'), bubble('10:06', 'Пока')];
@@ -112,7 +160,7 @@ describe('message ids with the time in them', () => {
 
     expect(sentTexts(telegramBot)).toEqual(['Новое']);
     expect(db.getMessage(stableId('max', CHAT, '10:06|Пока')).telegramMessageId).toBe(502);
-    expect(db.getSetting(`timed_ids:${CHAT}`)).toBe('1');
+    expect(Number(db.getSetting(`timed_ids:${CHAT}`))).toBeGreaterThan(0);
   });
 
   it('does not finish the switch on an empty read', async () => {

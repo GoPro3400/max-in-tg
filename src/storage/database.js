@@ -243,14 +243,17 @@ export class AppDatabase {
     `);
 
     // Telegram message ids are only unique within one Telegram chat; after a
-    // move to another relay group the newest match is the relevant one.
+    // move to another relay group the newest match is the relevant one. On a
+    // tie the later row: a bubble recorded again under its current id (see
+    // BridgeService.adoptLegacyId) shares its Telegram message and creation
+    // time with its old record, and the current id is the one MAX shows.
     this.getMessageByTelegramMessageIdStmt = this.db.prepare(
-      'SELECT * FROM messages WHERE telegram_message_id = ? ORDER BY created_at DESC LIMIT 1'
+      'SELECT * FROM messages WHERE telegram_message_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
     );
     // Every message a Telegram message id may refer to — ids repeat across
     // Telegram chats, so the caller picks the one in the right chat.
     this.listByTelegramMessageIdStmt = this.db.prepare(
-      'SELECT * FROM messages WHERE telegram_message_id = ? ORDER BY created_at DESC LIMIT 20'
+      'SELECT * FROM messages WHERE telegram_message_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 20'
     );
     this.listTgToMaxBySourceIdStmt = this.db.prepare(`
       SELECT * FROM messages
@@ -355,6 +358,9 @@ export class AppDatabase {
     this.countFailedDeliveriesStmt = this.db.prepare(`
       SELECT COUNT(*) AS n FROM message_deliveries
       WHERE message_id = ? AND direction = ? AND status = 'failed'
+    `);
+    this.hasDeliveryStmt = this.db.prepare(`
+      SELECT 1 FROM message_deliveries WHERE message_id = ? AND direction = ? LIMIT 1
     `);
 
     // Finds the most recent stored message in a MAX chat whose text matches the
@@ -680,6 +686,16 @@ export class AppDatabase {
 
   countFailedDeliveries(messageId, direction) {
     return this.countFailedDeliveriesStmt.get(messageId, direction).n;
+  }
+
+  // Whether delivering this message was ever tried, whatever came of it.
+  hasDelivery(messageId, direction) {
+    return Boolean(this.hasDeliveryStmt.get(messageId, direction));
+  }
+
+  // Runs fn in one transaction: all of its writes, or none.
+  transaction(fn) {
+    return this.db.transaction(fn)();
   }
 }
 

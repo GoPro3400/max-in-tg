@@ -116,15 +116,20 @@ const REACTION_SCAN_MAX_AGE_MS = 5000;
 
 // What MAX says someone is doing ("записывает аудио", "sending a file"…), as
 // the Telegram chat action showing the same.
+// The label ends with what they do, after the names ("Фотограф Анна
+// печатает" is typing).
 const TYPING_ACTIONS = [
-  [/аудио|голосов|voice|audio/i, 'record_voice'],
-  [/видеосообщ|video message/i, 'record_video_note'],
-  [/видео|video/i, 'upload_video'],
-  [/фото|photo/i, 'upload_photo'],
-  [/файл|file/i, 'upload_document'],
-  [/стикер|sticker/i, 'choose_sticker']
+  [/(записыва\S*|recording)\s+(аудио|голосовое\S*|a voice message|audio)$/i, 'record_voice'],
+  [/(записыва\S*|recording)\s+(видеосообщение|a video message)$/i, 'record_video_note'],
+  [/(отправля\S*|sending)\s+(видео|a video)$/i, 'upload_video'],
+  [/(отправля\S*|sending)\s+(фото|a photo)$/i, 'upload_photo'],
+  [/(отправля\S*|sending)\s+(файл|a file)$/i, 'upload_document'],
+  [/(выбира\S*|choosing|selecting)\s+(стикер|a sticker)$/i, 'choose_sticker']
 ];
-export const typingAction = (label) => TYPING_ACTIONS.find(([pattern]) => pattern.test(label || ''))?.[1] || 'typing';
+export const typingAction = (label) => {
+  const text = String(label || '').replace(/\s+/g, ' ').trim();
+  return TYPING_ACTIONS.find(([pattern]) => pattern.test(text))?.[1] || 'typing';
+};
 
 // Files bigger than this are not downloaded from MAX: a bot may upload at most
 // 50 MB to Telegram, so the bridge could only say it is too big — after the
@@ -141,6 +146,7 @@ const VIDEO_NOTE_MISSING = '📹 Видеосообщение — не удал�
 const reactionRowOf = (row) => ({
   rawId: row.rawId,
   legacyRawId: row.legacyRawId && row.legacyRawId !== row.rawId ? row.legacyRawId : null,
+  time: row.time || '',
   outgoing: Boolean(row.outgoing),
   mediaToken: (/[?&]r=([^&]+)/.exec(row.mediaUrl || '') || [])[1] || null,
   reactions: (row.reactions || []).map(({ emoji, count, active }) => ({ emoji, count, active: Boolean(active) })),
@@ -575,7 +581,7 @@ export class MaxWebClient {
     }), selectors);
   }
 
-  async selectChat(chatIdOrIndex) {
+  async selectChat(chatIdOrIndex, { detour = true } = {}) {
     await this.ensurePage();
 
     const url = this.page.url();
@@ -591,9 +597,10 @@ export class MaxWebClient {
     // Try to find the chat in the visible list; if not found, scroll down
     // to load virtualized items that are off-screen.
     let chat = null;
+    let chats = [];
     const maxScrollAttempts = 10;
     for (let attempt = 0; attempt <= maxScrollAttempts; attempt++) {
-      const chats = await this.listChats();
+      chats = await this.listChats();
       chat = chats.find((candidate, index) =>
         candidate.id === chatIdOrIndex || String(index + 1) === String(chatIdOrIndex)
       );
@@ -628,6 +635,7 @@ export class MaxWebClient {
     // under the click) cannot leave activeChatId naming a chat that is not on
     // screen — readMessages/sendText skip re-selection when the ids match, and
     // would then read or type into whatever chat the page actually shows.
+    const previousChatId = this.activeChatId;
     const maxIdBefore = await this.currentMaxChatId();
     this.activeChatId = null;
     this.activeChatTitle = null;
@@ -670,6 +678,23 @@ export class MaxWebClient {
     // it can never be the previous chat's.
     const maxIdAfter = await this.currentMaxChatId();
     this.activeMaxChatId = maxIdAfter && maxIdAfter !== maxIdBefore ? maxIdAfter : null;
+    // Another title opened and the address stayed: the chat that was open,
+    // renamed in MAX — or the address is late. Opening another chat and
+    // coming back tells which, and gives a renamed chat its id (the bridge
+    // recognises it by that: BridgeService.noteMaxChatId).
+    if (!this.activeMaxChatId && maxIdAfter && detour && previousChatId && previousChatId !== chat.id) {
+      const other = chats.find((candidate) => candidate.id !== chat.id && candidate.id !== previousChatId);
+      if (other) {
+        logger.debug({ chatId: chat.id, via: other.id }, 'Chat opened without its address changing — opening another one and coming back');
+        try {
+          await this.selectChat(other.id, { detour: false });
+        } catch (error) {
+          // Not this chat's failure: it is opened again all the same.
+          logger.debug({ err: error?.message, via: other.id }, 'Could not open another chat on the way');
+        }
+        return this.selectChat(chat.id, { detour: false });
+      }
+    }
 
     // Mark the chat active BEFORE the scroll below. Scrolling lazy-loads message
     // bubbles and triggers MAX to fetch their media (e.g. sticker Lottie); those
@@ -980,7 +1005,9 @@ export class MaxWebClient {
         const fingerprintMediaUrl = (fingerprintImg?.src || '') || legacySrc('audio')
           || legacySrc('video') || legacySrc('source[type="video"], source[type="webm"]') || legacyDocumentLink?.href || '';
         const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
-        const fallbackId = [author, time, fingerprintText, fingerprintMediaUrl].filter(Boolean).join('|');
+        // An uncaptioned file is known by its name too: by its time alone, a
+        // file sent at the same minute of another day was taken for it.
+        const fallbackId = [author, time, fingerprintText || (fileCard ? documentFileName : ''), fingerprintMediaUrl].filter(Boolean).join('|');
         const rawId = explicitId || fallbackId || `visible-${index}`;
         // The id this bubble had before the time was part of it — for finding
         // messages recorded under it (see BridgeService.adoptLegacyId).
@@ -1065,6 +1092,7 @@ export class MaxWebClient {
       const voiceCounts = new Map();
       const sameCounts = new Map();
       const legacyVoiceCounts = new Map();
+      const legacySameCounts = new Map();
       for (const row of rows) {
         if (row.rawId.startsWith('visible-')) continue;
         if (!row.outgoing && (row.hasVoiceElement || row.hasRoundVideoElement || row.hasDuration)) {
@@ -1081,6 +1109,11 @@ export class MaxWebClient {
         const n = (sameCounts.get(key) || 0) + 1;
         sameCounts.set(key, n);
         if (n > 1) row.rawId = `${row.rawId}#d${n}`;
+        // The previous build numbered its ids the same way.
+        const legacyKey = `${row.outgoing ? 'out' : 'in'}\u0000${row.legacyRawId}`;
+        const legacyN = (legacySameCounts.get(legacyKey) || 0) + 1;
+        legacySameCounts.set(legacyKey, legacyN);
+        if (legacyN > 1) row.legacyRawId = `${row.legacyRawId}#d${legacyN}`;
       }
       return rows;
     }, selectors, DOCUMENT_LINK_FALLBACK_SELECTOR, BUBBLE_DECOR);
@@ -1312,6 +1345,11 @@ export class MaxWebClient {
         }
       }));
 
+    // Whether the bridge already has this message (then nothing is fetched
+    // for it) — told also how far from the newest message it is.
+    const knownMessage = (msg) => Boolean(isKnown
+      && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId, messages.length - 1 - messages.indexOf(msg)));
+
     const stickerSourceFor = (msg) => filtered.find((f) => (f._stickerDataUrl || f._needsScreenshot)
       && stableId('max', this.activeChatId || chatId, f.rawId) === msg.id);
     // Network captures (a Lottie file, a sticker image) cannot be tied to a
@@ -1319,11 +1357,11 @@ export class MaxWebClient {
     // to the first one and the next to the second — the animations came out
     // swapped. They are only used when a single sticker is waiting; otherwise
     // each sticker is captured from its own canvas.
-    const pendingStickers = messages.filter((msg) => !(isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) && stickerSourceFor(msg)).length;
+    const pendingStickers = messages.filter((msg) => !(knownMessage(msg)) && stickerSourceFor(msg)).length;
     const networkStickerUsable = pendingStickers <= 1;
 
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) continue;
+      if (knownMessage(msg)) continue;
       const src = stickerSourceFor(msg);
       if (!src) continue;
 
@@ -1455,21 +1493,33 @@ export class MaxWebClient {
       }
     }
 
-    // Voice messages and video notes are fetched by clicking their own bubble
-    // (see clickInBubble).
+    // Voice messages, video notes and files are fetched by clicking their own
+    // bubble (see clickInBubble). What MAX loaded before the click cannot be
+    // tied to a bubble, so — as for stickers — it is only used when a single
+    // message of its kind is waiting; otherwise two would swap.
+    const waitingOf = (predicate) => messages.filter((msg) => !msg.mediaPath
+      && !(knownMessage(msg)) && predicate(msg)).length;
+    const rowFor = (msg) => filtered.find((f) => stableId('max', this.activeChatId || chatId, f.rawId) === msg.id) || {};
+    const isVideoNoteRow = (row) => Boolean(row.hasRoundVideoElement || row.type === 'video_note');
+    const waitingVideoNotes = waitingOf((msg) => isVideoNoteRow(rowFor(msg)));
+    const waitingVoices = waitingOf((msg) => {
+      const row = rowFor(msg);
+      return !isVideoNoteRow(row) && Boolean(row.hasVoiceElement || row.type === 'voice');
+    });
+    const waitingDocuments = waitingOf((msg) => msg.type === 'document' && !msg.mediaUrl);
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) continue;
+      if (knownMessage(msg)) continue;
       if (msg.mediaPath) continue;
       if (msg.type !== 'text' && msg.type !== 'voice' && msg.type !== 'video_note') continue;
 
       const src = filtered.find((f) => (f.hasVoiceElement || f.hasRoundVideoElement || f.hasDuration) && stableId('max', this.activeChatId || chatId, f.rawId) === msg.id);
       if (!src) continue;
 
-      const msgIsKnown = isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId);
+      const msgIsKnown = knownMessage(msg);
 
       if (src.hasRoundVideoElement || src.type === 'video_note') {
         if (msgIsKnown) continue;
-        let networkVideo = this.findNetworkVideo();
+        let networkVideo = waitingVideoNotes === 1 ? this.findNetworkVideo() : null;
         if (!networkVideo) {
           networkVideo = await this.triggerVideoNoteDownload(chatId, src.rawId);
         }
@@ -1493,7 +1543,7 @@ export class MaxWebClient {
         }
       } else if (src.hasVoiceElement || src.type === 'voice') {
         if (msgIsKnown) continue;
-        let networkVoice = this.findNetworkVoice();
+        let networkVoice = waitingVoices === 1 ? this.findNetworkVoice() : null;
         if (!networkVoice) {
           networkVoice = await this.triggerVoiceDownload(src, chatId);
         }
@@ -1525,7 +1575,7 @@ export class MaxWebClient {
     // Handle documents (PDFs, etc.): fetched by clicking their own bubble
     // (see clickInBubble).
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) continue;
+      if (knownMessage(msg)) continue;
       if (msg.mediaPath) continue;
       if (msg.type !== 'document') continue;
 
@@ -1541,7 +1591,7 @@ export class MaxWebClient {
         msg.metadata.fileTooBig = true;
       } else {
         // Need to trigger click to download
-        let networkDoc = this.findNetworkDocument();
+        let networkDoc = waitingDocuments === 1 ? this.findNetworkDocument() : null;
         if (!networkDoc) {
           networkDoc = await this.triggerDocumentDownload(chatId, msg.sourceMessageId);
         }
@@ -1622,11 +1672,15 @@ export class MaxWebClient {
       // the id it was given (numbering of identical bubbles included) — the
       // two used to compute it separately and drift apart.
       const rows = await this.scrapeMessageRows();
-      // A fingerprint stored before the time was part of ids is that bubble's
-      // legacy id.
-      const row = [...rows].reverse().find((candidate) => (mediaToken
+      const exact = [...rows].reverse().find((candidate) => (mediaToken
         ? mediaTokenOf(candidate.mediaUrl) === mediaToken
-        : candidate.rawId === fingerprint || candidate.legacyRawId === fingerprint));
+        : candidate.rawId === fingerprint));
+      // A fingerprint stored before the time was part of ids is a bubble's
+      // legacy id — which every repeat of the text shares, so only a bubble
+      // alone with it on screen is taken (no quote rather than a wrong one).
+      const legacy = (exact || mediaToken) ? [] : rows.filter((candidate) => candidate.legacyRawId === fingerprint);
+      if (legacy.length > 1) return null;
+      const row = exact || legacy[0];
       const box = row?.box;
 
       if (box) {
@@ -2307,7 +2361,9 @@ export class MaxWebClient {
   async clickInBubble(rawId, targets) {
     if (!rawId) return false;
     const rows = await this.scrapeMessageRows();
-    const index = rows.findIndex((row) => row.rawId === rawId);
+    // Only incoming bubbles are fetched, and ids are numbered per direction:
+    // our own file sent in the same minute may share the id.
+    const index = rows.findIndex((row) => !row.outgoing && row.rawId === rawId);
     if (index < 0) return false;
     return this.page.$$eval(this.selectors.messageItem, (nodes, i, box, selectorList) => {
       const node = nodes[i];

@@ -20,6 +20,26 @@ puppeteer.use(StealthPlugin());
 // sit inside the bridge's global lock for the whole protocol timeout (minutes).
 const BROWSER_CLOSE_TIMEOUT_MS = 15000;
 
+// Every ElementHandle pins its node — and through it the DOM that node belongs
+// to — in the renderer until it is disposed, and the MAX page is never
+// navigated. The handles this client used to drop on every chat switch (the
+// chat-row list, the first bubble it waited for) kept one entire old chat view
+// alive per switch: on a MAX-like test page, 146k DOM nodes after 400 switches
+// against ~400 with them disposed. That — not MAX itself — was the bulk of the
+// renderer growth behind the old 2-hourly restart.
+const disposeHandles = async (...handles) => {
+  await Promise.all(handles.flat().filter(Boolean).map((handle) => handle.dispose().catch(() => {})));
+};
+
+// Puppeteer enables the Network domain with no size limits, so Chromium keeps
+// up to 200 MB of response bodies for the page — copying an image's body into
+// that buffer when the image itself is garbage-collected — and only a
+// navigation empties it. With the HTTP cache off (see start()) every chat
+// switch re-downloads every picture, so the buffer filled to its cap and
+// stayed there (+250 MB measured). Capped, response.buffer() still works for
+// anything up to the per-resource limit.
+const NETWORK_BUFFER_LIMITS = { maxTotalBufferSize: 64 * 1024 * 1024, maxResourceBufferSize: 20 * 1024 * 1024 };
+
 const MAX_CAPTURE_MAP_SIZE = 100;
 const capMap = (map, maxSize = MAX_CAPTURE_MAP_SIZE) => {
   if (map.size >= maxSize) {
@@ -107,6 +127,11 @@ export class MaxWebClient {
     // the page cache so every sticker is re-fetched over the network and our
     // interceptor reliably sees the Lottie.
     await this.page.setCacheEnabled(false);
+    // Must go through Puppeteer's own session (a second CDP session would get a
+    // second, uncapped buffer); it survives reloads.
+    await this.page._client?.().send('Network.enable', NETWORK_BUFFER_LIMITS).catch((error) => {
+      logger.warn({ err: error?.message || String(error) }, 'Could not cap the DevTools network buffer');
+    });
 
     // Set download path for document downloads
     this.downloadDir = path.join(this.mediaDir, 'downloads');
@@ -200,16 +225,6 @@ export class MaxWebClient {
           }
         }
 
-        if (url.includes('max.ru') && !url.includes('.js') && !url.includes('.css') && !url.includes('.woff') && !url.includes('.svg') && !url.includes('favicon') && !url.includes('/_app/immutable/')) {
-          try {
-            const buffer = await response.buffer();
-            if (buffer.length > 5000 && buffer.length < 500000 && ct.includes('audio')) {
-              logger.debug({ url, size: buffer.length, contentType: ct }, 'Potential voice: audio response from max.ru');
-            }
-          } catch (error) {
-            logger.debug({ url, err: error.message }, 'Failed to capture max.ru audio response buffer');
-          }
-        }
       } catch (err) {
         logger.debug({ err }, 'response capture handler error');
       }
@@ -235,7 +250,7 @@ export class MaxWebClient {
   }
 
   async waitForReady(timeoutMs = 120000) {
-    await this.page.waitForSelector(this.selectors.chatList, { timeout: timeoutMs });
+    await this.waitForSelectorFree(this.selectors.chatList, { timeout: timeoutMs });
     const url = this.page.url();
     if (!url.includes('web.max.ru')) {
       throw new Error(`Max Web session may have expired. Current URL: ${url}`);
@@ -484,10 +499,6 @@ export class MaxWebClient {
       throw new Error(`Max chat not found: ${chatIdOrIndex}`);
     }
 
-    const chatItems = await this.page.$$(this.selectors.chatItem);
-    const targetNode = chatItems[chat.metadata.index];
-    if (!targetNode) throw new Error(`Chat node index not found: ${chat.metadata.index}`);
-
     // From the click on, the page no longer shows the previous chat. Forget it
     // now, so a switch that fails below (title never verified, list reordered
     // under the click) cannot leave activeChatId naming a chat that is not on
@@ -496,14 +507,17 @@ export class MaxWebClient {
     this.activeChatId = null;
     this.activeChatTitle = null;
 
-    await targetNode.evaluate((node) => {
+    // Clicked inside the page: no ElementHandles, so nothing is pinned (see
+    // disposeHandles).
+    const clicked = await this.page.evaluate((selector, index) => {
+      const node = document.querySelectorAll(selector)[index];
+      if (!node) return false;
       const btn = node.querySelector('button.cell') || node;
       btn.scrollIntoView({ block: 'center' });
-    });
-    await targetNode.evaluate((node) => {
-      const btn = node.querySelector('button.cell') || node;
       btn.click();
-    });
+      return true;
+    }, this.selectors.chatItem, chat.metadata.index);
+    if (!clicked) throw new Error(`Chat node index not found: ${chat.metadata.index}`);
 
     // Scroll chat list back to top so future listChats sees top items
     await this.page.evaluate((sel) => {
@@ -530,7 +544,7 @@ export class MaxWebClient {
     this.activeChatTitle = chat.title;
 
     // Wait for message bubbles to render (lazy-loaded after chat opens)
-    await this.page.waitForSelector(this.selectors.messageItem, { timeout: 5000 }).catch(() => null);
+    await this.waitForSelectorFree(this.selectors.messageItem, { timeout: 5000 }).catch(() => null);
 
     // Scroll message area to bottom to ensure newest messages are visible
     await this.scrollMessageListToBottom();
@@ -993,9 +1007,10 @@ export class MaxWebClient {
       // chat wallpaper behind an unrendered sticker and sent it as a photo.
 
       if (!saved && src._needsScreenshot) {
+        let elements = [];
         try {
           const selector = `${selectors.messageItem} canvas`;
-          const elements = await this.page.$$(selector);
+          elements = await this.page.$$(selector);
           const stickerIdx = stickerIndices.indexOf(src.stickerIndex);
           const el = elements[stickerIdx];
           logger.debug({ chatId, hasCanvasEl: Boolean(el), canvasCount: elements.length }, 'Sticker strategy: canvas element screenshot');
@@ -1011,6 +1026,8 @@ export class MaxWebClient {
           }
         } catch (error) {
           logger.warn({ err: error, chatId }, 'Failed to screenshot sticker canvas');
+        } finally {
+          await disposeHandles(elements);
         }
       }
 
@@ -1267,13 +1284,14 @@ export class MaxWebClient {
   // silently engaging reply mode on it instead.
   async replyToMessage(fingerprint) {
     if (!fingerprint) return false;
+    let candidates = [];
     try {
       const box = await this.findAndHoverMessage(fingerprint);
       if (!box) {
         logger.warn({ fingerprint }, 'replyToMessage: target bubble not found');
         return false;
       }
-      const candidates = await this.page.$$(this.selectors.messageReplyButton);
+      candidates = await this.page.$$(this.selectors.messageReplyButton);
       if (!candidates.length) {
         logger.warn({ fingerprint }, 'replyToMessage: Reply button not present after hover');
         return false;
@@ -1292,11 +1310,13 @@ export class MaxWebClient {
         return false;
       }
       await matches[0].click();
-      await this.page.waitForSelector(this.selectors.composerReplyActive, { timeout: 3000, visible: true });
+      await this.waitForSelectorFree(this.selectors.composerReplyActive, { timeout: 3000, visible: true });
       return true;
     } catch (error) {
       logger.warn({ err: error, fingerprint }, 'replyToMessage: failed to engage reply mode');
       return false;
+    } finally {
+      await disposeHandles(candidates);
     }
   }
 
@@ -1316,7 +1336,7 @@ export class MaxWebClient {
     // below restores scroll-to-bottom on every exit path (success or throw),
     // not just the happy path — see Fix 1 in the reply-feature review.
     try {
-      await this.page.waitForSelector(this.selectors.composer, { timeout: 30000 });
+      await this.waitForSelectorFree(this.selectors.composer, { timeout: 30000 });
       await this.page.focus(this.selectors.composer);
       await this.typeIntoComposer(text, { timeoutMs: this.config.protocolTimeoutMs || 60000 });
       await this.submitComposer();
@@ -1328,8 +1348,7 @@ export class MaxWebClient {
         // sent (to any chat) would silently become a wrong-target reply.
         // Best-effort cancel; never let a failure here mask the real error.
         try {
-          const closeBtn = await this.page.$(this.selectors.composerReplyActive);
-          if (closeBtn) await closeBtn.click();
+          await this.clickSelector(this.selectors.composerReplyActive);
         } catch (cancelError) {
           logger.warn({ err: cancelError, chatId }, 'sendText: failed to cancel reply mode after send failure');
         }
@@ -1386,18 +1405,16 @@ export class MaxWebClient {
     // else). Setting the input directly does nothing, so we drive the menu.
     const isImageOrVideo = /\.(jpe?g|png|gif|webp|bmp|heic|heif|mp4|webm|mov|m4v|mkv)$/i.test(absolutePath);
     const menuItemSel = isImageOrVideo ? this.selectors.attachMenuMedia : this.selectors.attachMenuFile;
-    const attachBtn = await this.page.$(this.selectors.attachButton);
-    if (!attachBtn) throw new Error(`sendFile: attach button not found (${this.selectors.attachButton})`);
-    await attachBtn.click();
-    await this.page.waitForSelector(menuItemSel, { timeout: 10000 });
+    if (!await this.clickSelector(this.selectors.attachButton)) {
+      throw new Error(`sendFile: attach button not found (${this.selectors.attachButton})`);
+    }
+    await this.waitForSelectorFree(menuItemSel, { timeout: 10000 });
     const [fileChooser] = await Promise.all([
       this.page.waitForFileChooser({ timeout: 15000 }),
       this.page.click(menuItemSel)
     ]);
     await fileChooser.accept([absolutePath]);
     logger.debug({ chatId, filePath: absolutePath }, 'File accepted via attach menu');
-
-    await this.captureDiagnostics('after-file-accept').catch(() => null);
 
     // --- Step 2: wait for evidence the attachment is staged in the composer ---
     // Poll up to 10 s for a preview/thumbnail element that appears after accept.
@@ -1431,10 +1448,7 @@ export class MaxWebClient {
     ).catch(() => 0);
 
     // --- Step 4: click send button (or fall back to Enter) ---
-    const sendBtn = await this.page.$(this.selectors.sendButton);
-    if (sendBtn) {
-      await sendBtn.click();
-    } else {
+    if (!await this.clickSelector(this.selectors.sendButton)) {
       await this.page.keyboard.press('Enter');
     }
 
@@ -1455,9 +1469,11 @@ export class MaxWebClient {
       await new Promise((r) => setTimeout(r, sendConfirmPollMs));
     }
 
-    await this.captureDiagnostics('after-send').catch(() => null);
-
     if (!confirmed) {
+      // Only on failure: two full-page screenshots + HTML dumps on EVERY file
+      // send were pure overhead, and pushed the dumps of real failures out of
+      // the retention window.
+      await this.captureDiagnostics('send-not-confirmed').catch(() => null);
       logger.error({ chatId, filePath: absolutePath, outgoingCountBefore, outgoingBubbleSel }, 'sendFile: no new outgoing message bubble detected after send');
       throw new Error(`sendFile: file send not confirmed — no new outgoing bubble appeared (chatId=${chatId}, file=${absolutePath}). Selector may need tuning; check diagnostics.`);
     }
@@ -1467,7 +1483,7 @@ export class MaxWebClient {
 
   async isTyping() {
     await this.ensurePage();
-    return Boolean(await this.page.$(this.selectors.typing));
+    return this.page.evaluate((selector) => Boolean(document.querySelector(selector)), this.selectors.typing);
   }
 
   async healthCheck() {
@@ -1950,7 +1966,33 @@ export class MaxWebClient {
   async getBrowserMemoryUsage() {
     const pid = this.browser?.process?.()?.pid;
     if (!pid) return null;
-    return measureProcessTreeMemory(pid);
+    const usage = await measureProcessTreeMemory(pid);
+    if (!usage) return null;
+    // DOM node count and JS heap of the MAX page: what the handle leak used to
+    // grow, so a regression shows up in /status and the logs.
+    const metrics = await this.page?.metrics().catch(() => null);
+    if (metrics) usage.page = { domNodes: metrics.Nodes, jsHeapBytes: metrics.JSHeapUsedSize };
+    return usage;
+  }
+
+  // Reloads the MAX page in place: drops the renderer's DOM, JS heap and
+  // DevTools network buffer (the network cap, the response listener and the
+  // download behaviour all survive a reload). Much cheaper than a browser
+  // relaunch. The caller holds the bridge's lock and waits for the chat list.
+  async reloadPage({ timeoutMs = 60000 } = {}) {
+    await this.ensurePage();
+    this.activeChatId = null;
+    this.activeChatTitle = null;
+    this.clearMediaCaches();
+    // A beforeunload prompt would block the reload forever.
+    const acceptDialog = (dialog) => { dialog.accept().catch(() => {}); };
+    this.page.on('dialog', acceptDialog);
+    try {
+      await this.page.reload({ waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    } finally {
+      this.page.off('dialog', acceptDialog);
+    }
+    logger.info('Reloaded the MAX page');
   }
 
   async captureDiagnostics(reason, { throttleMs = 0 } = {}) {
@@ -2032,6 +2074,27 @@ export class MaxWebClient {
     if (!this.page) throw new Error('Max Web page is not started');
   }
 
+  // waitForSelector without keeping the handle it resolves to (see
+  // disposeHandles). Resolves true when the element appeared.
+  async waitForSelectorFree(selector, options) {
+    const handle = await this.page.waitForSelector(selector, options);
+    await disposeHandles(handle);
+    return Boolean(handle);
+  }
+
+  // Clicks the first match like a user would (real mouse events, which MAX's
+  // buttons need), then lets the handle go. False when nothing matched.
+  async clickSelector(selector) {
+    const handle = await this.page.$(selector);
+    if (!handle) return false;
+    try {
+      await handle.click();
+    } finally {
+      await disposeHandles(handle);
+    }
+    return true;
+  }
+
   async verifyActiveChat(chat) {
     const title = await this.page.evaluate((selector) => {
       const el = document.querySelector(selector);
@@ -2050,10 +2113,7 @@ export class MaxWebClient {
   }
 
   async submitComposer() {
-    const sendButton = await this.page.$(this.selectors.sendButton);
-    if (sendButton) {
-      await sendButton.click();
-    } else {
+    if (!await this.clickSelector(this.selectors.sendButton)) {
       await this.page.keyboard.press('Enter');
     }
 

@@ -80,6 +80,9 @@ const BROWSER_RECYCLE_MIN_AGE_MS = 15 * 60 * 1000;
 // still holds the lock. Telegram sends queued behind the lock then run against
 // a usable page rather than a half-painted one.
 const BROWSER_RECYCLE_READY_TIMEOUT_MS = 90 * 1000;
+// Still above the reload threshold this soon after a reload: relaunch instead.
+const RELOAD_ESCALATION_WINDOW_MS = 30 * 60 * 1000;
+const BROWSER_MEMORY_LOG_INTERVAL_MS = 30 * 60 * 1000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const toMb = (bytes) => Math.round(bytes / (1024 * 1024));
@@ -180,8 +183,13 @@ export class BridgeService {
     // Chromium was launched, when its memory was last read (and the reading),
     // how many recycles ran, and whether one is running right now.
     this.browserStartedAt = 0;
+    // When the current MAX page was loaded (browser start or reload): MAX
+    // re-signs media URLs on every load (see the re-forward guard).
+    this.pageLoadedAt = 0;
     this.lastBrowserMemoryCheckAt = 0;
+    this.lastBrowserMemoryLogAt = 0;
     this.lastBrowserMemory = null;
+    this.pageReloads = 0;
     this.browserRecycles = 0;
     this.lastBrowserRecycle = null;
     this.browserRecycling = false;
@@ -357,6 +365,7 @@ export class BridgeService {
     try {
       await this.maxClient.start();
       this.browserStartedAt = Date.now();
+      this.pageLoadedAt = this.browserStartedAt;
       this.lastBrowserMemoryCheckAt = 0;
     } catch (error) {
       await this.maxClient.captureDiagnostics('startup-failed').catch(() => null);
@@ -682,13 +691,17 @@ export class BridgeService {
   }
 
   // Replaces the external cron that used to `docker compose restart` the whole
-  // container every 2 hours. Chromium's memory grows the longer one MAX page
-  // stays open (~2 GB in ~3 h, after which sends into MAX start failing while
-  // /status still looks fine), so the bridge relaunches the browser itself:
-  // once it is older than browserRecycleMinutes, or as soon as its process
-  // tree holds more than browserMemoryLimitMb. Unlike the container restart
-  // this keeps the Telegram bot online, and it never cuts into a send, a poll
-  // or a QR sign-in.
+  // container every 2 hours. Most of the old growth came from this client's
+  // own leaks (undisposed element handles, an unbounded DevTools network
+  // buffer — fixed in MaxWebClient); what remains is kept in check here, in
+  // two tiers, from the poll loop so it never cuts into a send, a poll or a
+  // QR sign-in, and without taking the Telegram bot offline:
+  //   * reload — the MAX page is reloaded (~10 s) when the Chromium process
+  //     tree holds more than pageReloadMemoryMb;
+  //   * relaunch — the browser is restarted when it is older than
+  //     browserRecycleMinutes, holds more than browserMemoryLimitMb, or is
+  //     still above the reload threshold soon after a reload (the growth is
+  //     then outside the page).
   async maybeRecycleBrowser(now = Date.now()) {
     const due = await this.browserRecycleDue(now);
     if (!due) return false;
@@ -702,66 +715,114 @@ export class BridgeService {
     const ageMs = now - this.browserStartedAt;
     const maxAgeMs = Math.max(0, this.config.browserRecycleMinutes || 0) * 60 * 1000;
     if (maxAgeMs > 0 && ageMs >= maxAgeMs) {
-      return { reason: 'age', ageMs, memory: this.lastBrowserMemory };
+      return { tier: 'relaunch', reason: 'age', ageMs, memory: this.lastBrowserMemory };
     }
 
-    const limitBytes = Math.max(0, this.config.browserMemoryLimitMb || 0) * 1024 * 1024;
-    if (!limitBytes || typeof this.maxClient.getBrowserMemoryUsage !== 'function') return null;
+    const hardBytes = Math.max(0, this.config.browserMemoryLimitMb || 0) * 1024 * 1024;
+    const softBytes = Math.max(0, this.config.pageReloadMemoryMb || 0) * 1024 * 1024;
+    if ((!hardBytes && !softBytes) || typeof this.maxClient.getBrowserMemoryUsage !== 'function') return null;
     if (now - this.lastBrowserMemoryCheckAt < BROWSER_MEMORY_CHECK_INTERVAL_MS) return null;
     this.lastBrowserMemoryCheckAt = now;
 
     const usage = await this.maxClient.getBrowserMemoryUsage().catch(() => null);
     if (!usage) return null;
     this.lastBrowserMemory = { ...usage, at: now };
-    if (usage.bytes < limitBytes) return null;
-    if (ageMs < BROWSER_RECYCLE_MIN_AGE_MS) {
+    this.logBrowserMemory(now);
+
+    const pageAgeMs = now - (this.pageLoadedAt || this.browserStartedAt);
+    const overHard = hardBytes > 0 && usage.bytes >= hardBytes;
+    const overSoft = softBytes > 0 && usage.bytes >= softBytes;
+    if (!overHard && !overSoft) return null;
+    if (pageAgeMs < BROWSER_RECYCLE_MIN_AGE_MS) {
       logger.warn(
-        { memoryMb: toMb(usage.bytes), limitMb: this.config.browserMemoryLimitMb, ageMin: Math.round(ageMs / 60000) },
-        'Chromium is already above MAX_BROWSER_MEMORY_LIMIT_MB shortly after launch — waiting before recycling (is the limit too low?)'
+        { memoryMb: toMb(usage.bytes), pageAgeMin: Math.round(pageAgeMs / 60000) },
+        'Chromium is already above its memory threshold shortly after (re)loading — waiting before acting (is the limit too low?)'
       );
       return null;
     }
-    return { reason: 'memory', ageMs, memory: this.lastBrowserMemory };
+    if (overHard) return { tier: 'relaunch', reason: 'memory', ageMs, memory: this.lastBrowserMemory };
+    // A reload that did not bring memory under the threshold for long means
+    // the growth is outside the page (GPU, browser process): relaunch.
+    const lastReload = this.lastBrowserRecycle?.tier === 'reload' ? this.lastBrowserRecycle.at : 0;
+    if (lastReload && now - lastReload < RELOAD_ESCALATION_WINDOW_MS) {
+      return { tier: 'relaunch', reason: 'memory-after-reload', ageMs, memory: this.lastBrowserMemory };
+    }
+    return { tier: 'reload', reason: 'memory', ageMs, memory: this.lastBrowserMemory };
   }
 
-  async recycleBrowser({ reason = 'manual', ageMs = 0, memory = null } = {}) {
+  // One compact line every half hour, so the steady state can be read from
+  // the logs (and a regression of the leak fixes noticed) without /status.
+  logBrowserMemory(now = Date.now()) {
+    if (now - this.lastBrowserMemoryLogAt < BROWSER_MEMORY_LOG_INTERVAL_MS) return;
+    this.lastBrowserMemoryLogAt = now;
+    const memory = this.lastBrowserMemory;
+    logger.info({
+      chromiumMb: toMb(memory.bytes),
+      rendererMb: memory.byType ? toMb(memory.byType.renderer) : undefined,
+      gpuMb: memory.byType ? toMb(memory.byType.gpu) : undefined,
+      domNodes: memory.page?.domNodes,
+      jsHeapMb: memory.page ? toMb(memory.page.jsHeapBytes) : undefined,
+      browserAgeMin: Math.round((now - this.browserStartedAt) / 60000),
+      pageAgeMin: Math.round((now - (this.pageLoadedAt || this.browserStartedAt)) / 60000),
+      reloads: this.pageReloads,
+      relaunches: this.browserRecycles
+    }, 'MAX browser memory');
+  }
+
+  async recycleBrowser({ tier = 'relaunch', reason = 'manual', ageMs = 0, memory = null } = {}) {
     if (!this.running || this.loginInProgress || this.browserRecycling) return false;
     this.browserRecycling = true;
-    let relaunched = false;
+    let done = false;
     let ready = false;
+    let appliedTier = tier;
     try {
-      // One lock section from teardown until the new page shows its chat list:
-      // a Telegram send queued meanwhile then runs against a usable page, and
-      // nothing can drive the page while it is being replaced.
+      // One lock section from teardown until the page shows its chat list
+      // again: a Telegram send queued meanwhile then runs against a usable
+      // page, and nothing can drive the page while it is being replaced.
       await this.maxLock.run(async () => {
         // Re-checked under the lock: stop() or a sign-in may have begun while
         // this waited behind an in-flight send.
         if (!this.running || this.loginInProgress) return;
         logger.info(
-          { reason, ageMin: Math.round(ageMs / 60000), memoryMb: memory ? toMb(memory.bytes) : null },
-          'Recycling the MAX browser to release Chromium memory'
+          { tier, reason, ageMin: Math.round(ageMs / 60000), memoryMb: memory ? toMb(memory.bytes) : null },
+          tier === 'reload' ? 'Reloading the MAX page to release renderer memory' : 'Relaunching the MAX browser to release Chromium memory'
         );
-        await this.relaunchMaxClient();
-        relaunched = true;
+        if (tier === 'reload' && typeof this.maxClient.reloadPage === 'function') {
+          try {
+            await this.maxClient.reloadPage();
+            this.pageLoadedAt = Date.now();
+            this.lastChatRefreshAt = 0;
+          } catch (error) {
+            logger.warn({ err: error }, 'Reloading the MAX page failed — relaunching the browser instead');
+            appliedTier = 'relaunch';
+            await this.relaunchMaxClient();
+          }
+        } else {
+          appliedTier = 'relaunch';
+          await this.relaunchMaxClient();
+        }
+        done = true;
         ready = await this.maxClient.waitForReady(BROWSER_RECYCLE_READY_TIMEOUT_MS).then(() => true, (error) => {
           logger.warn({ err: error }, 'MAX Web did not show the chat list after a planned browser recycle');
           return false;
         });
       });
     } catch (error) {
-      this.lastBrowserRecycle = { at: Date.now(), reason, ok: false, error: error?.message || String(error) };
+      this.lastBrowserRecycle = { at: Date.now(), tier: appliedTier, reason, ok: false, error: error?.message || String(error) };
       throw error;
     } finally {
       this.browserRecycling = false;
     }
-    if (!relaunched) return false;
+    if (!done) return false;
 
-    this.browserRecycles += 1;
+    if (appliedTier === 'reload') this.pageReloads += 1;
+    else this.browserRecycles += 1;
     this.consecutivePollFailures = 0;
-    this.lastBrowserRecycle = { at: Date.now(), reason, ok: ready };
-    logger.info({ reason, ready, recycles: this.browserRecycles }, 'MAX browser recycled');
+    this.zeroReachableStreak = 0;
+    this.lastBrowserRecycle = { at: Date.now(), tier: appliedTier, reason, ok: ready };
+    logger.info({ tier: appliedTier, reason, ready, reloads: this.pageReloads, relaunches: this.browserRecycles }, 'MAX browser recycled');
     if (!ready && this.running) {
-      // As after a failure restart: the relaunched profile may be signed out,
+      // As after a failure restart: the page may have come back signed out,
       // in which case the QR flow takes over (it no-ops on a live session).
       await this.ensureMaxLogin({ reason: 'after-recycle' });
     }
@@ -1456,7 +1517,7 @@ export class BridgeService {
         // swallowed as "already delivered". Only rows from before the current
         // page load count: signed URLs change only across page loads.
         const fingerprintPrefix = fingerprintWithoutMediaUrl(message.sourceMessageId, message.mediaUrl);
-        if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix, this.browserStartedAt || undefined)) {
+        if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix, this.pageLoadedAt || undefined)) {
           this.db.updateDeliveryStatus(deliveryId, 'sent');
           logger.info(
             { messageId: message.id, chatId: message.chatId, mediaHash: message.mediaHash },
@@ -1997,16 +2058,20 @@ export class BridgeService {
     if (!this.browserStartedAt) return [];
     const minutesAgo = (at) => `${Math.max(0, Math.round((now - at) / 60000))} min`;
     const memory = this.lastBrowserMemory;
-    const limitMb = this.config.browserMemoryLimitMb || 0;
+    const limits = [
+      this.config.pageReloadMemoryMb ? `reload at ${this.config.pageReloadMemoryMb}` : null,
+      this.config.browserMemoryLimitMb ? `relaunch at ${this.config.browserMemoryLimitMb}` : null
+    ].filter(Boolean).join(', ');
     const recycleMinutes = this.config.browserRecycleMinutes || 0;
     const last = this.lastBrowserRecycle;
     return [
-      `Browser uptime: ${minutesAgo(this.browserStartedAt)}${recycleMinutes ? ` (recycle every ${recycleMinutes} min)` : ''}`,
+      `Browser uptime: ${minutesAgo(this.browserStartedAt)}${recycleMinutes ? ` (relaunch every ${recycleMinutes} min)` : ''}`,
+      this.pageLoadedAt && this.pageLoadedAt !== this.browserStartedAt ? `Page reloaded: ${minutesAgo(this.pageLoadedAt)} ago` : null,
       memory
-        ? `Browser memory: ${toMb(memory.bytes)} MB${limitMb ? ` (limit ${limitMb} MB)` : ''}`
+        ? `Browser memory: ${toMb(memory.bytes)} MB${memory.page?.domNodes ? `, ${memory.page.domNodes} DOM nodes` : ''}${limits ? ` (${limits} MB)` : ''}`
         : null,
-      `Browser recycles: ${this.browserRecycles}${last ? ` (last: ${last.reason}, ${minutesAgo(last.at)} ago${last.ok ? '' : ', FAILED'})` : ''}`
-    ];
+      `Browser recycles: ${this.browserRecycles}, page reloads: ${this.pageReloads}${last ? ` (last: ${last.tier || 'relaunch'} for ${last.reason}, ${minutesAgo(last.at)} ago${last.ok ? '' : ', FAILED'})` : ''}`
+    ].filter(Boolean);
   }
 
   async runHealthCheck() {

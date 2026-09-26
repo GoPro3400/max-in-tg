@@ -95,7 +95,7 @@ describe('forwardMaxMessage', () => {
       createdAt: Date.now() - 60000,
       mediaHash: 'a1b2c3d4e5f60718'
     });
-    bridge.browserStartedAt = Date.now() - 1000; // a page load since then
+    bridge.pageLoadedAt = Date.now() - 1000; // a page load since then
 
     const message = maxMessage('m4', 'chat-4', {
       type: 'photo',
@@ -126,7 +126,7 @@ describe('forwardMaxMessage', () => {
       createdAt: Date.now() - 60000,
       mediaHash: 'a1b2c3d4e5f60718'
     });
-    bridge.browserStartedAt = Date.now() - 1000;
+    bridge.pageLoadedAt = Date.now() - 1000;
 
     const message = maxMessage('m4b', 'chat-4', {
       type: 'photo',
@@ -145,7 +145,7 @@ describe('forwardMaxMessage', () => {
   it('re-forward guard ignores copies from the current page load: an identical twin sent the same minute is new', async () => {
     const { bridge, db, telegramBot } = makeBridge();
     linkChat(db, 'chat-4');
-    bridge.browserStartedAt = Date.now() - 60000;
+    bridge.pageLoadedAt = Date.now() - 60000;
     db.insertMessage({
       ...maxMessage('first', 'chat-4', {
         type: 'photo',

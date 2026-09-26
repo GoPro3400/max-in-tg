@@ -23,8 +23,11 @@ function makeClient({ visibleChats, header }) {
   client.page = {
     url: () => 'https://web.max.ru/',
     $$eval: vi.fn(async () => visibleChats.map((chat, index) => ({ ...chat, metadata: { index } }))),
-    $$: vi.fn(async () => visibleChats.map(() => ({ evaluate: vi.fn(async () => {}) }))),
-    evaluate: vi.fn(async (fn, arg) => (arg === SELECTORS.activeChatTitle ? state.header : undefined)),
+    evaluate: vi.fn(async (fn, arg, index) => {
+      if (arg === SELECTORS.activeChatTitle) return state.header;
+      if (arg === SELECTORS.chatItem) return index < visibleChats.length; // the in-page click
+      return undefined;
+    }),
     waitForFunction: vi.fn(async () => {}),
     waitForSelector: vi.fn(async () => null)
   };

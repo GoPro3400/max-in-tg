@@ -8,12 +8,13 @@ import path from 'node:path';
 // Per process it prefers PSS (proportional set size, /proc/<pid>/smaps_rollup):
 // Chromium's processes share most of their mapped pages, so summing plain RSS
 // counts the same shared library and shared-memory pages once per process and
-// overstates the tree several times over. PSS splits every shared page between
-// the processes that map it, so the sum is what the tree really costs the
-// cgroup. VmRSS is the fallback for kernels without smaps_rollup (< 4.14).
+// overstates the tree 3-4x (measured: 809-898 MB of summed VmRSS against
+// 204-287 MB of PSS for the same idle tree). Where smaps_rollup is missing
+// (kernels < 4.14) the fallback is RssAnon + RssShmem, which lands at about
+// 0.7-0.9x PSS — still the right order of magnitude, unlike VmRSS.
 //
-// Returns { bytes, processes, method } or null when /proc is unavailable (not
-// Linux) or the root process is already gone.
+// Returns { bytes, processes, method, byType: { browser, renderer, gpu, other } }
+// or null when /proc is unavailable (not Linux) or the root process is gone.
 export async function measureProcessTreeMemory(rootPid, { procDir = '/proc' } = {}) {
   if (!Number.isInteger(rootPid) || rootPid <= 0) return null;
 
@@ -50,44 +51,59 @@ export async function measureProcessTreeMemory(rootPid, { procDir = '/proc' } = 
   let bytes = 0;
   let processes = 0;
   let method = 'pss';
+  const byType = { browser: 0, renderer: 0, gpu: 0, other: 0 };
   for (const pid of tree) {
-    const pss = await readKbField(path.join(procDir, String(pid), 'smaps_rollup'), 'Pss');
-    if (pss !== null) {
-      bytes += pss * 1024;
-      processes += 1;
-      continue;
+    const dir = path.join(procDir, String(pid));
+    let used = await readKbField(path.join(dir, 'smaps_rollup'), 'Pss');
+    if (used === null) {
+      const status = await readText(path.join(dir, 'status'));
+      if (status === null) continue; // exited meanwhile
+      used = (kbField(status, 'RssAnon') ?? 0) + (kbField(status, 'RssShmem') ?? 0);
+      method = 'anon+shmem';
     }
-    const rss = await readKbField(path.join(procDir, String(pid), 'status'), 'VmRSS');
-    if (rss !== null) {
-      bytes += rss * 1024;
-      processes += 1;
-      method = 'rss';
-    }
+    const usedBytes = used * 1024;
+    bytes += usedBytes;
+    processes += 1;
+    // Chromium rewrites its command line with spaces instead of NULs, so the
+    // process type is matched anywhere in it.
+    const type = pid === rootPid ? 'browser' : processType(await readText(path.join(dir, 'cmdline')));
+    byType[type] += usedBytes;
   }
   if (!processes) return null;
-  return { bytes, processes, method };
+  return { bytes, processes, method, byType };
 }
+
+const processType = (cmdline) => {
+  const type = /--type=([\w-]+)/.exec(cmdline || '')?.[1];
+  if (type === 'renderer') return 'renderer';
+  if (type === 'gpu-process') return 'gpu';
+  return 'other';
+};
 
 // /proc/<pid>/stat is "pid (comm) state ppid ...". comm may itself contain
 // spaces and parentheses, so the fields are counted from the LAST ')'.
 async function readParentPid(statPath) {
+  const stat = await readText(statPath);
+  if (stat === null) return null; // exited between readdir and read
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+  const ppid = Number(fields[1]);
+  return Number.isInteger(ppid) ? ppid : null;
+}
+
+async function readText(filePath) {
   try {
-    const stat = await fsp.readFile(statPath, 'utf8');
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const ppid = Number(fields[1]);
-    return Number.isInteger(ppid) ? ppid : null;
+    return await fsp.readFile(filePath, 'utf8');
   } catch {
-    // The process exited between readdir and read — just skip it.
     return null;
   }
 }
 
+const kbField = (text, field) => {
+  const match = new RegExp(`^${field}:\\s+(\\d+)\\s+kB`, 'm').exec(text || '');
+  return match ? Number(match[1]) : null;
+};
+
 async function readKbField(filePath, field) {
-  try {
-    const text = await fsp.readFile(filePath, 'utf8');
-    const match = new RegExp(`^${field}:\\s+(\\d+)\\s+kB`, 'm').exec(text);
-    return match ? Number(match[1]) : null;
-  } catch {
-    return null;
-  }
+  const text = await readText(filePath);
+  return text === null ? null : kbField(text, field);
 }

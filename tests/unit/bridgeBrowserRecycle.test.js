@@ -235,16 +235,87 @@ describe('BridgeService planned browser recycle', () => {
   });
 
   it('shows the browser state in /status', async () => {
-    const { bridge } = recyclingBridge();
+    const { bridge } = recyclingBridge({ config: { pageReloadMemoryMb: 900 } });
     bridge.browserStartedAt = Date.now() - 42 * MIN;
-    bridge.lastBrowserMemory = { bytes: 812 * MB, processes: 6, method: 'pss', at: Date.now() };
+    bridge.pageLoadedAt = Date.now() - 10 * MIN;
+    bridge.lastBrowserMemory = { bytes: 812 * MB, processes: 6, method: 'pss', at: Date.now(), page: { domNodes: 4100, jsHeapBytes: 30 * MB } };
     bridge.browserRecycles = 3;
-    bridge.lastBrowserRecycle = { at: Date.now() - 42 * MIN, reason: 'memory', ok: true };
+    bridge.pageReloads = 2;
+    bridge.lastBrowserRecycle = { at: Date.now() - 10 * MIN, tier: 'reload', reason: 'memory', ok: true };
 
     const status = await bridge.formatStatus();
 
-    expect(status).toContain('Browser uptime: 42 min (recycle every 120 min)');
-    expect(status).toContain('Browser memory: 812 MB (limit 1300 MB)');
-    expect(status).toContain('Browser recycles: 3 (last: memory, 42 min ago)');
+    expect(status).toContain('Browser uptime: 42 min (relaunch every 120 min)');
+    expect(status).toContain('Page reloaded: 10 min ago');
+    expect(status).toContain('Browser memory: 812 MB, 4100 DOM nodes (reload at 900, relaunch at 1300 MB)');
+    expect(status).toContain('Browser recycles: 3, page reloads: 2 (last: reload for memory, 10 min ago)');
+  });
+});
+
+describe('BridgeService page reload tier', () => {
+  function reloadingBridge(memoryMb) {
+    const harness = recyclingBridge({
+      config: { pageReloadMemoryMb: 900 },
+      maxClient: makeFakeMaxClient({
+        getBrowserMemoryUsage: vi.fn(async () => ({ bytes: memoryMb * MB, processes: 6, method: 'pss' })),
+        reloadPage: vi.fn(async () => {})
+      })
+    });
+    harness.bridge.browserStartedAt = Date.now() - 60 * MIN;
+    harness.bridge.pageLoadedAt = harness.bridge.browserStartedAt;
+    return harness;
+  }
+
+  it('above the reload threshold only reloads the page — no browser relaunch', async () => {
+    const { bridge, maxClient } = reloadingBridge(1000);
+    const before = bridge.pageLoadedAt;
+
+    await expect(bridge.maybeRecycleBrowser()).resolves.toBe(true);
+
+    expect(maxClient.reloadPage).toHaveBeenCalledTimes(1);
+    expect(maxClient.stop).not.toHaveBeenCalled();
+    expect(maxClient.start).not.toHaveBeenCalled();
+    expect(maxClient.waitForReady).toHaveBeenCalledTimes(1);
+    expect(bridge.pageReloads).toBe(1);
+    expect(bridge.browserRecycles).toBe(0);
+    // Media URLs are re-signed on every load: the re-forward guard must treat
+    // everything forwarded before this moment as "previous page".
+    expect(bridge.pageLoadedAt).toBeGreaterThan(before);
+  });
+
+  it('above the relaunch limit relaunches even though a reload would be cheaper', async () => {
+    const { bridge, maxClient } = reloadingBridge(1400);
+
+    await bridge.maybeRecycleBrowser();
+
+    expect(maxClient.reloadPage).not.toHaveBeenCalled();
+    expect(maxClient.start).toHaveBeenCalledTimes(1);
+    expect(bridge.lastBrowserRecycle).toMatchObject({ tier: 'relaunch', reason: 'memory' });
+  });
+
+  it('still above the reload threshold soon after a reload: the growth is outside the page, relaunch', async () => {
+    const { bridge, maxClient } = reloadingBridge(1000);
+    const now = Date.now();
+    await bridge.maybeRecycleBrowser(now);
+    expect(maxClient.reloadPage).toHaveBeenCalledTimes(1);
+
+    // 20 minutes later (past the 15-minute minimum page age), memory unchanged.
+    bridge.pageLoadedAt = now - 20 * MIN;
+    await bridge.maybeRecycleBrowser(now + 20 * MIN);
+
+    expect(maxClient.reloadPage).toHaveBeenCalledTimes(1);
+    expect(maxClient.start).toHaveBeenCalledTimes(1);
+    expect(bridge.lastBrowserRecycle).toMatchObject({ tier: 'relaunch', reason: 'memory-after-reload' });
+  });
+
+  it('a reload that fails falls back to a relaunch', async () => {
+    const { bridge, maxClient } = reloadingBridge(1000);
+    maxClient.reloadPage.mockRejectedValue(new Error('Navigation timeout of 60000 ms exceeded'));
+
+    await expect(bridge.maybeRecycleBrowser()).resolves.toBe(true);
+
+    expect(maxClient.start).toHaveBeenCalledTimes(1);
+    expect(bridge.browserRecycles).toBe(1);
+    expect(bridge.lastBrowserRecycle).toMatchObject({ tier: 'relaunch', ok: true });
   });
 });

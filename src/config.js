@@ -120,11 +120,12 @@ export const config = {
   historyLimit: int(process.env.HISTORY_LIMIT, 50),
   maxChatsPerPoll: int(process.env.MAX_CHATS_PER_POLL, 4),
   maxPollFailuresBeforeRestart: int(process.env.MAX_POLL_FAILURES_BEFORE_RESTART, 5),
-  // Chromium's memory grows the longer one MAX page stays open (~2 GB in
-  // ~3 h), so the bridge relaunches the browser itself, at a safe point
-  // between poll cycles — this replaces the external cron restart. Whichever
-  // limit is reached first triggers it; 0 disables that trigger.
-  browserRecycleMinutes: Math.max(0, int(process.env.MAX_BROWSER_RECYCLE_MINUTES, 120)),
+  // Keeping Chromium's memory in check replaces the external cron restart (see
+  // BridgeService.maybeRecycleBrowser): the MAX page is reloaded above
+  // pageReloadMemoryMb, the browser relaunched above browserMemoryLimitMb or
+  // after browserRecycleMinutes. 0 disables that trigger.
+  pageReloadMemoryMb: Math.max(0, int(process.env.MAX_PAGE_RELOAD_MEMORY_MB, 900)),
   browserMemoryLimitMb: Math.max(0, int(process.env.MAX_BROWSER_MEMORY_LIMIT_MB, 1300)),
+  browserRecycleMinutes: Math.max(0, int(process.env.MAX_BROWSER_RECYCLE_MINUTES, 360)),
   maxDeliveryAttempts: Math.max(1, int(process.env.MAX_DELIVERY_ATTEMPTS, 5))
 };

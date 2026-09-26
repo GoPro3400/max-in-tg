@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { Telegraf } from 'telegraf';
 import { Direction, MessageType, stableId } from '../domain/messages.js';
@@ -24,6 +23,7 @@ export class TelegramBotAdapter {
     this.onUnmuteRequested = null;
     this.onLoginRequested = null;
     this.onIdentityDiscoveredHandler = null;
+    this.onRelayLostHandler = null;
     // Set by startPairing() when no owner is configured (see /pair).
     this.pairingCode = null;
     this.pairingAttempts = 0;
@@ -147,6 +147,11 @@ export class TelegramBotAdapter {
   // bridge can persist it (the adapter has no database of its own).
   onIdentityDiscovered(handler) {
     this.onIdentityDiscoveredHandler = handler;
+  }
+
+  // Called when the bot is removed from the relay group.
+  onRelayLost(handler) {
+    this.onRelayLostHandler = handler;
   }
 
   // Zero-config ownership: with TELEGRAM_OWNER_ID unset the bot accepts a
@@ -341,7 +346,7 @@ export class TelegramBotAdapter {
       // .tgs strictly; if it is rejected, deliver a text marker rather than
       // dropping the message (the log tells us .tgs failed → fall back to webm).
       try {
-        return await this.bot.telegram.sendSticker(chatId, { source: fs.createReadStream(filePath) }, { ...threadExtra(route), ...replyExtra });
+        return await this.bot.telegram.sendSticker(chatId, { source: filePath }, { ...threadExtra(route), ...replyExtra });
       } catch (tgsError) {
         logger.warn({ err: tgsError, filePath }, 'sendSticker (.tgs) rejected by Telegram');
         return await this.bot.telegram.sendMessage(chatId, '[Стикер]', { ...threadExtra(route), ...replyExtra });
@@ -351,23 +356,22 @@ export class TelegramBotAdapter {
     if (message.type === MessageType.STICKER && message.metadata?.animated) {
       // Animated sticker encoded as a GIF — Telegram autoplays it inline.
       // Fall back to a document only if the animation upload is rejected.
-      const source = () => ({ source: fs.createReadStream(filePath) });
       try {
-        return await this.bot.telegram.sendAnimation(chatId, source(), extra);
+        return await this.bot.telegram.sendAnimation(chatId, { source: filePath }, extra);
       } catch (animationError) {
-        logger.warn({ err: animationError, filePath }, 'sendAnimation rejected, sending as document');
-        return await this.bot.telegram.sendDocument(chatId, source(), extra);
+        logger.warn({ err: animationError?.message || String(animationError), filePath }, 'sendAnimation rejected, sending as document');
+        return await this.bot.telegram.sendDocument(chatId, { source: filePath }, extra);
       }
     } else if (message.type === MessageType.PHOTO || message.type === MessageType.STICKER) {
-      return await this.bot.telegram.sendPhoto(chatId, { source: fs.createReadStream(filePath) }, extra);
+      return await this.bot.telegram.sendPhoto(chatId, { source: filePath }, extra);
     } else if (message.type === MessageType.VOICE) {
-      return await this.bot.telegram.sendVoice(chatId, { source: fs.createReadStream(filePath) }, extra);
+      return await this.bot.telegram.sendVoice(chatId, { source: filePath }, extra);
     } else if (message.type === MessageType.VIDEO_NOTE) {
-      return await this.bot.telegram.sendVideoNote(chatId, { source: fs.createReadStream(filePath) }, { ...threadExtra(route), ...replyExtra });
+      return await this.bot.telegram.sendVideoNote(chatId, { source: filePath }, { ...threadExtra(route), ...replyExtra });
     } else if (message.type === MessageType.VIDEO) {
-      return await this.bot.telegram.sendVideo(chatId, { source: fs.createReadStream(filePath) }, extra);
+      return await this.bot.telegram.sendVideo(chatId, { source: filePath }, extra);
     } else {
-      const docSource = { source: fs.createReadStream(filePath) };
+      const docSource = { source: filePath };
       if (message.originalFilename) {
         docSource.filename = message.originalFilename;
       }
@@ -382,7 +386,7 @@ export class TelegramBotAdapter {
     try {
       await this.bot.telegram.sendSticker(
         route.telegramChatId || this.targetChatId(),
-        { source: fs.createReadStream(filePath) },
+        { source: filePath },
         threadExtra(route)
       );
       return true;
@@ -395,7 +399,7 @@ export class TelegramBotAdapter {
   async sendDocument(filePath, route = {}, caption) {
     await this.bot.telegram.sendDocument(
       route.telegramChatId || this.targetChatId(),
-      { source: fs.createReadStream(filePath) },
+      { source: filePath },
       {
         ...threadExtra(route),
         caption
@@ -681,6 +685,11 @@ export class TelegramBotAdapter {
         const status = update?.new_chat_member?.status;
         const chat = update?.chat;
         if (!chat || (chat.type !== 'supergroup' && chat.type !== 'group')) return;
+        if ((status === 'left' || status === 'kicked') && chat.id === this.config.relayChatId) {
+          logger.warn({ chatId: chat.id, status }, 'Removed from the relay group');
+          await this.onRelayLostHandler?.(chat.id, status);
+          return;
+        }
         if (status !== 'administrator' && status !== 'member') return;
         if (this.config.relayChatId) {
           if (chat.id !== this.config.relayChatId) {
@@ -791,6 +800,10 @@ export class TelegramBotAdapter {
       if (ctx.updateType === 'my_chat_member') return true;
       return ctx.chat?.type === 'private' && /^\/pair(\s|$|@)/.test(ctx.message?.text || '');
     }
+    // Being removed from the relay group arrives from whichever admin did
+    // it, not necessarily the owner — and must still be noticed. It carries
+    // no user input; the handler only reacts to left/kicked there.
+    if (ctx.updateType === 'my_chat_member' && this.config.relayChatId && ctx.chat?.id === this.config.relayChatId) return true;
     if (ctx.from?.id !== this.config.ownerId) return false;
     // The owner adding the bot to a group is how the relay group is found;
     // the my_chat_member handler itself decides whether to adopt it.

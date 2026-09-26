@@ -85,6 +85,29 @@ const toMb = (bytes) => Math.round(bytes / (1024 * 1024));
 // back from the page without its line breaks.
 const echoKey = (text) => String(text ?? '').replace(/\s+/g, '');
 
+// The bot can no longer post in that chat at all (removed, banned, the group
+// deleted or turned into another chat) — not a temporary restriction.
+const isChatGoneError = (reason) => /kicked|not a member|chat not found|group chat was (deleted|upgraded)|CHANNEL_PRIVATE/i
+  .test(String(reason || ''));
+
+// Seconds Telegram asked us to wait (429 Too Many Requests), or 0.
+export const telegramRetryAfter = (error) => {
+  const code = error?.code ?? error?.response?.error_code;
+  if (code !== 429) return 0;
+  const seconds = Number(error?.parameters?.retry_after ?? error?.response?.parameters?.retry_after);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 5;
+};
+
+// A MAX fingerprint is author|time|text|mediaUrl (empty parts dropped). The
+// media URL is signed and regenerated on every page load; everything before it
+// is what identifies the bubble across loads.
+export const fingerprintWithoutMediaUrl = (sourceMessageId, mediaUrl) => {
+  const fingerprint = String(sourceMessageId || '');
+  if (mediaUrl && fingerprint.endsWith(`|${mediaUrl}`)) return fingerprint.slice(0, -(mediaUrl.length + 1));
+  if (mediaUrl && fingerprint === mediaUrl) return '';
+  return fingerprint.replace(/\|(?:https?:|blob:)[^|]*$/, '');
+};
+
 export class BridgeService {
   constructor({ db, maxClient, telegramBot, mediaService, config }) {
     this.db = db;
@@ -151,6 +174,10 @@ export class BridgeService {
     this.browserRecycles = 0;
     this.lastBrowserRecycle = null;
     this.browserRecycling = false;
+    // Telegram flood control (429): no forwarding before this time.
+    this.telegramPausedUntil = 0;
+    // A transient createForumTopic failure: no new topic before this time.
+    this.topicCreationRetryAt = 0;
   }
 
   async start() {
@@ -259,6 +286,7 @@ export class BridgeService {
     this.telegramBot.onUnmute((chatName) => this.unmuteChat(chatName));
     this.telegramBot.onLogin(() => this.requestLogin());
     this.telegramBot.onIdentityDiscovered((identity) => this.persistIdentity(identity));
+    this.telegramBot.onRelayLost?.((chatId, reason) => this.handleRelayLost(chatId, reason));
   }
 
   // Owner and relay group can be discovered at runtime instead of configured;
@@ -285,6 +313,24 @@ export class BridgeService {
   persistIdentity({ ownerId = null, relayChatId = null } = {}) {
     if (ownerId) this.db.setSetting('telegram_owner_id', String(ownerId));
     if (relayChatId) this.db.setSetting('telegram_relay_chat_id', String(relayChatId));
+  }
+
+  // The bot was removed from the relay group (or the group is gone). Keeping
+  // relayChatId pointed at it dropped every MAX message after 5 failed tries,
+  // with the "given up" notices aimed at that same dead group. Fall back to
+  // the owner's private chat, where routes are rebuilt on the next message.
+  async handleRelayLost(chatId, reason = '') {
+    if (!chatId || this.config.telegram.relayChatId !== chatId) return false;
+    this.config.telegram.relayChatId = null;
+    this.db.setSetting('telegram_relay_chat_id', '');
+    this.topicCreationBlockedReason = null;
+    logger.warn({ chatId, reason }, 'Relay group is no longer usable — falling back to the owner private chat');
+    await this.notifyOwner([
+      '⚠️ Группа-релей больше недоступна: меня из неё убрали, или её удалили.',
+      'Пока сообщения из MAX приходят сюда, в личку.',
+      'Чтобы вернуть группу: добавь меня в группу с Темами админом или отправь /relay в нужной группе.'
+    ].join('\n'));
+    return true;
   }
 
   // Launches the browser and opens MAX Web. Deliberately does NOT wait for the
@@ -764,6 +810,9 @@ export class BridgeService {
       let failedChats = 0;
       let unreachableChats = 0;
       for (const chat of chats) {
+        // Telegram asked us to back off: nothing read now could be forwarded,
+        // and everything stays unseen until the window has passed.
+        if (this.telegramPaused()) break;
         let messages;
         try {
           messages = await this.maxClient.readMessages(chat.id, {
@@ -813,6 +862,9 @@ export class BridgeService {
             this.pendingSeenCounts.delete(message.id);
             continue;
           }
+          // Stop at the first message that cannot go out while Telegram's
+          // flood control lasts, so the rest of the chat keeps its order.
+          if (this.telegramPaused()) break;
           // Grace for lazily-rendered reply quotes. The .link container and the
           // quoted author render synchronously with the bubble, but a quoted
           // media thumbnail's URL loads ~seconds later. So forward plain messages
@@ -1058,9 +1110,16 @@ export class BridgeService {
     return [...picked.values()];
   }
 
-  async ensureMapping(chat) {
+  // `createTopics` is false only for automatic routing with
+  // TELEGRAM_AUTO_CREATE_TOPICS=false; /sync and /select always may create.
+  async ensureMapping(chat, { createTopics = true } = {}) {
     const existing = this.db.getChatMapping(chat.id);
-    if (existing && (!this.requiresTelegramTopic() || existing.telegramThreadId)) {
+    // A route only counts when it points at the CURRENT destination: after
+    // /relay moved the bridge (or the relay group was lost), old routes still
+    // pointed at the previous group, where the owner's replies are no longer
+    // accepted — so the conversation silently became one-way.
+    const current = existing && existing.telegramChatId === this.telegramBot.targetChatId();
+    if (current && (!this.requiresTelegramTopic() || existing.telegramThreadId)) {
       this.db.upsertChatMapping({ ...existing, title: chat.title });
       const mapping = this.db.getChatMapping(chat.id);
       await this.ensureTopicIntro(chat, mapping);
@@ -1069,12 +1128,22 @@ export class BridgeService {
 
     let telegramThreadId = null;
     if (this.requiresTelegramTopic()) {
-      if (this.topicCreationBlockedReason) return null;
+      if (!createTopics || this.topicCreationBlockedReason) return null;
+      if (Date.now() < this.topicCreationRetryAt) return null;
       try {
         telegramThreadId = await this.telegramBot.createTopic(chat.title);
       } catch (error) {
-        logger.error({ err: error, chatId: chat.id, title: chat.title }, 'Failed to create Telegram topic');
-        this.topicCreationBlockedReason = error?.message || String(error);
+        const reason = error?.message || String(error);
+        logger.error({ err: reason, chatId: chat.id, title: chat.title }, 'Failed to create Telegram topic');
+        if (/rights|not enough|permission|CHAT_ADMIN_REQUIRED|not a forum|TOPICS?_DISABLED/i.test(reason)) {
+          // Only a missing right is worth latching until /sync: the owner has
+          // to change group settings first, and retrying just spams errors.
+          this.topicCreationBlockedReason = reason;
+        } else {
+          // A 429 or a network blip used to latch too, blocking every new
+          // chat's route until someone happened to run /sync.
+          this.topicCreationRetryAt = Date.now() + (telegramRetryAfter(error) || 30) * 1000;
+        }
         return null;
       }
     }
@@ -1216,7 +1285,7 @@ export class BridgeService {
       id: message.chatId,
       title: message.chatId
     };
-    const mapping = await this.ensureMapping(chat);
+    const mapping = await this.ensureMapping(chat, { createTopics: this.config.telegram.autoCreateTopics !== false });
     if (!mapping) {
       if (!this.missingRouteWarningChatIds.has(message.chatId)) {
         this.missingRouteWarningChatIds.add(message.chatId);
@@ -1331,8 +1400,13 @@ export class BridgeService {
       // timestamp/caption), this is that same bubble again — record it as
       // delivered without sending a duplicate to Telegram.
       if (message.mediaHash) {
-        const fingerprintPrefix = String(message.sourceMessageId || '').split('|')[0];
-        if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix)) {
+        // Everything in the fingerprint except the signed media URL. It used
+        // to be only the first field — often just the sender's name — so the
+        // same sticker or picture sent again later by the same person was
+        // swallowed as "already delivered". Only rows from before the current
+        // page load count: signed URLs change only across page loads.
+        const fingerprintPrefix = fingerprintWithoutMediaUrl(message.sourceMessageId, message.mediaUrl);
+        if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix, this.browserStartedAt || undefined)) {
           this.db.updateDeliveryStatus(deliveryId, 'sent');
           logger.info(
             { messageId: message.id, chatId: message.chatId, mediaHash: message.mediaHash },
@@ -1351,10 +1425,43 @@ export class BridgeService {
       logger.info({ messageId: message.id, type: message.type, chatId: message.chatId }, 'Forwarded Max message to Telegram');
       return true;
     } catch (error) {
+      const retryAfter = telegramRetryAfter(error);
+      if (retryAfter) {
+        // Flood control is not a failure of THIS message. Counted as one, the
+        // 5 attempts burned out within seconds while Telegram was asking for
+        // 30+ (a whole relay group shares ~20 messages a minute), and the
+        // burst was dropped for good. Pause forwarding for the window
+        // instead; the message stays unseen and is retried, in order.
+        this.telegramPausedUntil = Math.max(this.telegramPausedUntil, Date.now() + retryAfter * 1000);
+        this.db.updateDeliveryStatus(deliveryId, 'pending', `rate limited: retry after ${retryAfter}s`);
+        logger.warn({ messageId: message.id, chatId: message.chatId, retryAfter }, 'Telegram flood control — pausing forwarding');
+        return false;
+      }
+      const reason = error?.message || String(error);
+      if (mapping.telegramThreadId && /thread not found|TOPIC_DELETED/i.test(reason)) {
+        // The topic was deleted in Telegram. Every later message used to fail
+        // 5 times and be dropped, and /sync could not help (the route still
+        // "had" a topic). Forget it; the next attempt creates a fresh one.
+        this.db.clearChatMappingThread(message.chatId);
+        this.db.updateDeliveryStatus(deliveryId, 'pending', 'topic deleted, recreating');
+        logger.warn({ chatId: message.chatId, threadId: mapping.telegramThreadId }, 'Telegram topic was deleted — a new one will be created');
+        return false;
+      }
+      if (mapping.telegramChatId === this.config.telegram.relayChatId && isChatGoneError(reason)) {
+        // Kicked from (or no longer able to post in) the relay group: fall
+        // back to the owner's private chat instead of dropping everything.
+        this.db.updateDeliveryStatus(deliveryId, 'pending', reason);
+        await this.handleRelayLost(mapping.telegramChatId, reason);
+        return false;
+      }
       this.db.updateDeliveryStatus(deliveryId, 'failed', error.message);
       logger.error({ err: error, messageId: message.id, chatId: message.chatId }, 'Failed to forward Max message to Telegram');
       return false;
     }
+  }
+
+  telegramPaused(now = Date.now()) {
+    return now < this.telegramPausedUntil;
   }
 
   async handleTelegramMessage(message) {
@@ -1559,6 +1666,7 @@ export class BridgeService {
 
   async syncTopics() {
     this.topicCreationBlockedReason = null;
+    this.topicCreationRetryAt = 0;
     const chats = await this.maxLock.run(() => this.refreshChats({ ensureMappings: true }));
     const mappings = this.db.listChatMappings();
     const validMappings = mappings.filter((mapping) => mapping.telegramThreadId);
@@ -1826,6 +1934,9 @@ export class BridgeService {
       `Auto topics: ${this.shouldAutoCreateTopics() ? 'yes' : 'no'}`,
       this.topicCreationBlockedReason ? `Topic creation blocked: ${this.topicCreationBlockedReason}` : null,
       `Poll failures: ${this.consecutivePollFailures}`,
+      this.telegramPaused()
+        ? `Telegram flood control: forwarding paused for ${Math.ceil((this.telegramPausedUntil - Date.now()) / 1000)} s`
+        : null,
       ...this.formatBrowserStatusLines()
     ].filter(Boolean).join('\n');
   }

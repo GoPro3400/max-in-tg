@@ -334,3 +334,28 @@ describe('owner-private-chat helpers', () => {
     expect(await adapter.deleteOwnerMessage(12)).toBe(false);
   });
 });
+
+describe('losing the relay group', () => {
+  it('reports removal from the relay group even when another admin did it', async () => {
+    const { adapter } = makeAdapter({ ownerId: OWNER_ID, relayChatId: RELAY_ID });
+    const lost = vi.fn();
+    adapter.onRelayLost(lost);
+
+    await adapter.bot.handleUpdate(membershipUpdate({ chatId: RELAY_ID, status: 'kicked', fromId: STRANGER_ID }));
+
+    expect(lost).toHaveBeenCalledWith(RELAY_ID, 'kicked');
+  });
+
+  it('a stranger changing the bot in some other group still gets nowhere', async () => {
+    const { adapter, identities } = makeAdapter({ ownerId: OWNER_ID, relayChatId: RELAY_ID });
+    const lost = vi.fn();
+    adapter.onRelayLost(lost);
+
+    await adapter.bot.handleUpdate(membershipUpdate({ chatId: OTHER_GROUP_ID, status: 'kicked', fromId: STRANGER_ID }));
+    await adapter.bot.handleUpdate(membershipUpdate({ chatId: RELAY_ID, status: 'administrator', fromId: STRANGER_ID }));
+
+    expect(lost).not.toHaveBeenCalled();
+    expect(adapter.config.relayChatId).toBe(RELAY_ID);
+    expect(identities).toEqual([]);
+  });
+});

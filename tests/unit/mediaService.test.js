@@ -400,4 +400,32 @@ describe('MediaService', () => {
       expect(await service.fileContentHash(null)).toBeNull();
     });
   });
+
+  describe('framesDirToGif', () => {
+    it('keeps the frames when encoding fails, so the first-frame fallback still has its file', async () => {
+      // The bridge falls back to sending frame-000.png when the GIF encode
+      // fails. Deleting the directory on failure made that fallback open a
+      // missing file — which, sent as a raw stream, crashed the process.
+      const dir = path.join(mediaDir, 'sticker-frames-bad');
+      await fsp.mkdir(dir, { recursive: true });
+      await fsp.writeFile(path.join(dir, 'frame-000.png'), 'definitely not a png');
+
+      await expect(service.framesDirToGif(dir, 20)).rejects.toThrow();
+
+      expect(fs.existsSync(path.join(dir, 'frame-000.png'))).toBe(true);
+    });
+
+    it('drops the frames once the GIF is encoded', async () => {
+      const dir = path.join(mediaDir, 'sticker-frames-ok');
+      await fsp.mkdir(dir, { recursive: true });
+      for (let i = 0; i < 3; i++) {
+        await fsp.writeFile(path.join(dir, `frame-00${i}.png`), await gradientPng(16, 16, i % 2 === 0));
+      }
+
+      const gif = await service.framesDirToGif(dir, 10);
+
+      expect(fs.existsSync(gif)).toBe(true);
+      expect(fs.existsSync(dir)).toBe(false);
+    });
+  });
 });

@@ -84,21 +84,23 @@ describe('forwardMaxMessage', () => {
   it('re-forward guard: skips sending an already-forwarded bubble but marks the delivery sent', async () => {
     const { bridge, db, telegramBot, mediaService } = makeBridge();
     linkChat(db, 'chat-4');
-    // Prior forwarded copy of the same bubble under an older signed URL:
-    // same chat, same perceptual hash, same stable fingerprint prefix
-    // (the part before the first '|').
+    // Prior forwarded copy of the same bubble under an older signed URL,
+    // stored before the current page was loaded: same chat, same perceptual
+    // hash, same fingerprint apart from the (re-signed) media URL.
     db.insertMessage({
       ...maxMessage('old-copy', 'chat-4', {
         type: 'photo',
-        sourceMessageId: '12:00 photo|old-signed-url'
+        sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=OLDTOKEN&fn=w_1280'
       }),
+      createdAt: Date.now() - 60000,
       mediaHash: 'a1b2c3d4e5f60718'
     });
+    bridge.browserStartedAt = Date.now() - 1000; // a page load since then
 
     const message = maxMessage('m4', 'chat-4', {
       type: 'photo',
       mediaUrl: 'https://i.oneme.ru/i?r=NEWTOKEN&fn=w_1280',
-      sourceMessageId: '12:00 photo|new-signed-url'
+      sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=NEWTOKEN&fn=w_1280'
     });
     const result = await bridge.forwardMaxMessage(message);
 
@@ -119,21 +121,48 @@ describe('forwardMaxMessage', () => {
     db.insertMessage({
       ...maxMessage('old-copy', 'chat-4', {
         type: 'photo',
-        sourceMessageId: '12:00 photo|old-signed-url'
+        sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=OLDTOKEN&fn=w_1280'
       }),
+      createdAt: Date.now() - 60000,
       mediaHash: 'a1b2c3d4e5f60718'
     });
+    bridge.browserStartedAt = Date.now() - 1000;
 
     const message = maxMessage('m4b', 'chat-4', {
       type: 'photo',
       mediaUrl: 'https://i.oneme.ru/i?r=OTHERTOKEN&fn=w_1280',
-      sourceMessageId: '18:45 photo|new-signed-url' // different prefix
+      // Same sender, different time: used to be swallowed, because only the
+      // first field (here the sender's name) was compared.
+      sourceMessageId: 'Мама|18:45|https://i.oneme.ru/i?r=OTHERTOKEN&fn=w_1280'
     });
     const result = await bridge.forwardMaxMessage(message);
 
     expect(result).toBe(true);
     expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
     expect(telegramBot.sendMessage.mock.calls[0][0].id).toBe('m4b');
+  });
+
+  it('re-forward guard ignores copies from the current page load: an identical twin sent the same minute is new', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    linkChat(db, 'chat-4');
+    bridge.browserStartedAt = Date.now() - 60000;
+    db.insertMessage({
+      ...maxMessage('first', 'chat-4', {
+        type: 'photo',
+        sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=A&fn=w_1280'
+      }),
+      createdAt: Date.now() - 1000, // forwarded in THIS session
+      mediaHash: 'a1b2c3d4e5f60718'
+    });
+
+    const result = await bridge.forwardMaxMessage(maxMessage('second', 'chat-4', {
+      type: 'photo',
+      mediaUrl: 'https://i.oneme.ru/i?r=B&fn=w_1280',
+      sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=B&fn=w_1280'
+    }));
+
+    expect(result).toBe(true);
+    expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('records a failed delivery with the error message when the Telegram send rejects', async () => {

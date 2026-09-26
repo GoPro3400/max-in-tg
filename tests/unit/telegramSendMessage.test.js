@@ -20,14 +20,7 @@ function makeAdapter() {
   let nextId = 100;
   const api = {
     sendMessage: vi.fn(async () => ({ message_id: nextId++ })),
-    sendPhoto: vi.fn(async (chatId, input) => {
-      // Drain the upload stream like a real request would, so no file handle
-      // is still pending when the temp dir is removed.
-      await new Promise((resolve) => {
-        input.source.on('close', resolve).on('error', resolve).resume();
-      });
-      return { message_id: nextId++ };
-    })
+    sendPhoto: vi.fn(async () => ({ message_id: nextId++ }))
   };
   Object.assign(adapter.bot.telegram, api);
   return { adapter, api };
@@ -55,6 +48,20 @@ describe('splitTelegramText', () => {
       expect(part.length).toBeLessThanOrEqual(10);
       expect(part).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/);
     }
+  });
+});
+
+describe('TelegramBotAdapter.sendMessage file handling', () => {
+  it('passes the file PATH to Telegraf, so a missing file is a rejected send, not a process crash', async () => {
+    // A bare fs.createReadStream() on a missing file emits an 'error' nobody
+    // listens to — an uncaught exception that took the whole bridge down
+    // (reached via the animated-sticker fallback). Telegraf stats a path and
+    // rejects normally.
+    const { adapter, api } = makeAdapter();
+
+    await adapter.sendMessage({ type: 'photo', text: '', mediaPath: photoPath }, { telegramChatId: -100 });
+
+    expect(api.sendPhoto.mock.calls[0][1]).toEqual({ source: photoPath });
   });
 });
 

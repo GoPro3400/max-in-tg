@@ -240,13 +240,12 @@ export class MediaService {
       .format('webm');
     const webmDone = runFfmpeg(webmCommand, 'framesDirToWebmSticker');
     webmCommand.save(outputPath);
-    try {
-      await webmDone;
-    } finally {
-      // Also drop the frames on failure/timeout: cleanupOlderThan only unlinks
-      // files, never directories, so a leaked frames dir is never reclaimed.
-      await fsp.rm(framesDir, { recursive: true, force: true }).catch(() => {});
-    }
+    await webmDone;
+    // Frames are dropped only on success: on failure the caller falls back to
+    // sending frame-000.png from this directory (deleting it here made that
+    // fallback fail every time). A leftover directory is reclaimed by
+    // cleanupOlderThan (sticker-frames-* is one of its temp prefixes).
+    await fsp.rm(framesDir, { recursive: true, force: true }).catch(() => {});
     logger.debug({ framesDir, outputPath }, 'Encoded animated sticker webm');
     return outputPath;
   }
@@ -271,13 +270,9 @@ export class MediaService {
       .format('gif');
     const gifDone = runFfmpeg(gifCommand, 'framesDirToGif');
     gifCommand.save(outputPath);
-    try {
-      await gifDone;
-    } finally {
-      // See framesDirToWebmSticker: cleanupOlderThan never removes directories,
-      // so the frames must be dropped here even when encoding fails.
-      await fsp.rm(framesDir, { recursive: true, force: true }).catch(() => {});
-    }
+    await gifDone;
+    // Only on success — see framesDirToWebmSticker.
+    await fsp.rm(framesDir, { recursive: true, force: true }).catch(() => {});
     logger.debug({ framesDir, outputPath }, 'Encoded animated sticker gif');
     return outputPath;
   }

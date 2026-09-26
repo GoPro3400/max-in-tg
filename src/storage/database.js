@@ -51,9 +51,6 @@ export class AppDatabase {
         FOREIGN KEY(max_chat_id) REFERENCES chats(id) ON DELETE CASCADE
       );
 
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_mappings_telegram_thread
-        ON chat_mappings(telegram_chat_id, telegram_thread_id)
-        WHERE telegram_thread_id IS NOT NULL;
 
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -100,6 +97,18 @@ export class AppDatabase {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_messages_telegram_message_id
         ON messages(telegram_message_id);
+    `);
+
+    // One topic belongs to one MAX chat — except for chats /merge redirected
+    // into another chat's topic, which share it. The original unique index
+    // allowed no sharing at all, so /merge either did nothing or failed with
+    // "UNIQUE constraint failed". Merged mappings are now left out of it (and
+    // out of the topic -> chat lookup, see getMappingByTelegramThreadStmt).
+    this.db.exec(`
+      DROP INDEX IF EXISTS idx_chat_mappings_telegram_thread;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_mappings_thread_owner
+        ON chat_mappings(telegram_chat_id, telegram_thread_id)
+        WHERE telegram_thread_id IS NOT NULL AND json_extract(metadata, '$.mergedInto') IS NULL;
     `);
 
     // Covers getTgToMaxMessageBySourceIdStmt (WHERE direction='tg_to_max' AND
@@ -174,7 +183,15 @@ export class AppDatabase {
       )
       ON CONFLICT(max_chat_id) DO UPDATE SET
         telegram_chat_id = excluded.telegram_chat_id,
-        telegram_thread_id = COALESCE(chat_mappings.telegram_thread_id, excluded.telegram_thread_id),
+        -- A new topic always wins (a /relay move, /merge, /unmerge, a topic
+        -- recreated after the old one was deleted). A missing one keeps the
+        -- current topic only within the same Telegram chat — moving to
+        -- another chat without a topic must not carry a foreign thread id.
+        telegram_thread_id = CASE
+          WHEN excluded.telegram_thread_id IS NOT NULL THEN excluded.telegram_thread_id
+          WHEN excluded.telegram_chat_id = chat_mappings.telegram_chat_id THEN chat_mappings.telegram_thread_id
+          ELSE NULL
+        END,
         title = excluded.title,
         enabled = excluded.enabled,
         updated_at = excluded.updated_at,
@@ -186,7 +203,12 @@ export class AppDatabase {
       WHERE telegram_chat_id = ?
         AND COALESCE(telegram_thread_id, 0) = COALESCE(?, 0)
         AND enabled = 1
+        AND json_extract(metadata, '$.mergedInto') IS NULL
+      ORDER BY updated_at DESC
       LIMIT 1
+    `);
+    this.clearMappingThreadStmt = this.db.prepare(`
+      UPDATE chat_mappings SET telegram_thread_id = NULL, metadata = ?, updated_at = ? WHERE max_chat_id = ?
     `);
     this.listMappingsStmt = this.db.prepare('SELECT * FROM chat_mappings WHERE enabled = 1 ORDER BY title ASC');
 
@@ -232,7 +254,8 @@ export class AppDatabase {
       WHERE chat_id = ?
         AND direction = 'max_to_tg'
         AND media_hash = ?
-        AND source_message_id LIKE ? ESCAPE '\\'
+        AND (source_message_id = ? OR source_message_id LIKE ? ESCAPE '\\')
+        AND created_at < ?
       LIMIT 1
     `);
 
@@ -389,6 +412,16 @@ export class AppDatabase {
     return row ? rowToMapping(row) : null;
   }
 
+  // The topic was deleted in Telegram: forget it (the upsert cannot, since a
+  // missing topic keeps the current one) so the next message creates a new
+  // topic. The intro bookkeeping goes too — the new topic needs its own.
+  clearChatMappingThread(maxChatId) {
+    const mapping = this.getChatMapping(maxChatId);
+    if (!mapping) return;
+    const { topicIntroMessageId, topicIntroPinnedAt, topicIntroPinned, topicIntroPinError, ...metadata } = mapping.metadata || {};
+    this.clearMappingThreadStmt.run(JSON.stringify(metadata), Date.now(), maxChatId);
+  }
+
   getChatMappingByTelegramThread(telegramChatId, telegramThreadId = null) {
     const row = this.getMappingByTelegramThreadStmt.get(telegramChatId, telegramThreadId || null);
     return row ? rowToMapping(row) : null;
@@ -435,13 +468,16 @@ export class AppDatabase {
   // its fingerprint (timestamp/caption), because MAX's signed CDN URLs — which
   // the fingerprint embeds — are regenerated on every page load and therefore
   // cannot identify it. See hasForwardedMediaCopyStmt for the full rationale.
-  hasForwardedMediaCopy(chatId, mediaHash, fingerprintPrefix) {
+  // `storedBefore` limits the match to rows stored before the current page was
+  // loaded: signed URLs only change across page loads, so a same-session twin
+  // is a genuinely new message, not a stale copy.
+  hasForwardedMediaCopy(chatId, mediaHash, fingerprintPrefix, storedBefore = Number.MAX_SAFE_INTEGER) {
     if (!chatId || !mediaHash) return false;
     const prefix = String(fingerprintPrefix ?? '');
     // Escape LIKE wildcards in the caption/timestamp so a message whose text
     // contains % or _ can't match unrelated rows.
     const escaped = prefix.replace(/[\\%_]/g, '\\$&');
-    return Boolean(this.hasForwardedMediaCopyStmt.get(chatId, mediaHash, escaped + '|%'));
+    return Boolean(this.hasForwardedMediaCopyStmt.get(chatId, mediaHash, prefix, escaped + '|%', storedBefore));
   }
 
   // Returns the most recent stored message in a MAX chat whose text matches the

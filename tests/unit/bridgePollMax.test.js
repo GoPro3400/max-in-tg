@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   makeBridge,
   linkChat,
@@ -181,5 +181,52 @@ describe('pollMax', () => {
     expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
     expect(telegramBot.sendMessage.mock.calls[0][0].id).toBe('g1');
     expect(db.hasMessage('g1')).toBe(true);
+  });
+});
+
+describe('pollMax under Telegram flood control (429)', () => {
+  // A whole relay group shares ~20 messages a minute. Counted as ordinary
+  // failures, the retry budget (5 attempts, one per poll) burned out within
+  // seconds while Telegram was asking for 30+, and the burst was dropped for
+  // good — with the "given up" notice itself rejected by the same 429.
+  function floodError(retryAfter = 30) {
+    return Object.assign(new Error(`429: Too Many Requests: retry after ${retryAfter}`), {
+      code: 429,
+      parameters: { retry_after: retryAfter }
+    });
+  }
+
+  it('pauses forwarding instead of burning the retry budget, then delivers in order', async () => {
+    vi.useFakeTimers();
+    try {
+      const { bridge, db, maxClient, telegramBot } = primedBridge();
+      linkChat(db, 'chat-a', { unread: true });
+      maxClient.readMessages.mockResolvedValue([maxMessage('m1', 'chat-a'), maxMessage('m2', 'chat-a')]);
+      telegramBot.sendMessage.mockRejectedValueOnce(floodError(30));
+
+      for (let i = 0; i < 10; i++) {
+        bridge.lastChatRefreshAt = Date.now();
+        await bridge.pollMax();
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+
+      // One attempt, then silence for the window: m2 was never tried ahead
+      // of m1, nothing was given up, no failure counted.
+      expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+      expect(db.countFailedDeliveries('m1', 'max_to_tg')).toBe(0);
+      expect(db.hasMessage('m1')).toBe(false);
+      expect(telegramBot.sendText).not.toHaveBeenCalled();
+      expect(await bridge.formatStatus()).toContain('forwarding paused');
+
+      await vi.advanceTimersByTimeAsync(21000);
+      bridge.lastChatRefreshAt = Date.now();
+      await bridge.pollMax();
+
+      expect(telegramBot.sendMessage.mock.calls.slice(1).map(([message]) => message.id)).toEqual(['m1', 'm2']);
+      expect(db.hasMessage('m1')).toBe(true);
+      expect(db.hasMessage('m2')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

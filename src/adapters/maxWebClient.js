@@ -8,10 +8,17 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import sharp from 'sharp';
 import { Direction, MessageType, normalizeText, stableId } from '../domain/messages.js';
 import { logger } from '../logger.js';
-import { listFilesByMtime, safeName, saveBuffer } from '../utils/fileHelpers.js';
+import { listFilesByMtime, safeDisplayName, safeName, saveBuffer } from '../utils/fileHelpers.js';
 import { findNewestCapture, consumeNewestCapture } from '../utils/networkCapture.js';
+import { measureProcessTreeMemory } from '../utils/processMemory.js';
 
 puppeteer.use(StealthPlugin());
+
+// How long browser.close() may take before the Chromium process is killed.
+// close() waits for a clean CDP shutdown, which a wedged or crashed browser
+// never answers; without a bound, a planned recycle or a failure restart would
+// sit inside the bridge's global lock for the whole protocol timeout (minutes).
+const BROWSER_CLOSE_TIMEOUT_MS = 15000;
 
 const MAX_CAPTURE_MAP_SIZE = 100;
 const capMap = (map, maxSize = MAX_CAPTURE_MAP_SIZE) => {
@@ -35,6 +42,7 @@ export class MaxWebClient {
     this.browser = null;
     this.page = null;
     this.activeChatId = null;
+    this.activeChatTitle = null;
     this.selectors = maxConfig.selectors;
     this.diagnosticDir = options.diagnosticDir;
     this.diagnosticRetentionFiles = options.diagnosticRetentionFiles ?? 80;
@@ -80,6 +88,18 @@ export class MaxWebClient {
         '--remote-debugging-port=9222'
       ]
     });
+    // A close requested through stop() also fires 'disconnected'; only a
+    // browser that vanishes on its own is worth an error.
+    const browser = this.browser;
+    browser.on('disconnected', () => {
+      if (this.browser !== browser) {
+        logger.debug('Closed Chrome browser disconnected');
+        return;
+      }
+      logger.error('Chrome browser disconnected unexpectedly');
+      this.onDisconnect?.();
+    });
+
     this.page = await this.browser.newPage();
     await this.page.setViewport({ width: 1440, height: 980 });
     // MAX serves sticker assets (Lottie JSON) from the HTTP cache, so on repeat
@@ -87,11 +107,6 @@ export class MaxWebClient {
     // the page cache so every sticker is re-fetched over the network and our
     // interceptor reliably sees the Lottie.
     await this.page.setCacheEnabled(false);
-
-    this.browser.on('disconnected', () => {
-      logger.error('Chrome browser disconnected unexpectedly');
-      this.onDisconnect?.();
-    });
 
     // Set download path for document downloads
     this.downloadDir = path.join(this.mediaDir, 'downloads');
@@ -473,6 +488,14 @@ export class MaxWebClient {
     const targetNode = chatItems[chat.metadata.index];
     if (!targetNode) throw new Error(`Chat node index not found: ${chat.metadata.index}`);
 
+    // From the click on, the page no longer shows the previous chat. Forget it
+    // now, so a switch that fails below (title never verified, list reordered
+    // under the click) cannot leave activeChatId naming a chat that is not on
+    // screen — readMessages/sendText skip re-selection when the ids match, and
+    // would then read or type into whatever chat the page actually shows.
+    this.activeChatId = null;
+    this.activeChatTitle = null;
+
     await targetNode.evaluate((node) => {
       const btn = node.querySelector('button.cell') || node;
       btn.scrollIntoView({ block: 'center' });
@@ -504,6 +527,7 @@ export class MaxWebClient {
     // network captures are tagged with activeChatId, so it must already point at
     // this chat or the captures get attributed to the previous one and lost.
     this.activeChatId = chat.id;
+    this.activeChatTitle = chat.title;
 
     // Wait for message bubbles to render (lazy-loaded after chat opens)
     await this.page.waitForSelector(this.selectors.messageItem, { timeout: 5000 }).catch(() => null);
@@ -687,13 +711,16 @@ export class MaxWebClient {
     if (chatId && this.activeChatId !== chatId) return null;
     const deadline = Date.now() + 3000;
     const pollMs = 300;
-    const expected = String(sentText ?? '').trim();
+    // Whitespace-insensitive: a multi-line message's bubble text comes back
+    // without its line breaks (textContent of separate paragraphs).
+    const expected = withoutWhitespace(sentText);
+    if (!expected) return null;
     try {
       while (Date.now() < deadline) {
         const rows = await this.scrapeMessageRows();
         const outgoingRows = rows.filter((row) => row.outgoing);
         const last = outgoingRows.at(-1);
-        if (last && last.text === expected) {
+        if (last && withoutWhitespace(last.text) === expected) {
           if (last.rawId.startsWith('visible-')) return null;
           return last.rawId;
         }
@@ -1110,8 +1137,12 @@ export class MaxWebClient {
           try {
             const originalName = networkDoc.originalName || msg.originalFilename || '';
             const ext = originalName ? path.extname(originalName) : this.guessDocExtension(networkDoc.contentType, networkDoc.url);
-            const filename = originalName ? safeName(originalName, 200) : `doc-${msg.id}${ext}`;
-            const docPath = saveBuffer(this.mediaDir, filename, networkDoc.buffer);
+            // A directory per message: named straight into mediaDir, two
+            // documents with the same name (or any two Cyrillic names, which
+            // the old ASCII-only sanitizer reduced to "_.pdf") read in one
+            // poll overwrote each other before either was forwarded.
+            const filename = originalName ? safeDisplayName(originalName) : `document${ext}`;
+            const docPath = saveBuffer(path.join(this.mediaDir, `doc-${msg.id}`), filename, networkDoc.buffer);
             msg.mediaPath = docPath;
             msg.originalFilename = originalName || filename;
             logger.debug({ chatId, docPath, originalName: msg.originalFilename, size: networkDoc.buffer.length, contentType: networkDoc.contentType }, 'Saved document from network');
@@ -1287,11 +1318,7 @@ export class MaxWebClient {
     try {
       await this.page.waitForSelector(this.selectors.composer, { timeout: 30000 });
       await this.page.focus(this.selectors.composer);
-      const typeTimeout = this.config.protocolTimeoutMs || 60000;
-      await Promise.race([
-        this.page.keyboard.type(text, { delay: 1 }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Typing timeout')), typeTimeout))
-      ]);
+      await this.typeIntoComposer(text, { timeoutMs: this.config.protocolTimeoutMs || 60000 });
       await this.submitComposer();
     } catch (error) {
       if (replyToFingerprint) {
@@ -1315,7 +1342,40 @@ export class MaxWebClient {
     }
   }
 
-  async sendFile(chatId, filePath, caption = '') {
+  // Types a message into the focused composer. Puppeteer's keyboard.type maps
+  // "\n" to the Enter key, and Enter SENDS in MAX's composer — typing a
+  // multi-line message used to fire one partial message per line (only the
+  // first carrying the reply quote). Line breaks are Shift+Enter instead, and
+  // tabs become spaces (Tab would move focus out of the composer, and the rest
+  // of the text would be typed into some other element).
+  //
+  // Typed in chunks with the deadline checked in between, so a timeout really
+  // stops the typing: racing one long type() against a timer only rejected
+  // the caller while the keystrokes kept flowing into the page after the lock
+  // had been released.
+  async typeIntoComposer(text, { timeoutMs = 60000, chunkSize = 200 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    const lines = String(text ?? '').replace(/\t/g, '    ').split(/\r\n|\r|\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        await this.page.keyboard.down('Shift');
+        try {
+          await this.page.keyboard.press('Enter');
+        } finally {
+          await this.page.keyboard.up('Shift');
+        }
+      }
+      const chars = Array.from(lines[i]);
+      for (let start = 0; start < chars.length; start += chunkSize) {
+        if (Date.now() > deadline) throw new Error('Typing timeout');
+        await this.page.keyboard.type(chars.slice(start, start + chunkSize).join(''), { delay: 1 });
+      }
+    }
+  }
+
+  // Sends the file alone: MAX's attach flow has no caption the bridge fills
+  // in, so the bridge sends a caption as a separate text message.
+  async sendFile(chatId, filePath) {
     await this.ensureActiveChat(chatId);
 
     const absolutePath = path.resolve(filePath);
@@ -1850,11 +1910,47 @@ export class MaxWebClient {
   }
 
   async stop() {
-    await this.browser?.close();
+    const browser = this.browser;
+    // Detach first: the 'disconnected' handler uses this to tell a requested
+    // close from a crash, and nothing may keep driving a page that is closing.
     this.browser = null;
     this.page = null;
     this.activeChatId = null;
+    this.activeChatTitle = null;
     this.clearMediaCaches();
+    if (!browser) return;
+
+    const browserProcess = browser.process?.() || null;
+    let timer = null;
+    try {
+      await Promise.race([
+        browser.close(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`browser.close() timed out after ${BROWSER_CLOSE_TIMEOUT_MS}ms`)), BROWSER_CLOSE_TIMEOUT_MS);
+        })
+      ]);
+    } catch (error) {
+      logger.warn({ err: error?.message || String(error) }, 'Chrome did not close cleanly; killing the process');
+      try { browserProcess?.kill('SIGKILL'); } catch { /* already gone */ }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // False once the browser is gone or its page was closed (a crash, a failed
+  // relaunch). A crashed renderer can leave both looking alive, so callers
+  // that must notice that also count failing page calls.
+  isAlive() {
+    return Boolean(this.browser?.connected && this.page && !this.page.isClosed?.());
+  }
+
+  // Memory held by the whole Chromium process tree (see measureProcessTreeMemory):
+  // { bytes, processes, method } or null when it cannot be measured (no local
+  // browser process, or no /proc).
+  async getBrowserMemoryUsage() {
+    const pid = this.browser?.process?.()?.pid;
+    if (!pid) return null;
+    return measureProcessTreeMemory(pid);
   }
 
   async captureDiagnostics(reason, { throttleMs = 0 } = {}) {
@@ -1922,8 +2018,14 @@ export class MaxWebClient {
     if (this.activeChatId !== chatId) {
       await this.selectChat(chatId);
     }
-    const chat = (await this.listChats()).find((candidate) => candidate.id === chatId);
-    if (chat) await this.verifyActiveChat(chat);
+    // Always verify the header before typing. A chat scrolled out of MAX's
+    // virtualized list is not in listChats(), and skipping the check for it
+    // meant a send could go into whatever chat was really on screen; the
+    // title remembered when the chat was selected covers that case.
+    const chat = (await this.listChats()).find((candidate) => candidate.id === chatId)
+      || (this.activeChatId === chatId && this.activeChatTitle ? { id: chatId, title: this.activeChatTitle } : null);
+    if (!chat) throw new Error(`Cannot verify active Max chat before sending: ${chatId}`);
+    await this.verifyActiveChat(chat);
   }
 
   async ensurePage() {
@@ -1969,6 +2071,8 @@ export class MaxWebClient {
     }
   }
 }
+
+const withoutWhitespace = (value) => String(value ?? '').replace(/\s+/g, '');
 
 const normalizeMaxType = (type) => {
   if (Object.values(MessageType).includes(type)) return type;
@@ -2046,15 +2150,21 @@ const redactDiagnosticText = (html) => html
   // Redact unknown label-ish attribute values. Default-deny: a label MAX adds
   // later is redacted rather than silently leaking, and its length still shows
   // in the dump (run once with DIAGNOSTIC_REDACT_TEXT=false if the real value
-  // is needed to write a new selector).
+  // is needed to write a new selector). `value` carries typed text (a draft in
+  // the composer, a search query).
   .replace(
-    /\s(aria-label|title|alt|placeholder)\s*=\s*"([^"]*)"/gi,
+    /\s(aria-label|title|alt|placeholder|value)\s*=\s*"([^"]*)"/gi,
     (match, attribute, value) => {
       const trimmed = value.trim();
       if (!trimmed || SAFE_LABEL_VALUES.has(trimmed)) return match;
       return ` ${attribute}="[redacted ${trimmed.length} chars]"`;
     }
-  );
+  )
+  // MAX serves media over SIGNED URLs (…/i?r=<token>&expires=…): whoever holds
+  // one can fetch that private photo or file. Keep scheme, host and path —
+  // enough to see what an element points at — and drop the query everywhere
+  // (src, href, srcset, style url(), data-* attributes).
+  .replace(/(https?:\/\/[^\s"'<>?#)]+)\?[^\s"'<>#)]*/gi, '$1?[redacted]');
 
 // SVG children are dropped unconditionally — including with redaction turned
 // off. MAX renders the sign-in QR as inline SVG paths, so a dump taken on the

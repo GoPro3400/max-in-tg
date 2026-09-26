@@ -291,29 +291,51 @@ export class TelegramBotAdapter {
 
   async sendMessage(message, route = {}) {
     const chatId = route.telegramChatId || this.targetChatId();
-
-    // When the MAX message is a reply, instruct Telegram to render it as a quote.
-    // allow_sending_without_reply: true ensures delivery even if the original
-    // message was deleted or is unavailable in the target chat.
-    const replyExtra = message.replyToMessageId
-      ? { reply_parameters: { message_id: message.replyToMessageId, allow_sending_without_reply: true } }
-      : {};
-
-    const extra = {
-      ...threadExtra(route),
-      ...replyExtra,
-      caption: message.text || undefined
-    };
+    const replyExtra = replyParameters(message.replyToMessageId);
 
     if (message.type === MessageType.TEXT) {
-      return await this.bot.telegram.sendMessage(chatId, message.text || '', { ...threadExtra(route), ...replyExtra });
+      return await this.sendTextChunks(chatId, message.text || '', route, replyExtra);
     }
 
     const filePath = message.mediaPath;
     if (!filePath) {
-      return await this.bot.telegram.sendMessage(chatId, message.text || `[${message.type}] ${message.mediaUrl || ''}`, { ...threadExtra(route), ...replyExtra });
+      return await this.sendTextChunks(chatId, message.text || `[${message.type}] ${message.mediaUrl || ''}`, route, replyExtra);
     }
 
+    // Telegram rejects the whole upload when a caption is over 1024 characters
+    // — on every retry, until the message was given up on and dropped. A
+    // longer text is sent right after the media instead, as a reply to it.
+    const text = message.text || '';
+    const captionFits = text.length <= TELEGRAM_CAPTION_LIMIT;
+    const extra = {
+      ...threadExtra(route),
+      ...replyExtra,
+      caption: captionFits ? (text || undefined) : undefined
+    };
+    const sent = await this.sendMedia(chatId, message, filePath, extra, route, replyExtra);
+    if (!captionFits) {
+      await this.sendTextChunks(chatId, text, route, replyParameters(sent?.message_id));
+    }
+    return sent;
+  }
+
+  // Telegram caps a text message at 4096 characters and rejects anything
+  // longer outright, so long MAX texts go out in several parts. Returns the
+  // first part (its message_id is what later replies are matched against).
+  async sendTextChunks(chatId, text, route = {}, replyExtra = {}) {
+    let first = null;
+    const chunks = splitTelegramText(text);
+    for (let index = 0; index < chunks.length; index++) {
+      const sent = await this.bot.telegram.sendMessage(chatId, chunks[index], {
+        ...threadExtra(route),
+        ...(index === 0 ? replyExtra : {})
+      });
+      first = first || sent;
+    }
+    return first;
+  }
+
+  async sendMedia(chatId, message, filePath, extra, route, replyExtra) {
     if (message.type === MessageType.STICKER && message.metadata?.lottie) {
       // Animated sticker as a Telegram .tgs (gzipped Lottie). Telegram validates
       // .tgs strictly; if it is rejected, deliver a text marker rather than
@@ -770,14 +792,20 @@ export class TelegramBotAdapter {
       return ctx.chat?.type === 'private' && /^\/pair(\s|$|@)/.test(ctx.message?.text || '');
     }
     if (ctx.from?.id !== this.config.ownerId) return false;
-    if (!this.config.relayChatId) return true;
-    if (ctx.chat?.id === this.config.relayChatId) return true;
+    // The owner adding the bot to a group is how the relay group is found;
+    // the my_chat_member handler itself decides whether to adopt it.
+    if (ctx.updateType === 'my_chat_member') return true;
+    if (this.config.relayChatId && ctx.chat?.id === this.config.relayChatId) return true;
     // /relay is how the owner MOVES the bridge to a different group, so it has
     // to be reachable from a group that is not the current relay — otherwise
     // the escape hatch only works where it is not needed, and re-pointing the
     // bridge means editing SQLite on the server. Owner-only: the sender was
     // already checked above.
     if (isGroupChat(ctx.chat) && /^\/relay(\s|$|@)/.test(ctx.message?.text || '')) return true;
+    // Anything else only from the owner's private chat. Without a relay group
+    // this used to accept the owner's messages from ANY chat the bot was in —
+    // an ordinary message typed in some unrelated group was then delivered to
+    // the MAX chat picked with /select.
     return ctx.chat?.type === 'private' && ctx.chat.id === this.config.ownerId;
   }
 
@@ -809,7 +837,7 @@ export class TelegramBotAdapter {
     }
 
     if ('voice' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.voice.file_id, 'voice.ogg');
+      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.voice.file_id, 'voice');
       return { ...base, type: MessageType.VOICE, mediaPath };
     }
 
@@ -829,7 +857,7 @@ export class TelegramBotAdapter {
     }
 
     if ('sticker' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.sticker.file_id, 'sticker.webp');
+      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.sticker.file_id, 'sticker');
       return { ...base, type: MessageType.STICKER, mediaPath };
     }
 
@@ -858,6 +886,35 @@ const isBotCommand = (text) => {
 const threadExtra = (route = {}) => (
   route.telegramThreadId ? { message_thread_id: route.telegramThreadId } : {}
 );
+
+// When the MAX message is a reply, Telegram renders it as a quote.
+// allow_sending_without_reply keeps delivery working if the original was
+// deleted or is unavailable in the target chat.
+const replyParameters = (messageId) => (
+  messageId ? { reply_parameters: { message_id: messageId, allow_sending_without_reply: true } } : {}
+);
+
+// Bot API limits, in UTF-16 code units (what String#length counts).
+const TELEGRAM_TEXT_LIMIT = 4096;
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+// Splits text into parts Telegram accepts, preferring a line break, then a
+// space, in the second half of each part; never splits a surrogate pair.
+export const splitTelegramText = (text, limit = TELEGRAM_TEXT_LIMIT) => {
+  const chunks = [];
+  let rest = String(text ?? '');
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n', limit);
+    if (cut < limit / 2) cut = rest.lastIndexOf(' ', limit);
+    if (cut < limit / 2) cut = limit;
+    const code = rest.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^[\n ]/, '');
+  }
+  chunks.push(rest);
+  return chunks;
+};
 
 const threadExtraFromContext = (ctx) => threadExtra({
   telegramThreadId: ctx.message?.message_thread_id || null

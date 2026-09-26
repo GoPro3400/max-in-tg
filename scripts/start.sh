@@ -21,5 +21,6 @@ while [ "$i" -lt 30 ]; do
   sleep 0.2
 done
 
-# exec so node becomes PID 1 and keeps receiving SIGTERM for graceful shutdown.
+# exec so node replaces this shell as tini's direct child (see the Dockerfile's
+# ENTRYPOINT) and receives the SIGTERM tini forwards, for a graceful shutdown.
 exec node src/index.js

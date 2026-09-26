@@ -3,7 +3,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { safeName, listFilesByMtime, saveBuffer, replaceExtension } from '../../src/utils/fileHelpers.js';
+import { safeName, safeDisplayName, listFilesByMtime, saveBuffer, replaceExtension } from '../../src/utils/fileHelpers.js';
 
 describe('safeName', () => {
   it('replaces non-word characters with underscores', () => {
@@ -22,6 +22,38 @@ describe('safeName', () => {
 
   it('preserves dots and hyphens', () => {
     expect(safeName('my-file.2024.png')).toBe('my-file.2024.png');
+  });
+});
+
+describe('safeDisplayName', () => {
+  it('keeps Cyrillic and other scripts instead of collapsing them to "_"', () => {
+    expect(safeDisplayName('Договор.pdf')).toBe('Договор.pdf');
+    expect(safeDisplayName('Счёт на оплату.pdf')).toBe('Счёт_на_оплату.pdf');
+    expect(safeDisplayName('報告書.docx')).toBe('報告書.docx');
+    // Two different names must stay different (safeName made both "_.pdf").
+    expect(safeDisplayName('Договор.pdf')).not.toBe(safeDisplayName('Счёт.pdf'));
+  });
+
+  it('cannot escape its directory or hide the real extension', () => {
+    expect(safeDisplayName('../../etc/passwd')).toBe('etc_passwd');
+    expect(safeDisplayName('..\\..\\win.ini')).toBe('win.ini');
+    expect(safeDisplayName('.env')).toBe('env');
+    // U+202E RIGHT-TO-LEFT OVERRIDE would display "invoice‮fdp.exe" as "invoiceexe.pdf".
+    expect(safeDisplayName('invoice\u202Efdp.exe')).toBe('invoice_fdp.exe');
+  });
+
+  it('falls back to "file" for empty or punctuation-only names', () => {
+    expect(safeDisplayName('')).toBe('file');
+    expect(safeDisplayName(null)).toBe('file');
+    expect(safeDisplayName('...')).toBe('file');
+    expect(safeDisplayName('!!!')).toBe('file');
+  });
+
+  it('shortens long names by bytes, keeping the extension', () => {
+    const name = safeDisplayName(`${'Я'.repeat(300)}.pdf`);
+    expect(name.endsWith('.pdf')).toBe(true);
+    expect(Buffer.byteLength(name)).toBeLessThanOrEqual(200);
+    expect(safeDisplayName(`${'a'.repeat(300)}.jpg`, 80)).toHaveLength(80);
   });
 });
 

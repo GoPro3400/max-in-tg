@@ -63,8 +63,27 @@ const ECHO_GUARD_WINDOW_MS = 20000;
 // While waiting to be signed in, remind the owner at most this often — the QR
 // photo itself is updated silently in place.
 const LOGIN_REMINDER_INTERVAL_MS = 30 * 60 * 1000;
+// Consecutive failed QR captures (each ~LOGIN_POLL_INTERVAL_MS apart) after
+// which the page is taken for dead — e.g. a crashed renderer, which leaves the
+// browser connected — and the browser is relaunched.
+const LOGIN_CAPTURE_FAILURES_BEFORE_RELAUNCH = 5;
+// Planned browser recycling (see maybeRecycleBrowser). The memory reading walks
+// /proc, so it is taken at most once a minute rather than every 650 ms poll.
+const BROWSER_MEMORY_CHECK_INTERVAL_MS = 60 * 1000;
+// A memory-triggered recycle never fires on a browser younger than this: if a
+// FRESH Chromium already sits above the limit (heavy account, limit set too
+// low), recycling would only loop every minute and never help.
+const BROWSER_RECYCLE_MIN_AGE_MS = 15 * 60 * 1000;
+// How long a relaunched MAX page gets to show its chat list while the recycle
+// still holds the lock. Telegram sends queued behind the lock then run against
+// a usable page rather than a half-painted one.
+const BROWSER_RECYCLE_READY_TIMEOUT_MS = 90 * 1000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const toMb = (bytes) => Math.round(bytes / (1024 * 1024));
+// Echo-guard comparison key. Whitespace is dropped: a multi-line message comes
+// back from the page without its line breaks.
+const echoKey = (text) => String(text ?? '').replace(/\s+/g, '');
 
 export class BridgeService {
   constructor({ db, maxClient, telegramBot, mediaService, config }) {
@@ -111,6 +130,7 @@ export class BridgeService {
     // it does not spam failures against a logged-out page (and so the failure
     // counter does not trigger a pointless browser restart mid-login).
     this.loginInProgress = false;
+    this.loginFlow = null;
     // Distinct from `running`, which is also false during startup: this marks a
     // deliberate shutdown so long-running loops (the QR wait) bail out.
     this.stopping = false;
@@ -122,6 +142,15 @@ export class BridgeService {
     // Texts just delivered into MAX, per chat — see the echo guard in
     // forwardMaxMessage.
     this.recentSendsToMax = new Map();
+    // Planned browser recycling (maybeRecycleBrowser): when the current
+    // Chromium was launched, when its memory was last read (and the reading),
+    // how many recycles ran, and whether one is running right now.
+    this.browserStartedAt = 0;
+    this.lastBrowserMemoryCheckAt = 0;
+    this.lastBrowserMemory = null;
+    this.browserRecycles = 0;
+    this.lastBrowserRecycle = null;
+    this.browserRecycling = false;
   }
 
   async start() {
@@ -137,7 +166,13 @@ export class BridgeService {
 
     logger.info('Starting Max Web client');
     await this.startMaxClient();
-    const signedIn = await this.ensureMaxLogin({ reason: 'startup' });
+    let signedIn = await this.ensureMaxLogin({ reason: 'startup' });
+    // false can also mean "a sign-in is already running": the owner sent
+    // /login while the browser was still launching. Giving up here would throw
+    // below and exit the process in the middle of that sign-in — wait for it.
+    if (!signedIn && this.loginFlow) {
+      signedIn = await this.loginFlow.catch(() => false);
+    }
     // ensureMaxLogin only returns false when it never recognised the page (it
     // has no timeout otherwise), so waiting for a chat list here would just
     // burn 120s and then kill the process — taking the Telegram bot down with
@@ -146,11 +181,12 @@ export class BridgeService {
       throw new Error('MAX Web did not reach a usable state (neither the chat list nor the sign-in screen)');
     }
     // Under the lock: the Telegram bot is already live, so /check could be
-    // driving the same page concurrently.
+    // driving the same page concurrently. Same for everything below that
+    // touches the page.
     await this.maxLock.run(() => this.maxClient.waitForReady());
     logger.info('Max Web client ready');
     logger.info('Refreshing MAX chats');
-    const startupChats = await this.refreshChats({ ensureMappings: false });
+    const startupChats = await this.maxLock.run(() => this.refreshChats({ ensureMappings: false }));
     this.startupChatIds = new Set(startupChats.map((chat) => chat.id));
     // Priming = "mark what MAX already shows as seen, without delivering it".
     // It belongs to a FIRST run only:
@@ -159,13 +195,16 @@ export class BridgeService {
     //     hundreds of old messages the moment polling starts;
     //   * any later start — the database already knows the history, and
     //     anything unseen genuinely arrived while the bridge was down, so
-    //     priming it would silently swallow real messages (this container is
-    //     restarted every 2h by cron, so that window recurs on a schedule).
+    //     priming it would silently swallow real messages (restarts and
+    //     browser recycles recur on a schedule, so that window would too).
     if (!this.config.startupPrimeExistingMessages) {
       logger.info('Skipping startup MAX message priming by configuration');
     } else if (this.db.isEmptyOfMessages()) {
       logger.info({ chats: startupChats.length }, 'First run: priming existing MAX history so it is not delivered as new');
-      await this.primeExistingMaxMessages(startupChats);
+      // Priming opens every chat in turn and can take minutes. Without the
+      // lock a Telegram send (the bot is already live) verified chat X, then
+      // priming clicked chat Y before the text was typed — into Y.
+      await this.maxLock.run(() => this.primeExistingMaxMessages(startupChats));
     } else {
       logger.info('Not a first run: skipping priming so messages that arrived while the bridge was down are still delivered');
     }
@@ -183,9 +222,9 @@ export class BridgeService {
     this.stopping = true;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.telegramBot.stop(signal);
-    // Drain in-flight browser work before tearing the browser down: during the
-    // scheduled 2h restart a TG→MAX send can be mid-flight, and closing the
-    // page under it records the delivery as failed even though MAX actually
+    // Drain in-flight browser work before tearing the browser down: during a
+    // container restart a TG→MAX send can be mid-flight, and closing the page
+    // under it records the delivery as failed even though MAX actually
     // received the message. Polling and new sends are already off (running
     // is false, the bot is stopped), so the queue only shrinks. If a task is
     // wedged, give up after 8s and close anyway — index.js force-exits at 10s.
@@ -255,10 +294,22 @@ export class BridgeService {
   async startMaxClient() {
     try {
       await this.maxClient.start();
+      this.browserStartedAt = Date.now();
+      this.lastBrowserMemoryCheckAt = 0;
     } catch (error) {
       await this.maxClient.captureDiagnostics('startup-failed').catch(() => null);
       throw error;
     }
+  }
+
+  // Tears the browser down and launches a fresh one on the same profile (the
+  // MAX session survives, it lives in the profile). The caller must hold
+  // maxLock: both halves drive the page.
+  async relaunchMaxClient() {
+    await this.maxClient.stop().catch(() => null);
+    await this.startMaxClient();
+    // The new page has no chat list yet: re-read it on the next poll.
+    this.lastChatRefreshAt = 0;
   }
 
   // Blocks until a Telegram owner is known. With TELEGRAM_OWNER_ID unset (the
@@ -298,10 +349,15 @@ export class BridgeService {
     // under the other.
     if (this.loginInProgress) return false;
     this.loginInProgress = true;
+    // Kept so a caller that must not give up (start()) can wait for a flow
+    // someone else started — e.g. /login sent while the browser was launching.
+    const flow = this.runLoginFlow(reason);
+    this.loginFlow = flow;
     try {
-      return await this.runLoginFlow(reason);
+      return await flow;
     } finally {
       this.loginInProgress = false;
+      this.loginFlow = null;
     }
   }
 
@@ -330,6 +386,7 @@ export class BridgeService {
     let lastHash = null;
     let delivered = 0;
     let lastReminderAt = 0;
+    let failedCaptures = 0;
 
     const intro = [
       '🔐 Нужен вход в MAX.',
@@ -369,10 +426,28 @@ export class BridgeService {
         lastHash = null;
       }
 
+      // The wait is open-ended and polling stands down meanwhile, so nothing
+      // else would notice a browser that died under it: every capture would
+      // fail forever and the owner's last code would stay dead. (This used to
+      // be papered over by the external cron restarting the container.)
+      // Relaunch it here and carry on with a fresh page and a fresh code.
+      if (!this.stopping && (this.maxClient.isAlive?.() === false || failedCaptures >= LOGIN_CAPTURE_FAILURES_BEFORE_RELAUNCH)) {
+        logger.warn({ failedCaptures }, 'MAX browser is gone during the sign-in wait — relaunching it');
+        await this.maxLock.run(() => this.relaunchMaxClient()).catch((error) => {
+          logger.error({ err: error }, 'Relaunching the MAX browser during sign-in failed; will retry');
+        });
+        failedCaptures = 0;
+        lastHash = null;
+      }
+
       // knownHash lets the capture skip its screenshot + re-encode when the
       // code has not rotated, which is most passes of this open-ended wait.
-      const qr = await this.maxLock.run(() => this.maxClient.captureLoginQr({ knownHash: lastHash })).catch((error) => {
-        logger.warn({ err: error?.message || String(error) }, 'QR capture failed; retrying');
+      const qr = await this.maxLock.run(() => this.maxClient.captureLoginQr({ knownHash: lastHash })).then((result) => {
+        failedCaptures = 0;
+        return result;
+      }, (error) => {
+        failedCaptures += 1;
+        logger.warn({ err: error?.message || String(error), failedCaptures }, 'QR capture failed; retrying');
         return null;
       });
 
@@ -433,24 +508,39 @@ export class BridgeService {
   // ours. Only text: media identity already survives via the perceptual-hash
   // re-forward guard, and matching media by caption would be far too loose.
   rememberSentToMax(chatId, text) {
-    const trimmed = (text || '').trim();
-    if (!chatId || !trimmed) return;
+    const key = echoKey(text);
+    if (!chatId || !key) return;
     const pending = this.recentSendsToMax.get(chatId) || [];
-    pending.push({ text: trimmed, at: Date.now() });
+    pending.push({ text: key, at: Date.now() });
     this.recentSendsToMax.set(chatId, pending);
+  }
+
+  // Drops the record of a send once MAX itself shows that bubble as OUR
+  // outgoing message: the poller already skips outgoing bubbles, so the record
+  // can then only ever match — and swallow — the contact's own identical reply
+  // ("Да", "Ок", "+"), which normally arrives within the guard window.
+  forgetSentToMax(chatId, text) {
+    const key = echoKey(text);
+    const pending = this.recentSendsToMax.get(chatId);
+    if (!pending || !key) return;
+    const index = pending.findIndex((entry) => entry.text === key);
+    if (index >= 0) pending.splice(index, 1);
+    if (!pending.length) this.recentSendsToMax.delete(chatId);
   }
 
   // True when this incoming MAX message is one of ours coming back. Matching
   // entries are removed, and stale ones expire, so this can swallow at most
-  // one message per send and only within seconds of it.
+  // one message per send and only within seconds of it. Only text is guarded:
+  // what we record is text we typed, and a photo from the contact that merely
+  // carries the same caption is a real message.
   consumeRecentSend(message) {
     const pending = this.recentSendsToMax.get(message.chatId);
     if (!pending || !pending.length) return false;
 
     const now = Date.now();
     const fresh = pending.filter((entry) => now - entry.at <= ECHO_GUARD_WINDOW_MS);
-    const text = (message.text || '').trim();
-    const index = text ? fresh.findIndex((entry) => entry.text === text) : -1;
+    const key = message.type === MessageType.TEXT ? echoKey(message.text) : '';
+    const index = key ? fresh.findIndex((entry) => entry.text === key) : -1;
     if (index >= 0) fresh.splice(index, 1);
 
     if (fresh.length) this.recentSendsToMax.set(message.chatId, fresh);
@@ -491,16 +581,115 @@ export class BridgeService {
   schedulePoll(delay = this.config.pollIntervalMs) {
     if (!this.running) return;
     this.pollTimer = setTimeout(() => {
-      this.pollMax().then(() => {
-        this.consecutivePollFailures = 0;
-      }).catch((error) => {
-        this.consecutivePollFailures += 1;
-        logger.error({ err: error, failures: this.consecutivePollFailures }, 'Max polling failed');
-        this.handlePollFailure(error).catch((failureError) => {
-          logger.error({ err: failureError }, 'Poll failure recovery failed');
-        });
-      }).finally(() => this.schedulePoll());
+      this.runPollCycle().finally(() => this.schedulePoll());
     }, delay);
+  }
+
+  async runPollCycle() {
+    // Between two polls nothing is scraping the page, so this is where a
+    // planned browser recycle happens (it also takes maxLock, so an in-flight
+    // Telegram send finishes first). Its failure is not a poll failure.
+    await this.maybeRecycleBrowser().catch((error) => {
+      logger.error({ err: error }, 'Planned MAX browser recycle failed');
+    });
+    if (!this.running) return;
+    try {
+      await this.pollMax();
+      this.consecutivePollFailures = 0;
+    } catch (error) {
+      this.consecutivePollFailures += 1;
+      logger.error({ err: error, failures: this.consecutivePollFailures }, 'Max polling failed');
+      this.handlePollFailure(error).catch((failureError) => {
+        logger.error({ err: failureError }, 'Poll failure recovery failed');
+      });
+    }
+  }
+
+  // Replaces the external cron that used to `docker compose restart` the whole
+  // container every 2 hours. Chromium's memory grows the longer one MAX page
+  // stays open (~2 GB in ~3 h, after which sends into MAX start failing while
+  // /status still looks fine), so the bridge relaunches the browser itself:
+  // once it is older than browserRecycleMinutes, or as soon as its process
+  // tree holds more than browserMemoryLimitMb. Unlike the container restart
+  // this keeps the Telegram bot online, and it never cuts into a send, a poll
+  // or a QR sign-in.
+  async maybeRecycleBrowser(now = Date.now()) {
+    const due = await this.browserRecycleDue(now);
+    if (!due) return false;
+    return this.recycleBrowser(due);
+  }
+
+  async browserRecycleDue(now = Date.now()) {
+    if (!this.running || this.stopping || this.loginInProgress || this.browserRecycling) return null;
+    if (!this.browserStartedAt || !this.maxClient.page) return null;
+
+    const ageMs = now - this.browserStartedAt;
+    const maxAgeMs = Math.max(0, this.config.browserRecycleMinutes || 0) * 60 * 1000;
+    if (maxAgeMs > 0 && ageMs >= maxAgeMs) {
+      return { reason: 'age', ageMs, memory: this.lastBrowserMemory };
+    }
+
+    const limitBytes = Math.max(0, this.config.browserMemoryLimitMb || 0) * 1024 * 1024;
+    if (!limitBytes || typeof this.maxClient.getBrowserMemoryUsage !== 'function') return null;
+    if (now - this.lastBrowserMemoryCheckAt < BROWSER_MEMORY_CHECK_INTERVAL_MS) return null;
+    this.lastBrowserMemoryCheckAt = now;
+
+    const usage = await this.maxClient.getBrowserMemoryUsage().catch(() => null);
+    if (!usage) return null;
+    this.lastBrowserMemory = { ...usage, at: now };
+    if (usage.bytes < limitBytes) return null;
+    if (ageMs < BROWSER_RECYCLE_MIN_AGE_MS) {
+      logger.warn(
+        { memoryMb: toMb(usage.bytes), limitMb: this.config.browserMemoryLimitMb, ageMin: Math.round(ageMs / 60000) },
+        'Chromium is already above MAX_BROWSER_MEMORY_LIMIT_MB shortly after launch — waiting before recycling (is the limit too low?)'
+      );
+      return null;
+    }
+    return { reason: 'memory', ageMs, memory: this.lastBrowserMemory };
+  }
+
+  async recycleBrowser({ reason = 'manual', ageMs = 0, memory = null } = {}) {
+    if (!this.running || this.loginInProgress || this.browserRecycling) return false;
+    this.browserRecycling = true;
+    let relaunched = false;
+    let ready = false;
+    try {
+      // One lock section from teardown until the new page shows its chat list:
+      // a Telegram send queued meanwhile then runs against a usable page, and
+      // nothing can drive the page while it is being replaced.
+      await this.maxLock.run(async () => {
+        // Re-checked under the lock: stop() or a sign-in may have begun while
+        // this waited behind an in-flight send.
+        if (!this.running || this.loginInProgress) return;
+        logger.info(
+          { reason, ageMin: Math.round(ageMs / 60000), memoryMb: memory ? toMb(memory.bytes) : null },
+          'Recycling the MAX browser to release Chromium memory'
+        );
+        await this.relaunchMaxClient();
+        relaunched = true;
+        ready = await this.maxClient.waitForReady(BROWSER_RECYCLE_READY_TIMEOUT_MS).then(() => true, (error) => {
+          logger.warn({ err: error }, 'MAX Web did not show the chat list after a planned browser recycle');
+          return false;
+        });
+      });
+    } catch (error) {
+      this.lastBrowserRecycle = { at: Date.now(), reason, ok: false, error: error?.message || String(error) };
+      throw error;
+    } finally {
+      this.browserRecycling = false;
+    }
+    if (!relaunched) return false;
+
+    this.browserRecycles += 1;
+    this.consecutivePollFailures = 0;
+    this.lastBrowserRecycle = { at: Date.now(), reason, ok: ready };
+    logger.info({ reason, ready, recycles: this.browserRecycles }, 'MAX browser recycled');
+    if (!ready && this.running) {
+      // As after a failure restart: the relaunched profile may be signed out,
+      // in which case the QR flow takes over (it no-ops on a live session).
+      await this.ensureMaxLogin({ reason: 'after-recycle' });
+    }
+    return true;
   }
 
   async handlePollFailure(error) {
@@ -540,8 +729,7 @@ export class BridgeService {
       if (this.consecutivePollFailures < this.config.maxPollFailuresBeforeRestart) return;
 
       logger.warn('Restarting Max browser after repeated polling failures');
-      await this.maxClient.stop().catch(() => null);
-      await this.startMaxClient();
+      await this.relaunchMaxClient();
       this.consecutivePollFailures = 0;
       restarted = true;
     });
@@ -1174,8 +1362,10 @@ export class BridgeService {
     // carries the sign-in QR), so a message can land while MAX is still
     // starting or waiting to be scanned. Sending it would throw deep in
     // Puppeteer and burn the message as a failed delivery with no retry path,
-    // so say plainly that it was not sent and let the user resend.
-    if (this.loginInProgress || !this.maxClient.page) {
+    // so say plainly that it was not sent and let the user resend. A planned
+    // browser recycle is different: it holds maxLock until the new page is
+    // usable, so the send below simply waits for it instead of being refused.
+    if (this.loginInProgress || (!this.maxClient.page && !this.browserRecycling)) {
       await this.telegramBot.sendText(
         '⏳ MAX ещё не подключён — сообщение НЕ отправлено. Пришли его снова, когда придёт «✅ MAX подключён».',
         {
@@ -1202,6 +1392,7 @@ export class BridgeService {
     if (this.db.hasMessage(enriched.id)) return;
 
     const deliveryId = this.db.createDelivery(enriched.id, 'tg_to_max');
+    let captionError = null;
 
     try {
       await this.maxLock.run(async () => {
@@ -1219,18 +1410,47 @@ export class BridgeService {
           // was still the last row when a slow render raced the fixed sleep
           // (see Fix 2 in the reply-feature review).
           enriched.maxFingerprint = await this.maxClient.getLastOutgoingFingerprint(mapping.maxChatId, enriched.text).catch(() => null);
+          // A fingerprint means MAX already renders the bubble as outgoing,
+          // which the poller skips by itself: the echo record is no longer
+          // needed and would only swallow an identical reply from the contact.
+          if (enriched.maxFingerprint) this.forgetSentToMax(mapping.maxChatId, enriched.text);
         } else {
           const filePath = await this.mediaService.ensureMaxCompatible(enriched.mediaPath, enriched.type);
-          await this.maxClient.sendFile(mapping.maxChatId, filePath, enriched.text || '');
+          await this.maxClient.sendFile(mapping.maxChatId, filePath);
           enriched.mediaPath = filePath;
           // Hash the media we just sent into MAX so a reply to it can be matched.
           enriched.mediaHash = await this.computeMediaHash(filePath, enriched.type);
+          // The attach flow has no caption field the bridge fills in, and the
+          // caption used to be dropped without a trace. It follows as its own
+          // message instead. The file is already in MAX by now, so a failure
+          // here must not mark the delivery failed (the owner would resend the
+          // file) — it is reported separately below.
+          if (enriched.text?.trim()) {
+            try {
+              await this.maxClient.sendText(mapping.maxChatId, enriched.text);
+              this.rememberSentToMax(mapping.maxChatId, enriched.text);
+              const captionFingerprint = await this.maxClient.getLastOutgoingFingerprint(mapping.maxChatId, enriched.text).catch(() => null);
+              if (captionFingerprint) this.forgetSentToMax(mapping.maxChatId, enriched.text);
+            } catch (error) {
+              captionError = error;
+            }
+          }
         }
       });
 
       this.db.insertMessage(enriched);
       this.db.updateDeliveryStatus(deliveryId, 'sent');
       logger.info({ messageId: enriched.id, type: enriched.type, chatId: mapping.maxChatId }, 'Forwarded Telegram message to Max');
+      if (captionError) {
+        logger.warn({ err: captionError, messageId: enriched.id, chatId: mapping.maxChatId }, 'File sent to MAX but its caption was not');
+        await this.telegramBot.sendText(
+          `⚠️ Файл ушёл в MAX, а подпись к нему — нет: ${captionError.message}`,
+          {
+            telegramChatId: message.metadata.telegramChatId,
+            telegramThreadId: message.metadata.telegramThreadId
+          }
+        ).catch(() => null);
+      }
     } catch (error) {
       this.db.updateDeliveryStatus(deliveryId, 'failed', error.message);
       logger.error({ err: error, messageId: enriched.id, chatId: mapping.maxChatId }, 'Failed to forward Telegram message to Max');
@@ -1306,23 +1526,35 @@ export class BridgeService {
   resolveTelegramMapping(message) {
     const telegramChatId = message.metadata.telegramChatId;
     const telegramThreadId = message.metadata.telegramThreadId || null;
-    if (this.config.telegram.relayChatId && this.config.telegram.useTopics && !telegramThreadId) {
-      return null;
-    }
-    const mapping = this.db.getChatMappingByTelegramThread(telegramChatId, telegramThreadId);
-    if (mapping) return mapping;
-
-    if (!this.config.telegram.relayChatId) {
-      const selected = this.db.getSelectedChat();
-      return selected ? {
-        maxChatId: selected.id,
-        telegramChatId: this.telegramBot.targetChatId(),
-        telegramThreadId: null,
-        title: selected.title
-      } : null;
+    if (this.config.telegram.relayChatId && this.config.telegram.useTopics) {
+      if (!telegramThreadId) return null;
+      return this.db.getChatMappingByTelegramThread(telegramChatId, telegramThreadId);
     }
 
-    return null;
+    // No topics: every MAX chat is delivered into the same Telegram chat with
+    // no thread, so every mapping shares (chat, no thread) and a lookup by
+    // thread would return whichever chat happened to be inserted first. What
+    // the owner means is, in order: the chat of the message they replied to,
+    // else the chat picked with /select.
+    const repliedTo = this.fallbackReplyTarget(message);
+    const target = repliedTo || this.db.getSelectedChat();
+    return target ? {
+      maxChatId: target.id,
+      telegramChatId: this.telegramBot.targetChatId(),
+      telegramThreadId: null,
+      title: target.title
+    } : null;
+  }
+
+  // The MAX chat a Telegram reply points back to: the chat a forwarded MAX
+  // message came from, or the one an earlier Telegram message was sent into.
+  fallbackReplyTarget(message) {
+    const replyToTelegramMessageId = message.metadata?.replyToTelegramMessageId;
+    if (!replyToTelegramMessageId) return null;
+    const original = this.db.getMessageByTelegramMessageId(replyToTelegramMessageId)
+      || this.db.getTgToMaxMessageBySourceId(replyToTelegramMessageId);
+    if (!original?.chatId) return null;
+    return this.db.listChats().find((chat) => chat.id === original.chatId) || null;
   }
 
   async syncTopics() {
@@ -1387,7 +1619,10 @@ export class BridgeService {
   }
 
   async formatHistory(telegramChatId, telegramThreadId) {
-    const mapping = telegramChatId && !(this.config.telegram.relayChatId && this.config.telegram.useTopics && !telegramThreadId)
+    // Only a topic identifies a chat; without topics every mapping shares the
+    // same (chat, no thread) and a lookup would pick an arbitrary one.
+    const topicsInUse = Boolean(this.config.telegram.relayChatId && this.config.telegram.useTopics);
+    const mapping = telegramChatId && topicsInUse && telegramThreadId
       ? this.db.getChatMappingByTelegramThread(telegramChatId, telegramThreadId)
       : null;
     const selected = mapping
@@ -1397,7 +1632,9 @@ export class BridgeService {
     if (!selected) return 'No linked or selected MAX chat.';
     const messages = this.db.recentMessages(selected.id, this.config.historyLimit);
     if (!messages.length) return `No stored history for ${selected.title}.`;
-    return messages.map(humanMessage).join('\n').slice(0, 3900);
+    // Telegram caps a message at 4096 characters; keep the NEWEST lines, which
+    // are the ones /history is asked for.
+    return messages.map(humanMessage).join('\n').slice(-3900);
   }
 
   formatDeliveries() {
@@ -1588,8 +1825,27 @@ export class BridgeService {
       `Chats per poll: ${this.config.maxChatsPerPoll}`,
       `Auto topics: ${this.shouldAutoCreateTopics() ? 'yes' : 'no'}`,
       this.topicCreationBlockedReason ? `Topic creation blocked: ${this.topicCreationBlockedReason}` : null,
-      `Poll failures: ${this.consecutivePollFailures}`
+      `Poll failures: ${this.consecutivePollFailures}`,
+      ...this.formatBrowserStatusLines()
     ].filter(Boolean).join('\n');
+  }
+
+  // The planned-recycle state, so the owner can see from Telegram that the
+  // browser is being kept in check (this used to be an invisible host cron).
+  formatBrowserStatusLines(now = Date.now()) {
+    if (!this.browserStartedAt) return [];
+    const minutesAgo = (at) => `${Math.max(0, Math.round((now - at) / 60000))} min`;
+    const memory = this.lastBrowserMemory;
+    const limitMb = this.config.browserMemoryLimitMb || 0;
+    const recycleMinutes = this.config.browserRecycleMinutes || 0;
+    const last = this.lastBrowserRecycle;
+    return [
+      `Browser uptime: ${minutesAgo(this.browserStartedAt)}${recycleMinutes ? ` (recycle every ${recycleMinutes} min)` : ''}`,
+      memory
+        ? `Browser memory: ${toMb(memory.bytes)} MB${limitMb ? ` (limit ${limitMb} MB)` : ''}`
+        : null,
+      `Browser recycles: ${this.browserRecycles}${last ? ` (last: ${last.reason}, ${minutesAgo(last.at)} ago${last.ok ? '' : ', FAILED'})` : ''}`
+    ];
   }
 
   async runHealthCheck() {

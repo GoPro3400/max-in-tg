@@ -166,9 +166,9 @@ MAX Relay
 ### Requirements
 
 - **What it costs**: an always-on Linux VPS with 2 GB RAM and ~10 GB disk (typically
-  €5–10/month), plus a mandatory cron job restarting the container every 2 hours because
-  Chromium leaks (see [Known Limitations](#known-limitations) and SETUP_GUIDE §11.1).
-  A laptop that sleeps will not do
+  €5–10/month). A laptop that sleeps will not do. No cron job is needed any more: the
+  bridge relaunches Chromium by itself when it grows (see
+  [Known Limitations](#known-limitations) and SETUP_GUIDE §11.1)
 - **Server**: Debian 12/13 VPS with Docker + Docker Compose v2
 - **Telegram**: a bot token from [@BotFather](https://t.me/BotFather); a private group
   with Topics is optional and detected automatically
@@ -383,7 +383,7 @@ topics for every current chat.
 |---|-----------|---------|
 | 1 | **Max Web DOM** | Project depends on DOM selectors. Max Web updates may break things. Use `/check` for diagnostics |
 | 2 | **Stickers** | Network intercept of the Lottie/sticker asset, then a canvas screenshot; if neither works the message arrives as the text `[Стикер]` |
-| 3 | **Chromium memory leak** | The renderer grows to ~2 GB in about 3 hours, after which photos from Telegram stop reaching MAX while `/status` and `/check` still look fine. Mitigated by a scheduled restart every 2 hours — cron job in [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
+| 3 | **Chromium memory leak** | The renderer grows to ~2 GB in about 3 hours, after which photos from Telegram stop reaching MAX. The bridge relaunches the browser itself between poll cycles — every 2 hours, or as soon as Chromium exceeds 1300 MB (`MAX_BROWSER_RECYCLE_MINUTES`, `MAX_BROWSER_MEMORY_LIMIT_MB`); the Telegram bot stays online and no cron job is needed — [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
 | 4 | **At-least-once** | Possible duplicates if process crashes between send and SQLite write |
 | 5 | **Chat identity** | By title/index — same-named chats may be confused |
 | 6 | **Single user** | Self-hosted for one Max account |

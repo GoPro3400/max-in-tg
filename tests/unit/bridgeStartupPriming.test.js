@@ -6,9 +6,9 @@ import { makeBridge, makeTestConfig, linkChat, maxMessage } from '../helpers/bri
 // Get it wrong in one direction and a fresh install floods the owner's
 // Telegram with hundreds of old messages; get it wrong in the other and every
 // restart silently swallows the messages that arrived while the bridge was
-// down (this container is restarted every 2 hours by cron, so that window is
-// not hypothetical). The rule these tests pin: prime everything on a first
-// run, prime nothing afterwards.
+// down (restarts and planned browser recycles recur on a schedule, so that
+// window is not hypothetical). The rule these tests pin: prime everything on a
+// first run, prime nothing afterwards.
 
 function chatList(count) {
   return Array.from({ length: count }, (_, index) => ({

@@ -3,6 +3,8 @@ import {
   makeBridge,
   makeFakeMaxClient,
   makeFakeMediaService,
+  makeFakeTelegramBot,
+  makeTestConfig,
   linkChat,
   telegramMessage
 } from '../helpers/bridgeHarness.js';
@@ -99,8 +101,12 @@ describe('handleTelegramMessage', () => {
 
     expect(mediaService.ensureMaxCompatible).toHaveBeenCalledWith('/tmp/original.jpg', 'photo');
     expect(maxClient.sendFile).toHaveBeenCalledTimes(1);
-    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/converted.jpg', 'caption');
-    expect(maxClient.sendText).not.toHaveBeenCalled();
+    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/converted.jpg');
+    // The caption used to be passed to sendFile, which ignored it: the text
+    // never reached MAX. It now follows the file as its own message.
+    expect(maxClient.sendText).toHaveBeenCalledWith('max-1', 'caption');
+    expect(maxClient.sendFile.mock.invocationCallOrder[0])
+      .toBeLessThan(maxClient.sendText.mock.invocationCallOrder[0]);
     // Photo hash is computed over the file actually sent into MAX.
     expect(mediaService.imageDHash).toHaveBeenCalledWith('/tmp/converted.jpg');
 
@@ -110,10 +116,36 @@ describe('handleTelegramMessage', () => {
     expect(stored.mediaHash).toBe('a1b2c3d4e5f60718');
     expect(db.getDeliveryStats()).toEqual([{ status: 'sent', count: 1 }]);
 
-    // Fingerprint capture is deliberately text-only (a later Telegram reply
-    // to a media send cannot be quoted back inside MAX) — pin that boundary.
-    expect(maxClient.getLastOutgoingFingerprint).not.toHaveBeenCalled();
+    // The media message itself gets no MAX-side fingerprint (a later Telegram
+    // reply to a media send cannot be quoted back inside MAX) — pin that.
     expect(stored.maxFingerprint).toBeNull();
+  });
+
+  it('a media send without a caption sends no text', async () => {
+    const { bridge, db, maxClient } = makeBridge();
+    linkChat(db, 'max-1');
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-401', { type: 'photo', mediaPath: '/tmp/a.jpg', text: '' }));
+
+    expect(maxClient.sendFile).toHaveBeenCalledTimes(1);
+    expect(maxClient.sendText).not.toHaveBeenCalled();
+  });
+
+  it('a caption that fails after the file went through is reported, but the file is not marked failed', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge({
+      maxClient: makeFakeMaxClient({
+        sendText: vi.fn(async () => { throw new Error('composer did not clear'); })
+      })
+    });
+    linkChat(db, 'max-1');
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-402', { type: 'photo', mediaPath: '/tmp/a.jpg', text: 'подпись' }));
+
+    expect(maxClient.sendFile).toHaveBeenCalledTimes(1);
+    expect(db.hasMessage('tg-402')).toBe(true);
+    expect(db.getDeliveryStats()).toEqual([{ status: 'sent', count: 1 }]);
+    expect(telegramBot.sendText).toHaveBeenCalledTimes(1);
+    expect(telegramBot.sendText.mock.calls[0][0]).toContain('подпись к нему — нет');
   });
 
   it('records a failed delivery, keeps the message unstored, and notifies the user when the MAX send fails', async () => {
@@ -212,5 +244,75 @@ describe('handleTelegramMessage', () => {
 
     expect(maxClient.sendText).toHaveBeenCalledTimes(1);
     expect(maxClient.sendText).toHaveBeenCalledWith('max-1', 'reply anyway', null);
+  });
+});
+
+describe('routing without topics (no relay group)', () => {
+  const OWNER = 12345;
+
+  // Without topics every MAX chat is delivered into the owner's private chat,
+  // so every mapping is (owner, no thread): a lookup by thread returned the
+  // first-inserted chat and ignored /select — a reply meant for one contact was
+  // typed into another contact's chat.
+  function fallbackBridge() {
+    const harness = makeBridge({
+      config: makeTestConfig({ telegram: { relayChatId: null } }),
+      telegramBot: makeFakeTelegramBot({ targetChatId: vi.fn(() => OWNER) })
+    });
+    linkChat(harness.db, 'Mom', { telegramChatId: OWNER, telegramThreadId: null });
+    linkChat(harness.db, 'Boss', { telegramChatId: OWNER, telegramThreadId: null });
+    return harness;
+  }
+
+  it('sends to the chat picked with /select, not to whichever mapping came first', async () => {
+    const { bridge, db, maxClient } = fallbackBridge();
+    db.selectChat('Boss');
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-1', {
+      text: 'for the boss', telegramChatId: OWNER, telegramThreadId: null
+    }));
+
+    expect(maxClient.sendText).toHaveBeenCalledWith('Boss', 'for the boss', null);
+  });
+
+  it('a reply goes to the chat of the message it replies to', async () => {
+    const { bridge, db, maxClient } = fallbackBridge();
+    db.selectChat('Boss');
+    db.insertMessage({
+      id: 'max-from-mom',
+      chatId: 'Mom',
+      direction: 'max_to_tg',
+      type: 'text',
+      text: 'are you coming?',
+      sourceMessageId: 'fp-mom|18:00|are you coming?',
+      createdAt: Date.now(),
+      metadata: {},
+      telegramMessageId: 901
+    });
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-2', {
+      text: 'yes', telegramChatId: OWNER, telegramThreadId: null,
+      metadata: { replyToTelegramMessageId: 901 }
+    }));
+
+    expect(maxClient.sendText).toHaveBeenCalledWith('Mom', 'yes', 'fp-mom|18:00|are you coming?');
+  });
+
+  it('/history shows the selected chat', async () => {
+    const { bridge, db } = fallbackBridge();
+    db.selectChat('Boss');
+    db.insertMessage({
+      id: 'boss-1', chatId: 'Boss', direction: 'max_to_tg', type: 'text', text: 'report due',
+      sourceMessageId: 'b1', createdAt: Date.now(), metadata: {}
+    });
+    db.insertMessage({
+      id: 'mom-1', chatId: 'Mom', direction: 'max_to_tg', type: 'text', text: 'dinner at 7',
+      sourceMessageId: 'm1', createdAt: Date.now(), metadata: {}
+    });
+
+    const history = await bridge.formatHistory(OWNER, null);
+
+    expect(history).toContain('report due');
+    expect(history).not.toContain('dinner at 7');
   });
 });

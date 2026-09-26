@@ -187,6 +187,44 @@ describe('isAllowedContext gate', () => {
     await adapter.bot.handleUpdate(commandUpdate('/status', { chatId: OWNER_ID, fromId: OWNER_ID }));
     expect(onStatus).toHaveBeenCalledTimes(1);
   });
+
+  it('without a relay group, the owner is only listened to in the private chat', async () => {
+    // Regression: with no relay group the gate accepted the owner's updates
+    // from ANY chat, so a message typed in an unrelated group the bot sits in
+    // was delivered to whichever MAX chat /select pointed at.
+    const { adapter } = makeAdapter({ ownerId: OWNER_ID });
+    const outbound = vi.fn(async () => {});
+    adapter.onMessage(outbound);
+    const onStatus = vi.fn(async () => 'status');
+    adapter.onStatus(onStatus);
+    const groupText = {
+      update_id: ++updateId,
+      message: {
+        message_id: 5000,
+        date: 1700000000,
+        chat: { id: OTHER_GROUP_ID, type: 'supergroup' },
+        from: { id: OWNER_ID, is_bot: false, first_name: 'owner' },
+        text: 'test 123'
+      }
+    };
+
+    await adapter.bot.handleUpdate(groupText);
+    await adapter.bot.handleUpdate(commandUpdate('/status', { chatId: OTHER_GROUP_ID, chatType: 'supergroup', fromId: OWNER_ID }));
+
+    expect(outbound).not.toHaveBeenCalled();
+    expect(onStatus).not.toHaveBeenCalled();
+
+    await adapter.bot.handleUpdate(commandUpdate('/status', { chatId: OWNER_ID, fromId: OWNER_ID }));
+    expect(onStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('without a relay group, the owner adding the bot to a group still reaches relay discovery', async () => {
+    const { adapter } = makeAdapter({ ownerId: OWNER_ID });
+
+    await adapter.bot.handleUpdate(membershipUpdate({ chatId: RELAY_ID }));
+
+    expect(adapter.config.relayChatId).toBe(RELAY_ID);
+  });
 });
 
 describe('my_chat_member relay discovery', () => {

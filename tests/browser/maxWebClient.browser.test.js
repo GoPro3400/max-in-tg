@@ -315,8 +315,13 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
 
   it('notices a crashed page at once', async () => {
     expect(client.isAlive()).toBe(true);
-    await client.page.goto('chrome://crash').catch(() => null);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // The renderer is crashed through DevTools: some Chrome builds refuse to
+    // open chrome://crash.
+    // (It never answers: the page is gone.)
+    const devtools = await client.page.createCDPSession();
+    devtools.send('Page.crash').catch(() => null);
+    const deadline = Date.now() + 10000;
+    while (client.isAlive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
     expect(client.isAlive()).toBe(false);
   });
 

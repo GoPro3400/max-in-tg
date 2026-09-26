@@ -1,6 +1,9 @@
 // A fake MAX Web page for the browser tests (tests/browser). Its markup
 // follows the templates in MAX Web's own bundle (web.max.ru):
-//   message:  <div data-bubbles-variant> <div class="bubble"> <div class="bubbleContent">…
+//   message:  <div data-bubbles-variant> <div class="bordersWrapper"> <div class="bubble"> <div class="bubbleContent">…
+//   sender (groups, first bubble of a run): .bubbleContent > <div class="header"><button class="header"><span class="name"><span class="name"><span class="text">
+//   time:     .bubbleContent > <span class="meta"><div class="meta meta--text"><span class="text"> 12:04 </span> — there is no .time[aria-label] in a bubble
+//   file:     .bubbleContent > <div class="attaches"><button class="container" aria-label="Скачать"> .title (name) .info ("Скачать • 1.23 MB")
 //   text:     <span class="text"> with emoji as <span class="emoji"><img alt></span>
 //             and animoji as <span class="animoji" data-lexical-animoji-emoji><img class="img" src="data:…" alt>…
 //   emoji-only message: <div class="emojis"> with big emoji (plain img, or a lottie player)
@@ -37,7 +40,7 @@ export const PAGE = (opts = {}) => `<!doctype html><html><head><meta charset="ut
 </style></head><body>
 <aside aria-labelledby="aside-header-title"><h1 id="aside-header-title">Chats</h1>
  <div class="scrollable"><div class="scrollListContent"></div></div></aside>
-<main><header><h2 id="main-header-title"></h2></header>
+<main><h2 id="main-header-title" class="sr-only"></h2><div class="header"><span class="title"></span></div>
  <div class="scrollable" id="scroller"><div class="scrollListContent" id="msgs"></div></div>
  <div data-testid="composer"><button aria-label="Upload file">+</button><div contenteditable="true" role="textbox" id="composer"></div><button aria-label="Send message" id="send">send</button></div>
 </main>
@@ -57,20 +60,25 @@ const renderText = (parts) => parts.map((p) => typeof p === 'string' ? esc(p)
   : p.animoji ? '<span class="animoji" data-lexical-animoji="" data-lexical-animoji-emoji="' + esc(p.animoji) + '"><img class="img" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=" alt="' + esc(p.animoji) + '"><span class="player">' + lottie(p.animoji) + '</span></span>'
   : '').join('');
 const chips = (m) => (m.reactions || []).filter((r) => r.count > 0).map((r) => '<button class="reaction' + (m.mine === r.emoji ? ' reaction--active' : '') + '" data-mid="' + m.id + '" data-emoji="' + esc(r.emoji) + '"><div class="animoji">' + lottie(r.emoji) + '</div> <span class="counter">' + r.count + '</span></button>').join('');
+// .block > .messageWrapper > .message > .message > [data-bubbles-variant] >
+// .bordersWrapper > .bubble > .bubbleContent; the reactions of a text bubble
+// come right after .bordersWrapper.
 function renderMessage(m) {
   const inside = m.media || m.sticker;
   let content = '';
-  if (m.author) content += '<div class="author"><span class="text">' + esc(m.author) + '</span></div>';
-  if (m.media) content += '<div class="attaches"><img src="' + m.media + '" width="300" height="200"></div>';
+  if (m.author) content += '<div class="header"><button class="header"><span class="name"><span class="name"><span class="text">' + esc(m.author) + '</span></span></span>'
+    + (m.role ? ' <span class="role"><span class="text">' + esc(m.role) + '</span></span>' : '') + '</button></div>';
+  if (m.media) content += '<div class="media"><img src="' + m.media + '" width="300" height="200"></div>';
+  if (m.file) content += '<div class="attaches"><button class="container" aria-label="Скачать"><div class="fileIcon"><svg></svg></div><div class="title">' + esc(m.file.name) + '</div><div class="info">Скачать • ' + esc(m.file.size) + '</div></button></div>';
   if (m.sticker) content += '<div class="sticker">' + '<div class="lottie" data-url="' + m.sticker + '" data-emoji="sticker"><img src="/e/stk.png" alt="" width="170"></div></div>';
   if (m.big) content += '<div class="emojis">' + m.big.map((b) => b.plain ? emojiImg(b.plain, 64) : lottie(b.anim)).join('') + '</div>';
   if (m.text) content += '<span class="text">' + renderText(m.text) + '</span>';
   if (inside && (m.reactions || []).some((r) => r.count > 0)) content += '<div class="reactions reactions--inside"><div class="reactions reactions--inside">' + chips(m) + '</div></div>';
-  content += '<span class="time" aria-label="' + m.time + '">' + m.time + '</span>';
-  let html = '<div class="row" data-mid="' + m.id + '"><div data-bubbles-variant="' + (m.out ? 'outgoing' : 'incoming') + '"><div class="bubble"><div class="bubbleContent">' + content + '</div></div>'
-    + '<div class="toolbar"><button aria-label="Reply">↩</button><button aria-label="Message actions" data-mid="' + m.id + '">⋯</button></div></div>';
-  if (!inside && (m.reactions || []).some((r) => r.count > 0)) html += '<div class="reactions"><div class="reactions">' + chips(m) + '</div></div>';
-  return html + '</div>';
+  content += '<span class="meta"><div class="meta meta--text"><span class="text"> ' + m.time + (m.edited ? ' ред.' : '') + ' </span></div></span>';
+  const reactions = !inside && (m.reactions || []).some((r) => r.count > 0) ? '<div class="reactions"><div class="reactions">' + chips(m) + '</div></div>' : '';
+  return '<div class="row block" role="listitem" data-mid="' + m.id + '"><div class="messageWrapper' + (m.out ? ' messageWrapper--isOut' : '') + '"><div class="message"><div class="message">'
+    + '<div data-bubbles-variant="' + (m.out ? 'outgoing' : 'incoming') + '"><div class="bordersWrapper"><div class="bubble"><div class="bubbleContent">' + content + '</div></div></div>' + reactions + '</div>'
+    + '</div></div><div class="toolbar"><button aria-label="Reply">↩</button><button aria-label="Message actions" data-mid="' + m.id + '">⋯</button></div></div></div>';
 }
 function loadLotties(root) {
   root.querySelectorAll('.lottie:not([data-started])').forEach((el) => {
@@ -94,7 +102,8 @@ function renderChats() {
   list.innerHTML = window.__chats.map((c, i) => '<div class="item" data-index="' + i + '"><button class="cell"><h3 class="title"><span class="name"><span class="text">' + esc(c.title) + '</span></span></h3></button></div>').join('');
   list.querySelectorAll('.item').forEach((item) => item.querySelector('button').addEventListener('click', () => {
     window.__active = window.__chats[Number(item.getAttribute('data-index'))].title;
-    document.getElementById('main-header-title').textContent = window.__active;
+    document.getElementById('main-header-title').textContent = 'Окно чата с ' + window.__active;
+    document.querySelector('main .header .title').textContent = window.__active;
     window.renderMessages();
   }));
 }

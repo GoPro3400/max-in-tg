@@ -97,6 +97,10 @@ export const config = {
       messageText: process.env.MAX_SELECTORS_MESSAGE_TEXT || '.text, [data-lexical-text]',
       messageAuthor: process.env.MAX_SELECTORS_MESSAGE_AUTHOR || '.author, .sender, .bubbleAuthor',
       messageTime: process.env.MAX_SELECTORS_MESSAGE_TIME || '.time[aria-label], time',
+      // Where MAX actually shows a bubble's time: the text of its meta line.
+      messageMetaTime: process.env.MAX_SELECTORS_MESSAGE_META_TIME || '.bubbleContent > .meta',
+      // The sender's name above a group bubble (its .name is read).
+      messageSender: process.env.MAX_SELECTORS_MESSAGE_SENDER || '.bubbleContent > .header',
       messageImage: process.env.MAX_SELECTORS_MESSAGE_IMAGE || 'img, canvas',
       messageAudio: process.env.MAX_SELECTORS_MESSAGE_AUDIO || 'audio, [class*="voice"], [data-testid*="voice"]',
       messageVideo: process.env.MAX_SELECTORS_MESSAGE_VIDEO || 'video, source[type="video"]',

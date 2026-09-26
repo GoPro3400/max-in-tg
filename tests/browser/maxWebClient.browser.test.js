@@ -88,15 +88,22 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('keeps bubble ids in the format they always had (a change re-forwards history)', async () => {
+  it('puts the time from the meta line into bubble ids, and knows their old ids', async () => {
     const origin = new URL(site.url).origin;
-    const ids = (await client.scrapeMessageRows()).map((row) => row.rawId);
+    const rows = await client.scrapeMessageRows();
+    const ids = rows.map((row) => row.rawId);
     expect(ids[0]).toBe(`12:00|Привет|${origin}/e/1f600.png`);
     expect(ids[1]).toMatch(/^12:01\|Огонь\|data:image\/png;base64,/);
     expect(ids[2]).toBe(`12:02|${origin}/e/1fae0.png`);
     expect(ids[3]).toBe('12:03');
     expect(ids[4]).toBe(`12:04|${origin}/photo/p1.png?r=TOKEN1&fn=w_1280`);
     expect(ids[6]).toBe('12:06|Моё сообщение');
+    // Before, texts had no time in their ids; bubbles without a text of their
+    // own had it by accident (it was their first .text), and keep their ids.
+    const legacy = rows.map((row) => row.legacyRawId);
+    expect(legacy[0]).toBe(`Привет|${origin}/e/1f600.png`);
+    expect(legacy[6]).toBe('Моё сообщение');
+    expect(legacy.slice(2, 6)).toEqual(ids.slice(2, 6));
   });
 
   it('keeps animoji still and stickers animated', async () => {
@@ -115,8 +122,10 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     expect(at('12:01')).toMatchObject({ type: 'text', text: 'Огонь 🔥', mediaUrl: null });
     expect(at('12:02')).toMatchObject({ type: 'text', text: '🫠' });
     expect(at('12:03')).toMatchObject({ type: 'text', text: '👍' });
-    expect(at('12:04').type).toBe('photo');
+    expect(at('12:04')).toMatchObject({ type: 'photo', text: '' }); // the time is no caption
     expect(at('12:04').mediaUrl).toContain('TOKEN1');
+    expect(at('12:00').metadata.legacyId).toMatch(/^Привет\|/);
+    expect(at('12:04').metadata.legacyId).toBeUndefined();
   });
 
   it('numbers identical bubbles instead of dropping the second', async () => {
@@ -196,7 +205,11 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
   it('does not take the sender\'s name for a caption, and keeps emoji in group texts', async () => {
     await openChat('Group');
     const messages = await client.readMessages('Group', { isKnown: () => false });
-    expect(messages.find((message) => message.metadata.time === '13:00')).toMatchObject({ type: 'photo', text: '' });
+    const photo = messages.find((message) => message.metadata.time === '13:00');
+    expect(photo).toMatchObject({ type: 'photo', text: '' });
+    // Its old id took the sender's name for its text.
+    expect(photo.sourceMessageId).toMatch(/^13:00\|http/);
+    expect(photo.metadata.legacyId).toMatch(/^Анна\|http/);
     expect(messages.find((message) => message.metadata.time === '13:01')).toMatchObject({ type: 'text', text: 'Всем привет 👋' });
     const senders = Object.fromEntries(messages.map((message) => [message.metadata.time, message.metadata.sender]));
     // MAX names the sender on the first bubble of a run only.

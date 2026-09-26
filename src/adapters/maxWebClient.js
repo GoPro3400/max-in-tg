@@ -109,6 +109,7 @@ const REACTION_SCAN_MAX_AGE_MS = 5000;
 
 const reactionRowOf = (row) => ({
   rawId: row.rawId,
+  legacyRawId: row.legacyRawId && row.legacyRawId !== row.rawId ? row.legacyRawId : null,
   outgoing: Boolean(row.outgoing),
   mediaToken: (/[?&]r=([^&]+)/.exec(row.mediaUrl || '') || [])[1] || null,
   reactions: (row.reactions || []).map(({ emoji, count, active }) => ({ emoji, count, active: Boolean(active) })),
@@ -822,25 +823,43 @@ export class MaxWebClient {
         // NOT the one inside .link (which is the quoted author's name or snippet).
         let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
         if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
-        // Part of the bubble's id, exactly as it has always been computed.
-        const fingerprintText = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
-        // What is delivered: with its emoji, and never the sender's name —
-        // which is all the fallback .text used to find on an uncaptioned photo
-        // in a group. An emoji-only message has no .text at all; its emoji
-        // are drawn big instead.
-        const textSource = textEl || safeAll(node, innerSelectors.messageText)
-          .find((el) => !inQuote(el) && !safeClosest(el, innerSelectors.messageAuthor)) || null;
+        // The id of a bubble before the time was part of it (see legacyRawId
+        // below) took the first .text of the bubble when it had no text of
+        // its own — the sender's name in a group, else the time.
+        const legacyFingerprintText = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
+        // The bubble's own chrome: the quote, the sender's name above it and
+        // its meta line (the time, "ред."). MAX draws the time as a .text too,
+        // so an uncaptioned photo came through captioned "12:04" — and a voice
+        // message, having "text", was not taken for a voice message.
+        const isChrome = (el) => inQuote(el)
+          || Boolean(safeClosest(el, innerSelectors.messageAuthor))
+          || Boolean(safeClosest(el, innerSelectors.messageSender))
+          || Boolean(safeClosest(el, innerSelectors.messageMetaTime));
+        // What is delivered: with its emoji. An emoji-only message has no
+        // .text at all; its emoji are drawn big instead.
+        const textSource = textEl || safeAll(node, innerSelectors.messageText).find((el) => !isChrome(el)) || null;
         const bigEmojiEl = safeAll(node, decor.bigEmoji).find((el) => !inQuote(el)) || null;
         const text = readable(textSource).trim() || readable(bigEmojiEl).trim();
+        const fingerprintText = (textSource ? textSource.textContent : '').trim();
 
         const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
-        // Who wrote it, for showing in Telegram (group chats): the bubble's own
-        // author line — not the quoted author of a reply (which the id above
-        // may have picked up, and keeps for compatibility).
-        const senderEl = safeAll(node, innerSelectors.messageAuthor).find((el) => !inQuote(el)) || null;
-        const sender = senderEl ? readable(senderEl).trim() : '';
+        // Who wrote it, for showing in Telegram (group chats): the name above
+        // the bubble — MAX shows it on the first of a run of bubbles from one
+        // sender — else the bubble's own author line; never the quoted author
+        // of a reply (which `author` may have picked up, and keeps for the id).
+        const senderHeader = safeAll(node, innerSelectors.messageSender).find((el) => !inQuote(el)) || null;
+        const senderEl = (senderHeader && (senderHeader.querySelector('.name') || senderHeader))
+          || safeAll(node, innerSelectors.messageAuthor).find((el) => !inQuote(el)) || null;
+        const sender = senderEl ? readable(senderEl).replace(/\s+/g, ' ').trim() : '';
         const timeNode = node.querySelector(innerSelectors.messageTime);
-        const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
+        const legacyTime = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
+        // MAX shows a bubble's time as the text of its meta line, not in a
+        // .time[aria-label] element — which does not exist, so the time used
+        // to be missing from every id, and a text repeating any earlier
+        // message of the chat ("Ок" today after "Ок" last week) was taken for
+        // that one and never delivered.
+        const metaText = safeAll(node, innerSelectors.messageMetaTime).find((el) => !inQuote(el))?.textContent || '';
+        const time = legacyTime || (/\d{1,2}:\d{2}(?:\s?[AaPp][Mm])?/.exec(metaText) || [''])[0];
         // Media/type detection must ignore anything inside the reply quote (.link):
         // a reply to a photo/video/sticker embeds the quoted media's thumbnail,
         // which would otherwise be misdetected as this message's own media and
@@ -871,11 +890,11 @@ export class MaxWebClient {
         const fileNameEl = ownEl(node.querySelector('[class*="fileName"], [class*="file-name"], [class*="title"]'));
         const documentFileName = fileNameEl?.textContent?.trim() || '';
         const mediaUrl = imageUrl || audioUrl || videoUrl || documentUrl || '';
-        // The id: author|time|text|media, built the way it always was, so a
-        // bubble read before an update is still recognised after it — its
-        // media part is the first <img> (emoji pictures included), <audio>,
+        // The id: author|time|text|media. Its media part is built the way it
+        // always was — the first <img> (emoji pictures included), <audio>,
         // <video> or file link, minus the animoji stand-ins, which used to be
-        // canvases.
+        // canvases — so an uncaptioned photo in a private chat keeps the id it
+        // had (then its time came in as its "text").
         const legacySrc = (sel) => ownEl(node.querySelector(sel))?.src || '';
         const fingerprintImg = ownEl(safeAll(node, 'img').find((el) => !isAnimojiStandIn(el)) || null);
         const fingerprintMediaUrl = (fingerprintImg?.src || '') || legacySrc('audio')
@@ -883,6 +902,9 @@ export class MaxWebClient {
         const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
         const fallbackId = [author, time, fingerprintText, fingerprintMediaUrl].filter(Boolean).join('|');
         const rawId = explicitId || fallbackId || `visible-${index}`;
+        // The id this bubble had before the time was part of it — for finding
+        // messages recorded under it (see BridgeService.adoptLegacyId).
+        const legacyRawId = explicitId || [author, legacyTime, legacyFingerprintText, fingerprintMediaUrl].filter(Boolean).join('|') || `visible-${index}`;
         const outgoing = Boolean(
           node.closest('[data-outgoing="true"], .outgoing, .message-out')
           || node.closest('[data-bubbles-variant="outgoing"]')
@@ -926,6 +948,7 @@ export class MaxWebClient {
 
         return {
           rawId,
+          legacyRawId,
           text,
           author,
           sender,
@@ -959,12 +982,17 @@ export class MaxWebClient {
       // message. Voice messages keep their own "#vN" numbering.
       const voiceCounts = new Map();
       const sameCounts = new Map();
+      const legacyVoiceCounts = new Map();
       for (const row of rows) {
         if (row.rawId.startsWith('visible-')) continue;
         if (!row.outgoing && (row.hasVoiceElement || row.hasRoundVideoElement || row.hasDuration)) {
           const n = (voiceCounts.get(row.rawId) || 0) + 1;
           voiceCounts.set(row.rawId, n);
           if (n > 1) row.rawId = `${row.rawId}#v${n}`;
+          // The old ids numbered voice messages the same way (and nothing else).
+          const legacyN = (legacyVoiceCounts.get(row.legacyRawId) || 0) + 1;
+          legacyVoiceCounts.set(row.legacyRawId, legacyN);
+          if (legacyN > 1) row.legacyRawId = `${row.legacyRawId}#v${legacyN}`;
           continue;
         }
         const key = `${row.outgoing ? 'out' : 'in'}\u0000${row.rawId}`;
@@ -1048,7 +1076,7 @@ export class MaxWebClient {
     const hasNewUnresolvedReply = rawMessages.some((m) => {
       if (m.outgoing || !m.replyLinkPresent || m.replyToMediaUrl || m.replyToSnippet) return false;
       const id = stableId('max', this.activeChatId || chatId, m.rawId);
-      return !isKnown || !isKnown(id);
+      return !isKnown || !isKnown(id, m.rawId, m.legacyRawId !== m.rawId ? m.legacyRawId : undefined);
     });
     if (hasNewUnresolvedReply) {
       await new Promise((resolve) => setTimeout(resolve, 3500));
@@ -1190,6 +1218,7 @@ export class MaxWebClient {
         metadata: {
           author: message.author,
           sender: message.sender || undefined,
+          legacyId: message.legacyRawId && message.legacyRawId !== message.rawId ? message.legacyRawId : undefined,
           time: message.time,
           replyToAuthor: message.replyToAuthor || undefined,
           replyToSnippet: message.replyToSnippet || undefined,
@@ -1206,11 +1235,11 @@ export class MaxWebClient {
     // to the first one and the next to the second — the animations came out
     // swapped. They are only used when a single sticker is waiting; otherwise
     // each sticker is captured from its own canvas.
-    const pendingStickers = messages.filter((msg) => !(isKnown && isKnown(msg.id, msg.sourceMessageId)) && stickerSourceFor(msg)).length;
+    const pendingStickers = messages.filter((msg) => !(isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) && stickerSourceFor(msg)).length;
     const networkStickerUsable = pendingStickers <= 1;
 
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId)) continue;
+      if (isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) continue;
       const src = stickerSourceFor(msg);
       if (!src) continue;
 
@@ -1359,14 +1388,14 @@ export class MaxWebClient {
     }
 
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId)) continue;
+      if (isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) continue;
       if (msg.mediaPath) continue;
       if (msg.type !== 'text' && msg.type !== 'voice' && msg.type !== 'video_note') continue;
 
       const src = filtered.find((f) => (f.hasVoiceElement || f.hasRoundVideoElement || f.hasDuration) && stableId('max', this.activeChatId || chatId, f.rawId) === msg.id);
       if (!src) continue;
 
-      const msgIsKnown = isKnown && isKnown(msg.id, msg.sourceMessageId);
+      const msgIsKnown = isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId);
 
       if (src.hasRoundVideoElement || src.type === 'video_note') {
         if (msgIsKnown) continue;
@@ -1437,11 +1466,11 @@ export class MaxWebClient {
     }
 
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId)) continue;
+      if (isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) continue;
       if (msg.mediaPath) continue;
       if (msg.type !== 'document') continue;
 
-      const msgIsKnown = isKnown && isKnown(msg.id, msg.sourceMessageId);
+      const msgIsKnown = isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId);
       if (msgIsKnown) continue;
       const docIndex = docOrdinalById.get(msg.id) ?? 0;
 
@@ -1520,9 +1549,11 @@ export class MaxWebClient {
       // the id it was given (numbering of identical bubbles included) — the
       // two used to compute it separately and drift apart.
       const rows = await this.scrapeMessageRows();
+      // A fingerprint stored before the time was part of ids is that bubble's
+      // legacy id.
       const row = [...rows].reverse().find((candidate) => (mediaToken
         ? mediaTokenOf(candidate.mediaUrl) === mediaToken
-        : candidate.rawId === fingerprint));
+        : candidate.rawId === fingerprint || candidate.legacyRawId === fingerprint));
       const box = row?.box;
 
       if (box) {

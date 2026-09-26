@@ -950,13 +950,18 @@ export class BridgeService {
         // and everything stays unseen until the window has passed.
         if (this.telegramPaused()) break;
         let messages;
+        // First read of this chat since ids carry the time: see legacyAdoptionEnd.
+        const firstTimedRead = !this.chatOnTimedIds(chat.id);
         try {
           messages = await this.maxClient.readMessages(chat.id, {
             // Dedup strictly by the exact message id. We must NOT collapse a
             // disambiguated "#vN" id onto its base id: two distinct media
             // messages sent close together (e.g. two video notes) share the
             // same base rawId, and collapsing would drop all but the first.
-            isKnown: (id) => this.db.hasMessage(id)
+            // A bubble about to be adopted under its old id is known too
+            // (no sticker or file capture for it).
+            isKnown: (id, _sourceMessageId, legacyId) => this.db.hasMessage(id)
+              || Boolean(firstTimedRead && legacyId && this.db.hasMessage(stableId('max', chat.id, legacyId)))
           });
         } catch (error) {
           // A single chat failing to read (e.g. virtual-scroll chat not yet in
@@ -991,7 +996,9 @@ export class BridgeService {
         // back into the virtualized list) — stop excluding it from round-robin.
         this.chronicallyUnreachableChatIds.delete(chat.id);
         const backlog = this.historyBacklog(chat, messages);
-        for (const message of messages) {
+        const adoptUpTo = this.legacyAdoptionEnd(messages, firstTimedRead);
+        let readThrough = true;
+        for (const [index, message] of messages.entries()) {
           // Dedup by exact id only — see the isKnown note above. Collapsing a
           // "#vN" id onto its base id would drop a genuine second media message
           // that shares the same base rawId.
@@ -999,9 +1006,13 @@ export class BridgeService {
             this.pendingSeenCounts.delete(message.id);
             continue;
           }
+          if (index <= adoptUpTo && this.adoptLegacyId(message)) continue;
           // Stop at the first message that cannot go out while Telegram's
           // flood control lasts, so the rest of the chat keeps its order.
-          if (this.telegramPaused()) break;
+          if (this.telegramPaused()) {
+            readThrough = false;
+            break;
+          }
           if (backlog.has(message.id) || this.isOldDuplicate(message)) {
             this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
             continue;
@@ -1045,6 +1056,7 @@ export class BridgeService {
           }
           // Otherwise leave it unseen so the next poll retries it.
         }
+        if (firstTimedRead && readThrough && messages.length) this.db.setSetting(`timed_ids:${chat.id}`, '1');
         await this.syncReactionsFromMax(chat);
       }
       // If every reachable chat failed, this is a real problem (expired session,
@@ -1084,6 +1096,51 @@ export class BridgeService {
         await this.ensureMaxLogin({ reason: 'session-expired' });
       }
     }
+  }
+
+  // Message ids used to lack the time (MAX shows it where the old selector did
+  // not look), so a text repeating any earlier message of the chat ("Ок") was
+  // taken for it and dropped. Now that ids carry the time, a bubble recorded
+  // under its old id is recorded under the new one as well — keeping its
+  // Telegram link — instead of being delivered again. But an old id is shared
+  // by every repeat of a text, so it only counts where the bubble cannot be
+  // new: on the chat's first read since the change (what is on screen then
+  // is what the old ids saw, up to the last bubble they know), and after it
+  // above the newest bubble known by its new id — history scrolled into
+  // view, never a message that has just arrived.
+  chatOnTimedIds(chatId) {
+    return this.db.getSetting(`timed_ids:${chatId}`, '') === '1';
+  }
+
+  // Index of the last bubble up to which old ids are trusted, or -1.
+  legacyAdoptionEnd(messages, firstTimedRead) {
+    let end = -1;
+    messages.forEach((message, index) => {
+      if (this.db.hasMessage(message.id) || (firstTimedRead && this.legacyRecordOf(message))) end = index;
+    });
+    return end;
+  }
+
+  legacyRecordOf(message) {
+    const legacyRawId = message.metadata?.legacyId;
+    return legacyRawId ? this.db.getMessage(stableId('max', message.chatId, legacyRawId)) : null;
+  }
+
+  adoptLegacyId(message) {
+    // Still waiting for its reply quote, or for another try after a failed
+    // delivery: it is new, whatever its old id says.
+    if (this.pendingSeenCounts.has(message.id) || this.db.countFailedDeliveries(message.id, 'max_to_tg') > 0) return false;
+    const legacy = this.legacyRecordOf(message);
+    if (!legacy) return false;
+    // The same message, delivered (or primed) back then.
+    this.db.insertMessage({
+      ...message,
+      createdAt: legacy.createdAt,
+      telegramMessageId: legacy.telegramMessageId,
+      mediaHash: legacy.mediaHash,
+      metadata: { ...legacy.metadata, ...message.metadata, adoptedFrom: legacy.id }
+    });
+    return true;
   }
 
   // When this installation first ran a version with `key`'s behaviour —
@@ -1579,7 +1636,13 @@ export class BridgeService {
         // swallowed as "already delivered". Only rows from before the current
         // page load count: signed URLs change only across page loads.
         const fingerprintPrefix = fingerprintWithoutMediaUrl(message.sourceMessageId, message.mediaUrl);
-        if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix, this.pageLoadedAt || undefined)) {
+        // Media forwarded before the time was part of ids is on record under
+        // the old id's prefix.
+        const legacyPrefix = message.metadata?.legacyId ? fingerprintWithoutMediaUrl(message.metadata.legacyId, message.mediaUrl) : '';
+        const storedBefore = this.pageLoadedAt || undefined;
+        if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix, storedBefore)
+            || (legacyPrefix && legacyPrefix !== fingerprintPrefix
+              && this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, legacyPrefix, storedBefore))) {
           this.db.updateDeliveryStatus(deliveryId, 'sent');
           logger.info(
             { messageId: message.id, chatId: message.chatId, mediaHash: message.mediaHash },
@@ -1970,12 +2033,14 @@ export class BridgeService {
     if (row.outgoing) {
       // A file we sent is known by its media token (see getLastOutgoingMediaFingerprint).
       const own = this.db.getTgToMaxMessageByMaxFingerprint(chatId, row.rawId)
+        || (row.legacyRawId ? this.db.getTgToMaxMessageByMaxFingerprint(chatId, row.legacyRawId) : null)
         || (row.mediaToken ? this.db.getTgToMaxMessageByMaxFingerprint(chatId, `media-token:${row.mediaToken}`) : null);
       const telegramMessageId = Number(own?.sourceMessageId) || null;
       const telegramChatId = own?.metadata?.telegramChatId ?? null;
       return telegramMessageId && telegramChatId ? { message: own, telegramChatId, telegramMessageId } : null;
     }
-    const forwarded = this.db.getMessage(stableId('max', chatId, row.rawId));
+    const forwarded = this.db.getMessage(stableId('max', chatId, row.rawId))
+      || (row.legacyRawId ? this.db.getMessage(stableId('max', chatId, row.legacyRawId)) : null);
     if (!forwarded?.telegramMessageId) return null;
     // Older records do not say which Telegram chat they went to; the route's
     // chat is only trusted if the route has not changed since.
@@ -2347,7 +2412,8 @@ export class BridgeService {
           });
           for (const message of messages) {
             if (!this.db.hasMessage(message.id)) {
-              this.db.insertMessage(message);
+              // One recorded under its old id keeps its Telegram link.
+              if (!this.adoptLegacyId(message)) this.db.insertMessage(message);
               primed += 1;
             }
           }

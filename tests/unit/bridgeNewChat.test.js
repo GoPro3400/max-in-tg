@@ -14,7 +14,7 @@ const FOUND = [
   { kind: 'phone', title: '', hint: '', ordinal: 0 }
 ];
 
-const setup = ({ found = FOUND, opened = { title: 'Иван Петров', maxId: '5005' }, shown = [] } = {}) => {
+const setup = ({ found = FOUND, opened = { title: 'Иван Петров', maxId: '5005', listed: false }, shown = [] } = {}) => {
   const maxClient = makeFakeMaxClient({
     searchChats: vi.fn(async () => found),
     openSearchResult: vi.fn(async () => {
@@ -23,10 +23,20 @@ const setup = ({ found = FOUND, opened = { title: 'Иван Петров', maxId
       return opened;
     }),
     readMessages: vi.fn(async (chatId) => shown.map((make) => make(chatId))),
-    rememberChatId: vi.fn()
+    rememberChatId: vi.fn(),
+    forgetActiveChat: vi.fn(() => {
+      maxClient.activeChatId = null;
+      maxClient.activeMaxChatId = null;
+    })
   });
   return makeBridge({ maxClient });
 };
+
+const bubble = (time, text) => (chatId) => maxMessage(stableId('max', chatId, `${time}|${text}`), chatId, {
+  text,
+  sourceMessageId: `${time}|${text}`,
+  metadata: { time }
+});
 
 const pick = async (bridge, query, label) => {
   const offer = await bridge.startNewChat(query);
@@ -42,6 +52,7 @@ describe('phoneQuery', () => {
     expect(phoneQuery('79991234567')).toBe('+79991234567');
     expect(phoneQuery('9991234567')).toBe('+79991234567');
     expect(phoneQuery('+44 20 7946 0958')).toBe('+442079460958');
+    expect(phoneQuery('0044 20 7946 0958')).toBe('+442079460958');
     expect(phoneQuery('Иван Петров')).toBeNull();
     expect(phoneQuery('12345')).toBeNull();
   });
@@ -92,9 +103,10 @@ describe('/new', () => {
     expect(telegramBot.createTopic).toHaveBeenCalledWith('Иван Петров');
     expect(db.getChatMapping('Иван Петров')).toMatchObject({ telegramChatId: -100500, telegramThreadId: 7700 });
     expect(text).toContain('https://t.me/c/500/7700');
-    // MAX lists a chat only once it has messages: it is opened by its id.
+    // MAX lists a chat only once it has messages: it is opened by its id,
+    // and its first message watched.
     expect(db.getSetting('max_chat:5005')).toBe('Иван Петров');
-    expect(maxClient.rememberChatId).toHaveBeenCalledWith('Иван Петров', '5005');
+    expect(maxClient.rememberChatId).toHaveBeenCalledWith('Иван Петров', '5005', { listed: false });
     expect(db.getMessage(stableId('max', 'Иван Петров', '10:00|давнее')).metadata.primedAsBacklog).toBe(true);
     expect(telegramBot.sendMessage).not.toHaveBeenCalled();
   });
@@ -113,26 +125,104 @@ describe('/new', () => {
     expect(telegramBot.createTopic).not.toHaveBeenCalled();
   });
 
-  it('refuses a chat named like another one of the bridge (they would share a topic)', async () => {
-    const { bridge, db, telegramBot } = setup();
+  it('refuses a chat named like another one of the bridge (they would share a topic), and lets go of it in MAX', async () => {
+    const { bridge, db, maxClient, telegramBot } = setup();
+    linkChat(db, 'Иван Петров', { telegramThreadId: 77 });
     db.setSetting('max_chat:9009', 'Иван Петров');
     const text = await pick(bridge, 'Иван', 'Иван Петров');
     expect(text).toContain('другой чат с именем «Иван Петров»');
     expect(telegramBot.createTopic).not.toHaveBeenCalled();
+    // What opened is not that chat: the next message into its topic must
+    // not be typed into it.
+    expect(maxClient.forgetActiveChat).toHaveBeenCalled();
+    expect([maxClient.activeChatId, maxClient.activeMaxChatId]).toEqual([null, null]);
+    expect(maxClient.readMessages).not.toHaveBeenCalled();
+    expect(db.getSetting('max_chat:5005', '')).toBe('');
+    expect(maxClient.rememberChatId).not.toHaveBeenCalled();
   });
 
-  it('uses a list of choices once, and not after ten minutes', async () => {
+  it('refuses someone found beyond the owner\'s chats under the name of a chat it has, unless its id says it is that chat', async () => {
+    // The bridge has an "Иван Петров" (muted, say: its id in MAX never read).
+    const byName = setup();
+    linkChat(byName.db, 'Иван Петров', { telegramThreadId: 77 });
+    const text = await pick(byName.bridge, 'Иван', '👤 Иван Петров');
+    expect(text).toContain('уже есть чат «Иван Петров» (https://t.me/c/500/77)');
+    expect(byName.maxClient.forgetActiveChat).toHaveBeenCalled();
+    expect(byName.db.getSetting('max_chat:5005', '')).toBe('');
+
+    const byPhone = setup();
+    byPhone.db.upsertChat({ id: 'Иван Петров', title: 'Иван Петров', lastSeenAt: Date.now(), metadata: {} });
+    expect(await pick(byPhone.bridge, '+7 999 123-45-67', 'найти в MAX')).toContain('уже есть чат «Иван Петров»');
+    expect(byPhone.telegramBot.createTopic).not.toHaveBeenCalled();
+
+    // One of that name renamed away in MAX is not in the way.
+    const renamed = setup();
+    renamed.db.upsertChat({ id: 'Иван Петров', title: 'Иван Петров', lastSeenAt: Date.now(), metadata: { renamedTo: 'Иван П.' } });
+    expect(await pick(renamed.bridge, 'Иван', '👤 Иван Петров')).toContain('готов');
+    expect(renamed.db.listChats().find((item) => item.id === 'Иван Петров').metadata).toMatchObject({ startedWithNew: true });
+    expect(renamed.db.listChats().find((item) => item.id === 'Иван Петров').metadata.renamedTo).toBeUndefined();
+
+    // Known to be that chat: its topic.
+    const same = setup();
+    linkChat(same.db, 'Иван Петров', { telegramThreadId: 77 });
+    same.db.setSetting('max_chat:5005', 'Иван Петров');
+    expect(await pick(same.bridge, 'Иван', '👤 Иван Петров')).toContain('тема уже есть: https://t.me/c/500/77');
+    expect(same.maxClient.forgetActiveChat).not.toHaveBeenCalled();
+  });
+
+  it('leaves messages of a chat the bridge has to polling, and delivers them', async () => {
+    const { bridge, db, telegramBot } = setup({
+      opened: { title: 'Иван', maxId: '4004', listed: true },
+      shown: [bubble('10:00', 'старое'), bubble('10:05', 'ещё не доставлено')]
+    });
+    linkChat(db, 'Иван', { telegramThreadId: 77 });
+    db.insertMessage({ ...bubble('10:00', 'старое')('Иван'), telegramMessageId: 501 });
+    db.upsertChat({ id: 'Иван', title: 'Иван', lastSeenAt: Date.now(), metadata: { unread: true, unreadText: '1' } });
+
+    expect(await pick(bridge, 'Иван', '💬 Иван')).toContain('тема уже есть');
+    expect(db.hasMessage(stableId('max', 'Иван', '10:05|ещё не доставлено'))).toBe(false);
+
+    await bridge.pollMax();
+    expect(telegramBot.sendMessage.mock.calls.map(([sent]) => sent.text)).toEqual(['ещё не доставлено']);
+  });
+
+  it('records a new chat\'s history without delivering it, but for its unread messages', async () => {
+    const { bridge, db } = setup({
+      opened: { title: 'Иван', maxId: '4004', listed: true },
+      shown: [bubble('10:00', 'давнее'), bubble('10:01', 'тоже давнее'), bubble('10:05', 'непрочитанное')]
+    });
+    db.upsertChat({ id: 'Иван', title: 'Иван', lastSeenAt: Date.now(), metadata: { unread: true, unreadText: '1' } });
+
+    await pick(bridge, 'Иван', '💬 Иван');
+
+    expect(db.getMessage(stableId('max', 'Иван', '10:01|тоже давнее')).metadata.primedAsBacklog).toBe(true);
+    expect(db.hasMessage(stableId('max', 'Иван', '10:05|непрочитанное'))).toBe(false);
+  });
+
+  it('answers the first press of a button only, and a list of choices goes stale after ten minutes', async () => {
     const { bridge, maxClient } = setup();
     const offer = await bridge.startNewChat('Иван');
     const [, sessionId] = offer.choices[0].data.split(':');
     await bridge.chooseNewChat(sessionId, 'x');
-    expect(await bridge.chooseNewChat(sessionId, '1')).toContain('устарел');
+    // A second press on its way: nothing more to say.
+    expect(await bridge.chooseNewChat(sessionId, '1')).toBeNull();
     expect(maxClient.openSearchResult).not.toHaveBeenCalled();
 
     const later = await bridge.startNewChat('Иван');
     const [, laterId] = later.choices[0].data.split(':');
     bridge.newChatSessions.get(laterId).createdAt -= 11 * 60 * 1000;
     expect(await bridge.chooseNewChat(laterId, '1')).toContain('устарел');
+    // A list from before a restart.
+    expect(await bridge.chooseNewChat('gone', '0')).toContain('устарел');
+  });
+
+  it('never cuts an emoji in half on a button', async () => {
+    const title = `Дача ${'а'.repeat(50)} 2026 гг 🏡🌲`;
+    const { bridge } = setup({ found: [{ kind: 'chat', title, hint: '', ordinal: 0 }] });
+    const [choice] = (await bridge.startNewChat('Дача')).choices;
+    expect(choice.label).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    expect(choice.label.endsWith('…')).toBe(true);
+    expect([...new Intl.Segmenter('ru', { granularity: 'grapheme' }).segment(choice.label)]).toHaveLength(60);
   });
 
   it('passes on why MAX could not open it', async () => {
@@ -177,6 +267,41 @@ describe('/new in Telegram', () => {
     const [chatId, text, extra] = api.sendMessage.mock.calls[0];
     expect([chatId, text, extra.message_thread_id]).toEqual([RELAY, 'Что нашлось', 3]);
     expect(extra.reply_markup.inline_keyboard).toEqual([[{ text: '👤 Иван', callback_data: 'new:abc:0' }], [{ text: 'Отмена', callback_data: 'new:abc:x' }]]);
+  });
+
+  it('never sends /new to MAX as text, however it is spelled', async () => {
+    const { adapter } = makeAdapter();
+    const outbound = vi.fn(async () => {});
+    adapter.onMessage(outbound);
+    adapter.onNewChat(vi.fn(async () => ({ text: 'ok' })));
+
+    let updateId = 10;
+    for (const text of ['/New +7 999 123-45-67', '/NEW Иван', '/new@otherbot Иван']) {
+      const length = text.split(' ')[0].length;
+      await adapter.bot.handleUpdate({
+        update_id: updateId++,
+        message: { message_id: updateId, message_thread_id: 3, date: 1, chat, from, text, entities: [{ type: 'bot_command', offset: 0, length }] }
+      });
+    }
+
+    expect(outbound).not.toHaveBeenCalled();
+  });
+
+  it('leaves the answer to the first press of a button alone', async () => {
+    const { adapter, api } = makeAdapter();
+    adapter.onNewChatChoice(vi.fn(async () => null));
+
+    await adapter.bot.handleUpdate({
+      update_id: 3,
+      callback_query: {
+        id: 'cb2', from, chat_instance: 'x', data: 'new:abc:0',
+        message: { message_id: 901, message_thread_id: 3, date: 2, chat, from: { id: 1, is_bot: true, first_name: 'test' }, text: '✅ Чат с «Иван» готов' }
+      }
+    });
+
+    expect(api.answerCbQuery).toHaveBeenCalled();
+    expect(api.editMessageText).not.toHaveBeenCalled();
+    expect(api.sendMessage).not.toHaveBeenCalled();
   });
 
   it('takes the buttons away at once and shows what came of the choice', async () => {

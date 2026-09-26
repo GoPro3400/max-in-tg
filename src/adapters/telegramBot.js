@@ -887,6 +887,8 @@ export class TelegramBotAdapter {
         logger.error({ err: error }, '/new choice failed');
         text = `⚠️ ${error.message}`;
       }
+      // A second press of a button already pressed: the first one answers.
+      if (text === null) return;
       const reply = text || '/new is not available.';
       await ctx.editMessageText(reply, { link_preview_options: { is_disabled: true } })
         .catch(() => ctx.reply(reply, { ...threadExtra({ telegramThreadId: ctx.callbackQuery?.message?.message_thread_id || null }) }).catch(() => {}));
@@ -1119,7 +1121,7 @@ export class TelegramBotAdapter {
 const BOT_COMMANDS = new Set([
   'start', 'sync', 'chats', 'select', 'history', 'status',
   'check', 'diagnostics', 'deliveries', 'merge', 'unmerge',
-  'mute', 'unmute', 'pair', 'login', 'relay'
+  'mute', 'unmute', 'pair', 'login', 'relay', 'new'
 ]);
 
 // Wrong /pair codes one user may send before being locked out for a while.

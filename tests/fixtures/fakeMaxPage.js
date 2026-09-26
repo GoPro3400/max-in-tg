@@ -11,7 +11,8 @@
 //             <span class="separator">Сообщения</span>; for a whole phone number first «Действия» / «Найти по номеру»,
 //             which opens that person's chat and switches the list to MAX's contacts (a.cell links) — back through
 //             nav «Папки и профиль» [aria-labelledby$=-all-folder-title]; an unknown number opens «Не нашли номер …»
-//   a chat opens by its address too: MAX's router takes over a click on <a href="/<id>">
+//   a chat opens by its address too: MAX's router takes over a click on <a href="/<id>"> (a chat it does not know: «Чат не найден»)
+//   window.__navDelayMs: how long a chat picked in the search takes to open (both its address and its header)
 //   text:     <span class="text"> with emoji as <span class="emoji"><img alt></span>
 //             and animoji as <span class="animoji" data-lexical-animoji-emoji><img class="img" src="data:…" alt>…
 //   emoji-only message: <div class="emojis"> with big emoji (plain img, or a lottie player)
@@ -229,12 +230,20 @@ document.querySelector('aside .search input.field').addEventListener('input', (e
 document.addEventListener('click', (ev) => {
   const link = ev.target.closest('a[href]');
   if (!link || link.hasAttribute('download')) return;
-  const id = (link.getAttribute('href') || '').split('/').pop();
+  const href = link.getAttribute('href') || '';
+  const id = href.split('/').pop();
   const found = window.__chats.concat(window.__directory).find((c) => c.maxId === id);
   if (found) {
     ev.preventDefault();
     window.__openedByAddress = (window.__openedByAddress || []).concat([id]);
     window.openChat(found);
+  } else if (href.startsWith('/') && /^-?\\d+$/.test(id)) {
+    // A chat MAX does not know (left, deleted): its address, and no chat.
+    ev.preventDefault();
+    window.__active = null;
+    history.pushState({}, '', '/web.max.ru/' + id);
+    document.getElementById('main-header-title').textContent = 'Чат не найден';
+    window.renderMessages();
   }
 }, true);
 document.addEventListener('click', (ev) => {
@@ -245,8 +254,9 @@ document.addEventListener('click', (ev) => {
     const title = result.getAttribute('data-open-title');
     const person = result.getAttribute('data-open-directory');
     const phone = result.getAttribute('data-phone');
-    if (title) window.openChat(window.__chats.find((c) => c.title === title));
-    else if (person) window.openChat(window.__directory.find((p) => p.maxId === person));
+    const go = (open) => (window.__navDelayMs ? setTimeout(open, window.__navDelayMs) : open());
+    if (title) go(() => window.openChat(window.__chats.find((c) => c.title === title)));
+    else if (person) go(() => window.openChat(window.__directory.find((p) => p.maxId === person)));
     else if (phone) {
       const found = window.__directory.concat(window.__chats).find((p) => p.phone === phone);
       if (!found) {
@@ -294,13 +304,16 @@ document.getElementById('send').addEventListener('click', () => {
   const chat = window.__chats.find((c) => c.title === window.__active);
   const person = window.__directory.find((p) => p.title === window.__active);
   if (person && person.restricted) {
-    // Someone who takes messages only from their contacts: MAX refuses.
+    // Someone who takes messages only from their contacts: MAX refuses, once
+    // its server has answered.
     ed.textContent = '';
-    const modal = document.createElement('dialog');
-    modal.setAttribute('data-testid', 'modal');
-    modal.setAttribute('open', '');
-    modal.innerHTML = '<h2 id="modalHeaderTitle">Хотите написать первым?</h2>';
-    document.body.appendChild(modal);
+    setTimeout(() => {
+      const modal = document.createElement('dialog');
+      modal.setAttribute('data-testid', 'modal');
+      modal.setAttribute('open', '');
+      modal.innerHTML = '<h2 id="modalHeaderTitle">Хотите написать первым?</h2>';
+      document.body.appendChild(modal);
+    }, 1000);
     return;
   }
   window.__sent = (window.__sent || []).concat([{ chat: window.__active, text }]);

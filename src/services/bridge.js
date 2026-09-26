@@ -157,7 +157,9 @@ const formatBytes = (bytes) => {
 // "8 999 …", "7999…" and a ten-digit "999…" are Russian numbers. null when
 // the query is not a phone number (a name).
 export const phoneQuery = (query) => {
-  const compact = String(query || '').replace(/[\s()\-.]/g, '');
+  let compact = String(query || '').replace(/[\s()\-.]/g, '');
+  // 00 is how some dial the + (0044… is +44…).
+  if (compact.startsWith('00')) compact = `+${compact.slice(2)}`;
   if (!/^\+?\d{10,15}$/.test(compact)) return null;
   const digits = compact.replace(/^\+/, '');
   if (!compact.startsWith('+')) {
@@ -165,6 +167,14 @@ export const phoneQuery = (query) => {
     if (digits.length === 10 && digits.startsWith('9')) return `+7${digits}`;
   }
   return `+${digits}`;
+};
+
+// `text` in at most `max` characters, whole ones: an emoji (a surrogate
+// pair, or several joined) is never cut in half — half an emoji is not
+// valid text, and could cost the whole keyboard it is on.
+const shorten = (text, max) => {
+  const characters = [...new Intl.Segmenter('ru', { granularity: 'grapheme' }).segment(text)].map((part) => part.segment);
+  return characters.length > max ? `${characters.slice(0, max - 1).join('')}…` : text;
 };
 
 const formatPhone = (phone) => {
@@ -1249,7 +1259,7 @@ export class BridgeService {
       const text = candidate.kind === 'chat'
         ? `💬 ${candidate.title}${hasTopic ? ' (тема уже есть)' : ''}`
         : `👤 ${candidate.title}${candidate.hint ? ` · ${candidate.hint}` : ''}`;
-      return text.length > 60 ? `${text.slice(0, 59)}…` : text;
+      return shorten(text, 60);
     };
     return {
       text: phone
@@ -1266,20 +1276,44 @@ export class BridgeService {
   // is the one picked) and gives it a topic. Returns what to tell them.
   async chooseNewChat(sessionId, choice) {
     const session = this.newChatSessions.get(sessionId);
-    this.newChatSessions.delete(sessionId);
-    if (!session || Date.now() - session.createdAt > NEW_CHAT_SESSION_MS) return 'Этот поиск устарел — пришли /new ещё раз.';
+    // Pressed twice (the buttons go with the first press, but a second one
+    // may be on its way already): the first press answers. null — nothing to say.
+    if (session?.used) return null;
+    if (!session || Date.now() - session.createdAt > NEW_CHAT_SESSION_MS) {
+      this.newChatSessions.delete(sessionId);
+      return 'Этот поиск устарел — пришли /new ещё раз.';
+    }
+    session.used = true;
     if (choice === 'x') return 'Отменено — ничего не создано.';
     const candidate = session.candidates[Number(choice)];
     if (!candidate) return 'Нет такого варианта — пришли /new ещё раз.';
     if (await this.maxSessionState() !== 'ready') return '⏳ MAX не подключён — сначала /login.';
 
     let opened;
+    let conflict = null;
     let messages = [];
     try {
       opened = await this.maxLock.run(async () => {
         const result = await this.maxClient.openSearchResult(session.query, candidate);
-        // What it already shows is history: recorded below, not delivered
-        // (and nothing is fetched for it).
+        const chat = { id: result.title, title: result.title };
+        conflict = this.newChatConflict(chat, result.maxId, candidate);
+        if (conflict) {
+          // It stays open in MAX, but it is not the chat of that name here:
+          // nothing is read from it or typed into it as that chat.
+          this.maxClient.forgetActiveChat?.();
+          return result;
+        }
+        // (A chat of that name renamed away in MAX is another one.)
+        const known = this.db.listChats().find((item) => item.id === chat.id);
+        if (!known || known.metadata?.renamedTo) {
+          this.db.upsertChat({ id: chat.id, title: chat.title, lastSeenAt: Date.now(), metadata: { unread: false, startedWithNew: true } });
+        }
+        // Its id in MAX, while it is the chat open: a renamed chat is
+        // recognised, and one MAX does not list yet (no messages) is opened
+        // by its id until it does.
+        await this.noteMaxChatId(chat);
+        this.maxClient.rememberChatId?.(chat.id, result.maxId, { listed: result.listed });
+        // What it already shows (nothing is fetched for it): see below.
         messages = await this.maxClient.readMessages(result.title, { isKnown: () => true }).catch(() => []);
         return result;
       });
@@ -1287,27 +1321,27 @@ export class BridgeService {
       logger.warn({ err: error?.message, kind: candidate.kind }, '/new: could not open the chat in MAX');
       return `⚠️ ${error.message}`;
     }
+    if (conflict) {
+      logger.warn({ kind: candidate.kind }, '/new: the chat that opened is named like another chat of the bridge');
+      return conflict;
+    }
 
     const chat = { id: opened.title, title: opened.title };
-    // Chats are known by their names here: another chat of MAX with the same
-    // name would share its topic (and the owner's replies would go to either).
-    const namesake = (this.db.listSettings?.('max_chat:') || [])
-      .find(({ key, value }) => value === chat.id && key !== `max_chat:${opened.maxId}`);
-    if (namesake) {
-      return `⚠️ В MAX есть и другой чат с именем «${chat.title}» — мост различает чаты по имени, и переписка двух чатов смешалась бы в одной теме. `
-        + 'Переименуй один из них в MAX (например, контакт) и повтори /new.';
+    // A chat new to the bridge: what it shows is history — recorded (or
+    // known again by the ids it had before), not delivered — but for its
+    // unread messages, which polling brings. A chat the bridge has already
+    // may have messages still on their way: polling sees to those.
+    if (!this.db.hasMessagesInChat(chat.id)) {
+      const unknown = messages.filter((message) => !this.db.hasMessage(message.id));
+      const fresh = unreadCount(this.db.listChats().find((item) => item.id === chat.id));
+      for (const message of unknown.slice(0, Math.max(0, unknown.length - fresh))) {
+        // Waiting for its reply quote or file, or delivering it was tried.
+        if (this.pendingSeenCounts.has(message.id) || this.db.hasDelivery(message.id, 'max_to_tg')) continue;
+        if (this.adoptLegacyId(message)) continue;
+        this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
+      }
+      if (!this.chatOnTimedIds(chat.id)) this.db.setSetting(`timed_ids:${chat.id}`, String(Date.now()));
     }
-    if (!this.db.listChats().some((item) => item.id === chat.id)) {
-      this.db.upsertChat({ id: chat.id, title: chat.title, lastSeenAt: Date.now(), metadata: { unread: false, startedWithNew: true } });
-    }
-    // Its id in MAX: MAX does not list a chat without messages, so it is
-    // opened by its id until it does (and a renamed chat is recognised).
-    await this.noteMaxChatId(chat);
-    for (const message of messages) {
-      if (this.db.hasMessage(message.id) || this.adoptLegacyId(message)) continue;
-      this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
-    }
-    if (!this.chatOnTimedIds(chat.id)) this.db.setSetting(`timed_ids:${chat.id}`, String(Date.now()));
 
     const before = this.db.getChatMapping(chat.id);
     const mapping = await this.ensureMapping(chat, { createTopics: true });
@@ -1328,6 +1362,29 @@ export class BridgeService {
       await this.telegramBot.sendText(`📞 ${formatPhone(session.phone)} — этот чат начат по номеру телефона.`, mapping).catch(() => null);
     }
     return `✅ Чат с «${chat.title}» готов${link ? `: ${link}` : ''}. Пиши в эту тему — сообщения уйдут в MAX.`;
+  }
+
+  // Why the chat /new opened cannot have a route here, or null. Chats are
+  // known by their names: two chats of MAX with one name would share a
+  // topic, and the owner's replies would go to either.
+  newChatConflict(chat, maxId, candidate) {
+    const own = `max_chat:${maxId}`;
+    const namesake = (this.db.listSettings?.('max_chat:') || []).some(({ key, value }) => value === chat.id && key !== own);
+    if (namesake) {
+      return `⚠️ В MAX есть и другой чат с именем «${chat.title}» — мост различает чаты по имени, и переписка двух чатов смешалась бы в одной теме. `
+        + 'Переименуй один из них в MAX (например, контакт) и повтори /new.';
+    }
+    // Found beyond the owner's chats (in MAX's global search, or by number)
+    // under the name of a chat the bridge has, not known to be this one: it
+    // may be that chat, or someone else of that name.
+    const mapping = this.db.getChatMapping(chat.id);
+    const known = mapping || this.db.listChats().some((item) => item.id === chat.id && !item.metadata?.renamedTo);
+    if (candidate.kind !== 'chat' && known && this.db.getSetting(own, '') !== chat.id) {
+      const link = topicLink(mapping);
+      return `⚠️ У моста уже есть чат «${chat.title}»${link ? ` (${link})` : ''}, и не видно, тот ли это человек. `
+        + 'Если тот — пиши в его тему. Если другой — переименуй контакт в MAX и повтори /new.';
+    }
+    return null;
   }
 
   pruneNewChatSessions(now = Date.now()) {

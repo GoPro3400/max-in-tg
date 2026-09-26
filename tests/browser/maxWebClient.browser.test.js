@@ -97,7 +97,11 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
         { title: 'Иван Петров', phone: '+79991234567', maxId: '5005' },
         { title: 'Борис Новый', maxId: '6006', hint: '@boris' },
         { title: 'Bono', maxId: '7007', hint: '@bono' },
-        { title: 'Закрытый', maxId: '8008', restricted: true }
+        { title: 'Закрытый', maxId: '8008', restricted: true },
+        { title: 'Скрытный', maxId: '8118', restricted: true },
+        // Two people of one name, told apart by what MAX shows under it.
+        { title: 'Анна Смирнова', maxId: '3031', hint: '@anna1' },
+        { title: 'Анна Смирнова', maxId: '3032', hint: '@anna2' }
       ]
     });
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'max-browser-'));
@@ -338,17 +342,62 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
 
   it('/new: opens a person found by name, and knows their chat\'s id', async () => {
     await openChat('Bob');
-    const opened = await client.openSearchResult('Бор', { kind: 'global', title: 'Борис Новый', ordinal: 0 });
-    expect(opened).toEqual({ title: 'Борис Новый', maxId: '6006' });
+    const [person] = await client.searchChats('Бор');
+    const opened = await client.openSearchResult('Бор', person);
+    // Not in MAX's list: no messages yet.
+    expect(opened).toEqual({ title: 'Борис Новый', maxId: '6006', listed: false });
     expect(client.activeChatId).toBe('Борис Новый');
+  });
+
+  it('/new: opens the person picked, never the chat of the same name open before, however slowly MAX gets there', async () => {
+    await client.page.evaluate(() => window.__directory.push({ title: 'Bob', maxId: '9090', hint: '@bob2' }));
+    try {
+      await openChat('Group');
+      await openChat('Bob');
+      const person = (await client.searchChats('Bob')).find((result) => result.kind === 'global');
+      expect(person).toMatchObject({ title: 'Bob', hint: '@bob2' });
+      await client.page.evaluate(() => { window.__navDelayMs = 1500; });
+      const opened = await client.openSearchResult('Bob', person);
+      expect(opened).toMatchObject({ title: 'Bob', maxId: '9090' });
+      expect(client.activeMaxChatId).toBe('9090');
+      expect(await client.page.evaluate(() => location.pathname)).toBe('/web.max.ru/9090');
+    } finally {
+      await client.page.evaluate(() => {
+        window.__navDelayMs = 0;
+        window.__directory = window.__directory.filter((person) => person.maxId !== '9090');
+      });
+    }
+    await openChat('Bob');
+  });
+
+  it('/new: tells people of one name apart by what MAX shows under it, whatever their order', async () => {
+    const found = await client.searchChats('Анна');
+    expect(found.map(({ title, hint }) => `${title} ${hint}`)).toEqual(['Анна Смирнова @anna1', 'Анна Смирнова @anna2']);
+    // MAX's server answers the second search in another order.
+    await client.page.evaluate(() => window.__directory.reverse());
+    const opened = await client.openSearchResult('Анна', found[1]);
+    expect(opened.maxId).toBe('3032');
+    await openChat('Bob');
   });
 
   it('/new: opens a chat by phone number, then shows the chats again (MAX switches to its contacts)', async () => {
     await openChat('Bob');
     const opened = await client.openSearchResult('+79991234567', { kind: 'phone' });
-    expect(opened).toEqual({ title: 'Иван Петров', maxId: '5005' });
+    expect(opened).toEqual({ title: 'Иван Петров', maxId: '5005', listed: false });
     expect(await client.page.evaluate(() => window.__tab)).toBe('chats');
     expect((await client.listChats()).map((chat) => chat.title)).toEqual(['Bob', 'Group', 'Files']);
+  });
+
+  it('/new: opens by number the chat that is open already', async () => {
+    // Bob has that number too: his chat, open now, is the one found.
+    await client.page.evaluate(() => { window.__chats[0].phone = '+79995550000'; });
+    try {
+      await openChat('Bob');
+      const opened = await client.openSearchResult('+79995550000', { kind: 'phone' });
+      expect(opened).toEqual({ title: 'Bob', maxId: '1001', listed: true });
+    } finally {
+      await client.page.evaluate(() => { delete window.__chats[0].phone; });
+    }
   });
 
   it('/new: says so when MAX does not know a number, and leaves nothing open', async () => {
@@ -356,7 +405,25 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     await expect(client.openSearchResult('+79990000000', { kind: 'phone' })).rejects.toThrow(/не нашёл такой номер/);
     expect(await client.page.evaluate(() => Boolean(document.querySelector('dialog[open]')))).toBe(false);
     // Escape closed MAX's window, not the chat.
-    expect(await client.page.evaluate(() => [window.__active, window.__escapeClosedChat])).toEqual(['Bob', 0]);
+    expect(await client.page.evaluate(() => [Boolean(window.__active), window.__escapeClosedChat])).toEqual([true, 0]);
+  });
+
+  it('gives the chats back when MAX stays on its contacts', async () => {
+    await client.page.evaluate(() => {
+      window.__tab = 'contacts';
+      window.renderChats();
+    });
+    expect((await client.listChats()).map((chat) => chat.title)).toEqual(['Bob', 'Group', 'Files']);
+  });
+
+  it('opens again the chat it reads when the page has moved on to another', async () => {
+    await openChat('Group');
+    await openChat('Bob');
+    expect(client.activeMaxChatId).toBe('1001');
+    await client.page.evaluate(() => window.openChat(window.__chats[1]));
+    const messages = await client.readMessages('Bob');
+    expect(messages.map((message) => message.text)).toContain('Без реакций');
+    expect(await client.page.evaluate(() => window.__active)).toBe('Bob');
   });
 
   it('opens a chat MAX does not list yet (started with /new) by its address', async () => {
@@ -375,11 +442,27 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     await openChat('Bob');
   });
 
+  it('takes a chat whose address leads nowhere for one not found', async () => {
+    client.rememberChatId('Пропавший', '4040');
+    await expect(client.selectChat('Пропавший')).rejects.toThrow('Max chat not found: Пропавший');
+    expect(client.activeChatId).toBeNull();
+    await openChat('Bob');
+  });
+
   it('says so when MAX refuses the first message to someone new', async () => {
     client.rememberChatId('Закрытый', '8008');
     await client.selectChat('Закрытый');
     await expect(client.sendText('Закрытый', 'привет')).rejects.toThrow('MAX не дал отправить: Хотите написать первым?');
     expect(await client.page.evaluate(() => Boolean(document.querySelector('dialog[open]')))).toBe(false);
+    await openChat('Bob');
+  });
+
+  it('says so right after /new too (the chat is open already)', async () => {
+    const [person] = await client.searchChats('Скрыт');
+    const opened = await client.openSearchResult('Скрыт', person);
+    // What the bridge does with a chat /new opened.
+    client.rememberChatId(opened.title, opened.maxId, { listed: opened.listed });
+    await expect(client.sendText('Скрытный', 'привет')).rejects.toThrow('MAX не дал отправить: Хотите написать первым?');
     await openChat('Bob');
   });
 

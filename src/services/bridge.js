@@ -1477,6 +1477,10 @@ export class BridgeService {
 
     try {
       const outgoing = { ...message };
+      // Group chats: who wrote it, shown above the message. Not when it is the
+      // chat's own name (a channel's posts, or a contact in a private chat).
+      const sender = message.metadata?.sender;
+      if (sender && sender !== chat.title) outgoing.sender = sender;
 
       // Resolve reply target: if this MAX message is a reply, find the original
       // stored message and set replyToMessageId so Telegram renders the outgoing

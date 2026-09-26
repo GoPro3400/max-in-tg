@@ -370,3 +370,19 @@ describe('forwardMaxMessage: files over Telegram\'s limit for bots', () => {
     expect(message.telegramMessageId).toBeTruthy();
   });
 });
+
+describe('forwardMaxMessage: group chats', () => {
+  it('passes the sender on, so Telegram shows who wrote it', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    linkChat(db, 'Семья', { title: 'Семья' });
+    await bridge.forwardMaxMessage(maxMessage('g-1', 'Семья', { text: 'ужин в 7', metadata: { sender: 'Мама' } }));
+    expect(telegramBot.sendMessage.mock.calls[0][0].sender).toBe('Мама');
+  });
+
+  it('does not repeat the chat\'s own name (a channel, or a private chat)', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    linkChat(db, 'Новости', { title: 'Новости' });
+    await bridge.forwardMaxMessage(maxMessage('c-1', 'Новости', { text: 'пост', metadata: { sender: 'Новости' } }));
+    expect(telegramBot.sendMessage.mock.calls[0][0].sender).toBeUndefined();
+  });
+});

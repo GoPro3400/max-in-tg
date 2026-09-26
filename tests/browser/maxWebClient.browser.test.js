@@ -40,7 +40,11 @@ const chats = () => ([
     title: 'Group',
     messages: [
       { id: 'g1', time: '13:00', author: 'Анна', media: '/photo/p2.png?r=TOKEN2&fn=w_1280' },
-      { id: 'g2', time: '13:01', author: 'Анна', text: ['Всем привет ', { emoji: '👋' }] }
+      { id: 'g2', time: '13:01', author: 'Анна', text: ['Всем привет ', { emoji: '👋' }] },
+      { id: 'g3', time: '13:02', text: ['и ещё'] },
+      { id: 'g4', time: '13:03', author: 'Борис', text: ['привет'] },
+      { id: 'g5', time: '13:04', out: true, text: ['моё'] },
+      { id: 'g6', time: '13:05', text: ['без имени после моего'] }
     ]
   }
 ]);
@@ -194,6 +198,10 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     const messages = await client.readMessages('Group', { isKnown: () => false });
     expect(messages.find((message) => message.metadata.time === '13:00')).toMatchObject({ type: 'photo', text: '' });
     expect(messages.find((message) => message.metadata.time === '13:01')).toMatchObject({ type: 'text', text: 'Всем привет 👋' });
+    const senders = Object.fromEntries(messages.map((message) => [message.metadata.time, message.metadata.sender]));
+    // MAX names the sender on the first bubble of a run only.
+    expect(senders).toMatchObject({ '13:00': 'Анна', '13:01': 'Анна', '13:02': 'Анна', '13:03': 'Борис' });
+    expect(senders['13:05']).toBeUndefined();
     await openChat('Bob');
   });
 

@@ -834,6 +834,11 @@ export class MaxWebClient {
         const text = readable(textSource).trim() || readable(bigEmojiEl).trim();
 
         const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
+        // Who wrote it, for showing in Telegram (group chats): the bubble's own
+        // author line — not the quoted author of a reply (which the id above
+        // may have picked up, and keeps for compatibility).
+        const senderEl = safeAll(node, innerSelectors.messageAuthor).find((el) => !inQuote(el)) || null;
+        const sender = senderEl ? readable(senderEl).trim() : '';
         const timeNode = node.querySelector(innerSelectors.messageTime);
         const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
         // Media/type detection must ignore anything inside the reply quote (.link):
@@ -923,6 +928,7 @@ export class MaxWebClient {
           rawId,
           text,
           author,
+          sender,
           time,
           outgoing,
           mediaUrl: stickerImgUrl || mediaUrl,
@@ -1053,6 +1059,18 @@ export class MaxWebClient {
 
     // Bubbles sharing an id are already numbered by scrapeMessageRows ("#vN"
     // for voice messages, "#dN" otherwise), so uniqueMessages() keeps them all.
+    // A group chat names the sender only on the first bubble of a run of
+    // messages from the same person; the others belong to the last name seen
+    // (our own bubbles end a run).
+    let runSender = '';
+    for (const row of rawMessages) {
+      if (row.outgoing) {
+        runSender = '';
+        continue;
+      }
+      if (row.sender) runSender = row.sender;
+      else row.sender = runSender;
+    }
     // Kept for readReactions, which the bridge calls right after this.
     this.lastReactionScan = { chatId: this.activeChatId || chatId, at: Date.now(), rows: rawMessages.map(reactionRowOf) };
 
@@ -1171,6 +1189,7 @@ export class MaxWebClient {
         createdAt: Date.now(),
         metadata: {
           author: message.author,
+          sender: message.sender || undefined,
           time: message.time,
           replyToAuthor: message.replyToAuthor || undefined,
           replyToSnippet: message.replyToSnippet || undefined,

@@ -211,3 +211,29 @@ describe('Telegram -> MAX: files Telegram will not hand to a bot', () => {
     expect(text).toContain('до 20 МБ');
   });
 });
+
+describe('group chats: the sender above the message', () => {
+  it('puts the sender in bold on top of a text', async () => {
+    const { adapter, api } = makeAdapter();
+    await adapter.sendMessage({ type: 'text', text: 'Всем привет', sender: 'Анна' }, { telegramChatId: -100 });
+    const [, text, extra] = api.sendMessage.mock.calls[0];
+    expect(text).toBe('Анна\nВсем привет');
+    expect(extra.entities).toEqual([{ type: 'bold', offset: 0, length: 4 }]);
+  });
+
+  it('uses the caption for media, and the sender alone when the text goes separately', async () => {
+    const { adapter, api } = makeAdapter();
+    await adapter.sendMessage({ type: 'photo', mediaPath: photoPath, text: 'смотрите', sender: 'Анна' }, { telegramChatId: -100 });
+    expect(api.sendPhoto.mock.calls[0][2]).toMatchObject({ caption: 'Анна\nсмотрите', caption_entities: [{ type: 'bold', offset: 0, length: 4 }] });
+
+    await adapter.sendMessage({ type: 'photo', mediaPath: photoPath, text: 'x'.repeat(1500), sender: 'Анна' }, { telegramChatId: -100 });
+    expect(api.sendPhoto.mock.calls[1][2].caption).toBe('Анна');
+  });
+
+  it('leaves messages without a sender as they were', async () => {
+    const { adapter, api } = makeAdapter();
+    await adapter.sendMessage({ type: 'text', text: 'привет' }, { telegramChatId: -100 });
+    expect(api.sendMessage.mock.calls[0][1]).toBe('привет');
+    expect(api.sendMessage.mock.calls[0][2].entities).toBeUndefined();
+  });
+});

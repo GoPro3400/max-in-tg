@@ -352,13 +352,19 @@ export class TelegramBotAdapter {
     const chatId = route.telegramChatId || this.targetChatId();
     const replyExtra = replyParameters(message.replyToMessageId);
 
+    // In a group chat, the sender's name in bold on top — as Telegram shows
+    // it in its own groups. An entity rather than HTML: nothing to escape.
+    const sender = String(message.sender || '').trim();
+    const withSender = (text) => (sender ? (text ? `${sender}\n${text}` : sender) : text);
+    const senderEntities = sender ? [{ type: 'bold', offset: 0, length: sender.length }] : undefined;
+
     if (message.type === MessageType.TEXT) {
-      return await this.sendTextChunks(chatId, message.text || '', route, replyExtra);
+      return await this.sendTextChunks(chatId, withSender(message.text || ''), route, replyExtra, senderEntities);
     }
 
     const filePath = message.mediaPath;
     if (!filePath) {
-      return await this.sendTextChunks(chatId, message.text || `[${message.type}] ${message.mediaUrl || ''}`, route, replyExtra);
+      return await this.sendTextChunks(chatId, withSender(message.text || `[${message.type}] ${message.mediaUrl || ''}`), route, replyExtra, senderEntities);
     }
 
     // Telegram takes at most 50 MB from a bot. A bigger upload failed on every
@@ -367,18 +373,20 @@ export class TelegramBotAdapter {
     if (size > TELEGRAM_UPLOAD_LIMIT_BYTES) {
       const name = documentDisplayName(message.originalFilename, filePath) || path.basename(filePath);
       const notice = `📎 «${name}» — ${formatMb(size)}: больше 50 МБ, столько бот в Telegram отправить не может. Файл можно открыть в MAX.`;
-      return await this.sendTextChunks(chatId, message.text ? `${notice}\n\n${message.text}` : notice, route, replyExtra);
+      return await this.sendTextChunks(chatId, withSender(message.text ? `${notice}\n\n${message.text}` : notice), route, replyExtra, senderEntities);
     }
 
     // Telegram rejects the whole upload when a caption is over 1024 characters
     // — on every retry, until the message was given up on and dropped. A
     // longer text is sent right after the media instead, as a reply to it.
     const text = message.text || '';
-    const captionFits = text.length <= TELEGRAM_CAPTION_LIMIT;
+    const captionFits = withSender(text).length <= TELEGRAM_CAPTION_LIMIT;
+    const caption = captionFits ? withSender(text) : withSender('');
     const extra = {
       ...threadExtra(route),
       ...replyExtra,
-      caption: captionFits ? (text || undefined) : undefined
+      caption: caption || undefined,
+      ...(caption && senderEntities ? { caption_entities: senderEntities } : {})
     };
     const sent = await this.sendMedia(chatId, message, filePath, extra, route, replyExtra);
     if (!captionFits) {
@@ -390,13 +398,15 @@ export class TelegramBotAdapter {
   // Telegram caps a text message at 4096 characters and rejects anything
   // longer outright, so long MAX texts go out in several parts. Returns the
   // first part (its message_id is what later replies are matched against).
-  async sendTextChunks(chatId, text, route = {}, replyExtra = {}) {
+  // `entities` (formatting, e.g. the sender's bold name) apply to the first part.
+  async sendTextChunks(chatId, text, route = {}, replyExtra = {}, entities = undefined) {
     let first = null;
     const chunks = splitTelegramText(text);
     for (let index = 0; index < chunks.length; index++) {
       const sent = await this.bot.telegram.sendMessage(chatId, chunks[index], {
         ...threadExtra(route),
-        ...(index === 0 ? replyExtra : {})
+        ...(index === 0 ? replyExtra : {}),
+        ...(index === 0 && entities ? { entities } : {})
       });
       first = first || sent;
     }

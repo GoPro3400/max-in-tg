@@ -371,6 +371,68 @@ describe('forwardMaxMessage: files over Telegram\'s limit for bots', () => {
   });
 });
 
+describe('files MAX did not hand over', () => {
+  const file = (id, metadata, text = '') => Object.assign(
+    maxMessage(id, 'chat-a', { type: 'document', text, metadata }),
+    { originalFilename: 'Фильм.mkv' }
+  );
+
+  it('names a file too big for Telegram, with its size, instead of sending it', async () => {
+    const { bridge, db, telegramBot, mediaService } = makeBridge();
+    linkChat(db, 'chat-a');
+
+    await expect(bridge.forwardMaxMessage(file('f-1', { fileTooBig: true, fileSize: 1.5 * 1024 ** 3 }, 'смотри'))).resolves.toBe(true);
+
+    expect(mediaService.downloadUrl).not.toHaveBeenCalled();
+    const [sent] = telegramBot.sendMessage.mock.calls[0];
+    expect(sent).toMatchObject({ type: 'text', mediaPath: null });
+    expect(sent.text).toBe('📎 «Фильм.mkv» (1,5 ГБ) — больше 50 МБ, столько бот в Telegram отправить не может. Файл можно открыть в MAX.\n\nсмотри');
+  });
+
+  it('says a file was deleted in MAX, or could not be fetched', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    linkChat(db, 'chat-a');
+
+    await bridge.forwardMaxMessage(file('f-2', { fileUnavailable: true }));
+    await bridge.forwardMaxMessage(file('f-3', { fileCaptureFailed: true, fileSize: 1290000 }));
+
+    const texts = telegramBot.sendMessage.mock.calls.map(([sent]) => sent.text);
+    expect(texts[0]).toBe('📎 «Фильм.mkv» — файл удалён или недоступен в MAX.');
+    expect(texts[1]).toBe('📎 «Фильм.mkv» (1,2 МБ) — не удалось забрать из MAX. Файл можно открыть там.');
+  });
+
+  it('tries a file that did not download again on the next reads before giving up on it', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, 'chat-a', { unread: true });
+    const failed = file('f-4', { fileCaptureFailed: true });
+    maxClient.readMessages.mockResolvedValue([failed]);
+
+    await bridge.pollMax();
+    await bridge.pollMax();
+    expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+    expect(db.hasMessage('f-4')).toBe(false);
+
+    await bridge.pollMax();
+    expect(telegramBot.sendMessage.mock.calls[0][0].text).toContain('не удалось забрать из MAX');
+    expect(db.hasMessage('f-4')).toBe(true);
+  });
+
+  it('delivers the file when a later read gets it', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, 'chat-a', { unread: true });
+    maxClient.readMessages.mockResolvedValueOnce([file('f-5', { fileCaptureFailed: true })]);
+    await bridge.pollMax();
+
+    const fetched = file('f-5', {});
+    fetched.mediaPath = '/tmp/media/doc-f-5/Фильм.mkv';
+    maxClient.readMessages.mockResolvedValue([fetched]);
+    await bridge.pollMax();
+
+    const [sent] = telegramBot.sendMessage.mock.calls[0];
+    expect(sent).toMatchObject({ type: 'document', mediaPath: '/tmp/media/doc-f-5/Фильм.mkv' });
+  });
+});
+
 describe('forwardMaxMessage: group chats', () => {
   it('passes the sender on, so Telegram shows who wrote it', async () => {
     const { bridge, db, telegramBot } = makeBridge();

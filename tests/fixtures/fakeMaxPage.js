@@ -3,7 +3,9 @@
 //   message:  <div data-bubbles-variant> <div class="bordersWrapper"> <div class="bubble"> <div class="bubbleContent">…
 //   sender (groups, first bubble of a run): .bubbleContent > <div class="header"><button class="header"><span class="name"><span class="name"><span class="text">
 //   time:     .bubbleContent > <span class="meta"><div class="meta meta--text"><span class="text"> 12:04 </span> — there is no .time[aria-label] in a bubble
-//   file:     .bubbleContent > <div class="attaches"><button class="container" aria-label="Скачать"> .title (name) .info ("Скачать • 1.23 MB")
+//   file:     .bubbleContent > <div class="attaches"><button class="container" aria-label="Скачать"> .title (name) .info ("Скачать • 1.23 MB");
+//             a click makes a temporary <a href download=name> and clicks it (MAX asks its API for the URL first)
+//   links:    <a class="link" href> in the text; a preview card: .bubbleContent > <div class="share"><a class="container" href> [picture] .host .title .description
 //   text:     <span class="text"> with emoji as <span class="emoji"><img alt></span>
 //             and animoji as <span class="animoji" data-lexical-animoji-emoji><img class="img" src="data:…" alt>…
 //   emoji-only message: <div class="emojis"> with big emoji (plain img, or a lottie player)
@@ -56,6 +58,7 @@ const emojiImg = (e, size) => '<span class="emoji"><img src="/e/' + cp(e) + '.pn
 // A lottie player: placeholder now, canvas once its JSON arrives (never, if the body is empty).
 const lottie = (e, url) => '<div class="lottie" data-url="' + esc(url || '/animoji/' + cp(e) + '.json') + '" data-emoji="' + esc(e) + '">' + emojiImg(e) + '</div>';
 const renderText = (parts) => parts.map((p) => typeof p === 'string' ? esc(p)
+  : p.link ? '<a class="link" href="' + esc(p.link) + '">' + esc(p.link) + '</a>'
   : p.emoji ? emojiImg(p.emoji)
   : p.animoji ? '<span class="animoji" data-lexical-animoji="" data-lexical-animoji-emoji="' + esc(p.animoji) + '"><img class="img" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=" alt="' + esc(p.animoji) + '"><span class="player">' + lottie(p.animoji) + '</span></span>'
   : '').join('');
@@ -69,10 +72,16 @@ function renderMessage(m) {
   if (m.author) content += '<div class="header"><button class="header"><span class="name"><span class="name"><span class="text">' + esc(m.author) + '</span></span></span>'
     + (m.role ? ' <span class="role"><span class="text">' + esc(m.role) + '</span></span>' : '') + '</button></div>';
   if (m.media) content += '<div class="media"><img src="' + m.media + '" width="300" height="200"></div>';
-  if (m.file) content += '<div class="attaches"><button class="container" aria-label="Скачать"><div class="fileIcon"><svg></svg></div><div class="title">' + esc(m.file.name) + '</div><div class="info">Скачать • ' + esc(m.file.size) + '</div></button></div>';
+  if (m.file) content += '<div class="attaches"><button class="container" aria-label="Скачать" data-mid="' + m.id + '"' + (m.file.deleted ? ' disabled' : '') + '>'
+    + (m.file.preview ? '<div class="fileIcon preview"><img src="' + m.file.preview + '" alt="' + esc(m.file.name) + '"></div>' : '<div class="fileIcon"><svg></svg></div>')
+    + '<div class="title">' + esc(m.file.name) + '</div><div class="info">' + (m.file.deleted ? 'Файл удален' : 'Скачать • ' + esc(m.file.size)) + '</div></button></div>';
   if (m.sticker) content += '<div class="sticker">' + '<div class="lottie" data-url="' + m.sticker + '" data-emoji="sticker"><img src="/e/stk.png" alt="" width="170"></div></div>';
   if (m.big) content += '<div class="emojis">' + m.big.map((b) => b.plain ? emojiImg(b.plain, 64) : lottie(b.anim)).join('') + '</div>';
+  if (m.location) content += '<div class="location"><div class="map"></div></div>';
   if (m.text) content += '<span class="text">' + renderText(m.text) + '</span>';
+  if (m.share) content += '<div class="share"><a class="container" href="' + esc(m.share.url) + '" rel="noopener noreferrer">'
+    + (m.share.image ? '<div class="media"><img src="' + m.share.image + '" width="300" height="150"></div>' : '')
+    + '<div class="content"><span class="host">' + esc(new URL(m.share.url).host) + '</span> <span class="title">' + esc(m.share.title || 'Title') + '</span> <span class="description">…</span></div></a></div>';
   if (inside && (m.reactions || []).some((r) => r.count > 0)) content += '<div class="reactions reactions--inside"><div class="reactions reactions--inside">' + chips(m) + '</div></div>';
   content += '<span class="meta"><div class="meta meta--text"><span class="text"> ' + m.time + (m.edited ? ' ред.' : '') + ' </span></div></span>';
   const reactions = !inside && (m.reactions || []).some((r) => r.count > 0) ? '<div class="reactions"><div class="reactions">' + chips(m) + '</div></div>' : '';
@@ -146,6 +155,16 @@ document.addEventListener('contextmenu', (ev) => {
   openMenu(findMsg(row.getAttribute('data-mid')), ev.clientX, ev.clientY, false);
 });
 document.addEventListener('click', (ev) => {
+  const file = ev.target.closest('.attaches button.container[data-mid]');
+  if (file && !file.disabled) {
+    const name = findMsg(file.getAttribute('data-mid')).file.name;
+    window.__downloads = (window.__downloads || []).concat([name]);
+    const a = document.createElement('a');
+    a.href = '/files/' + encodeURIComponent(name);
+    a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    return;
+  }
   const chip = ev.target.closest('button.reaction[data-mid]');
   if (chip) { const m = findMsg(chip.getAttribute('data-mid')); const e = chip.getAttribute('data-emoji'); setReaction(m, m.mine === e ? null : e); return; }
   const actions = ev.target.closest('button[aria-label="Message actions"]');
@@ -180,6 +199,12 @@ export const serve = (pageOpts) => new Promise((resolve) => {
       return res.end(LOTTIE);
     }
     if (u.pathname.startsWith('/photo/')) { res.setHeader('content-type', 'image/png'); return res.end(PNG_1PX); }
+    if (u.pathname.startsWith('/files/')) {
+      // A file's bytes name it, so a test can tell which one was fetched.
+      const name = decodeURIComponent(u.pathname.slice('/files/'.length));
+      res.setHeader('content-type', 'application/octet-stream');
+      return res.end(Buffer.concat([Buffer.from(`FILE:${name}\n`), Buffer.alloc(4096, 0x20)]));
+    }
     res.setHeader('content-type', 'text/html; charset=utf-8');
     res.end(PAGE(typeof pageOpts === 'function' ? pageOpts() : pageOpts));
   });

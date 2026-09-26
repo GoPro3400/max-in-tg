@@ -105,6 +105,11 @@ export const config = {
       messageAudio: process.env.MAX_SELECTORS_MESSAGE_AUDIO || 'audio, [class*="voice"], [data-testid*="voice"]',
       messageVideo: process.env.MAX_SELECTORS_MESSAGE_VIDEO || 'video, source[type="video"]',
       messageDocument: process.env.MAX_SELECTORS_MESSAGE_DOCUMENT || 'a[href][download],a[href*="/file"],a[href*="/download"]',
+      // A file in a bubble: a card with the name (.title) and size (.info);
+      // clicking it downloads the file. There is no link to it in the page.
+      messageFileCard: process.env.MAX_SELECTORS_MESSAGE_FILE_CARD || '.bubbleContent > .attaches > button.container',
+      // A link's preview card under the text — its picture is not a photo.
+      messageLinkPreview: process.env.MAX_SELECTORS_MESSAGE_LINK_PREVIEW || '.bubbleContent > .share',
       composer: process.env.MAX_SELECTORS_COMPOSER || '[data-testid="composer"] [contenteditable][role="textbox"], [data-lexical-editor="true"]',
       attachInput: process.env.MAX_SELECTORS_ATTACH_INPUT || 'input[type="file"]',
       // Attach flow: MAX's paperclip opens an actions menu; the file <input> is

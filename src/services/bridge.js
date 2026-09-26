@@ -43,6 +43,11 @@ const MEDIA_HASH_MATCH_THRESHOLD = 12;
 // reply to a deleted message) from blocking forwarding forever.
 const REPLY_GRACE_SIGHTINGS = 5;
 
+// A file MAX did not hand over when its bubble was read is tried again on the
+// next reads — this many in all — before the owner is told it could not be
+// fetched.
+const FILE_CAPTURE_SIGHTINGS = 3;
+
 // MAX rotates the login QR about every two minutes (measured on the live login
 // screen). Poll a little faster than that so a rotated code reaches Telegram
 // while it is still valid, and so a completed scan is noticed promptly.
@@ -114,6 +119,29 @@ const maxFingerprintOf = (original) => {
   if (original.type === MessageType.TEXT) return usable(original.sourceMessageId);
   const token = original.mediaUrl ? extractMediaToken(original.mediaUrl) : null;
   return token ? `media-token:${token}` : usable(original.sourceMessageId);
+};
+
+const formatBytes = (bytes) => {
+  const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit ? 1 : 0).replace('.', ',')} ${units[unit]}`;
+};
+
+// What goes to Telegram in place of a file from MAX that is not delivered.
+const fileNotice = (message) => {
+  const name = message.originalFilename ? `«${message.originalFilename}»` : 'Файл';
+  const size = message.metadata?.fileSize ? ` (${formatBytes(message.metadata.fileSize)})` : '';
+  const why = message.metadata?.fileTooBig
+    ? 'больше 50 МБ, столько бот в Telegram отправить не может. Файл можно открыть в MAX.'
+    : message.metadata?.fileUnavailable
+      ? 'файл удалён или недоступен в MAX.'
+      : 'не удалось забрать из MAX. Файл можно открыть там.';
+  return `📎 ${name}${size} — ${why}${message.text ? `\n\n${message.text}` : ''}`;
 };
 
 // Whitespace- and variation-selector-insensitive: MAX gives a multi-line
@@ -1028,7 +1056,8 @@ export class BridgeService {
           const isReply = Boolean(message.metadata?.replyLinkPresent || message.metadata?.replyToAuthor);
           const replyResolved = Boolean(message.metadata?.replyToSnippet || message.metadata?.replyToMediaUrl);
           const seen = (this.pendingSeenCounts.get(message.id) || 0) + 1;
-          if (isReply && !replyResolved && seen < REPLY_GRACE_SIGHTINGS) {
+          const retryFile = Boolean(message.metadata?.fileCaptureFailed) && seen < FILE_CAPTURE_SIGHTINGS;
+          if ((isReply && !replyResolved && seen < REPLY_GRACE_SIGHTINGS) || retryFile) {
             this.pendingSeenCounts.set(message.id, seen);
             continue;
           }
@@ -1496,9 +1525,8 @@ export class BridgeService {
     // is applied, and the owner gets their own message quoted back at them
     // (observed live: sent at 13:00:03, echoed at 13:00:09).
     //
-    // Message identity cannot help here — MAX renders no author and no
-    // timestamp we can read, so a message fingerprint is effectively just its
-    // text, in a different id namespace from the Telegram side. So match on
+    // Message identity cannot help here — a bubble's id (its time and text)
+    // lives in a different namespace from the Telegram message's. So match on
     // what we know we just sent, and consume the record on the first hit: a
     // genuine identical reply arriving later is still delivered.
     if (this.consumeRecentSend(message)) {
@@ -1591,6 +1619,13 @@ export class BridgeService {
           },
           'REPLY_RESOLVE'
         );
+      }
+
+      // A file that could not be brought over — too big for Telegram,
+      // deleted in MAX, or not downloaded on several tries: say what it was.
+      if (message.type === MessageType.DOCUMENT && !message.mediaUrl && !message.mediaPath) {
+        outgoing.type = MessageType.TEXT;
+        outgoing.text = fileNotice(message);
       }
 
       // The file whose bytes identify this bubble for the re-forward guard —

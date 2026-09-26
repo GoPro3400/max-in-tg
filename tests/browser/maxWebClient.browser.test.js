@@ -46,6 +46,19 @@ const chats = () => ([
       { id: 'g5', time: '13:04', out: true, text: ['моё'] },
       { id: 'g6', time: '13:05', text: ['без имени после моего'] }
     ]
+  },
+  {
+    title: 'Files',
+    messages: [
+      { id: 'o1', time: '14:00', out: true, file: { name: 'Моё.pdf', size: '0.50 MB' } },
+      { id: 'f1', time: '14:01', file: { name: 'Отчёт.pdf', size: '1.23 MB' } },
+      { id: 'f2', time: '14:02', file: { name: 'Фильм.mkv', size: '1.50 GB' } },
+      { id: 'f3', time: '14:03', file: { name: 'Старое.doc', deleted: true } },
+      { id: 't1', time: '14:04', text: ['Смотри ', { link: 'https://example.com/file/42' }] },
+      { id: 't2', time: '14:05', text: ['Статья ', { link: 'https://example.com/a' }], share: { url: 'https://example.com/a', image: '/photo/prev.png' } },
+      { id: 'f4', time: '14:06', file: { name: 'IMG_1.jpg', size: '2.00 MB', preview: '/photo/p3.png' } },
+      { id: 'l1', time: '14:07', location: true }
+    ]
   }
 ]);
 
@@ -215,6 +228,30 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     // MAX names the sender on the first bubble of a run only.
     expect(senders).toMatchObject({ '13:00': 'Анна', '13:01': 'Анна', '13:02': 'Анна', '13:03': 'Борис' });
     expect(senders['13:05']).toBeUndefined();
+    await openChat('Bob');
+  });
+
+  it('fetches each file from its own card, and never takes a link for a file', async () => {
+    await openChat('Files');
+    const messages = await client.readMessages('Files', { isKnown: () => false });
+    const at = (time) => messages.find((message) => message.metadata.time === time);
+    // Our own file before it used to be clicked instead (bubbles were counted
+    // differently in the page).
+    expect(at('14:01')).toMatchObject({ type: 'document', originalFilename: 'Отчёт.pdf' });
+    expect(fs.readFileSync(at('14:01').mediaPath, 'utf8')).toMatch(/^FILE:Отчёт\.pdf/);
+    // A picture sent as a file is that file, not a photo of its preview.
+    expect(at('14:06')).toMatchObject({ type: 'document', originalFilename: 'IMG_1.jpg' });
+    expect(fs.readFileSync(at('14:06').mediaPath, 'utf8')).toMatch(/^FILE:IMG_1\.jpg/);
+    // Too big for Telegram: not downloaded at all.
+    expect(at('14:02')).toMatchObject({ type: 'document', mediaPath: null });
+    expect(at('14:02').metadata).toMatchObject({ fileTooBig: true, fileSize: Math.round(1.5 * 1024 ** 3) });
+    expect(at('14:03').metadata.fileUnavailable).toBe(true);
+    expect(await client.page.evaluate(() => window.__downloads)).toEqual(['Отчёт.pdf', 'IMG_1.jpg']);
+    // A link in the text, and a link's preview card, are texts.
+    expect(at('14:04')).toMatchObject({ type: 'text', mediaUrl: null, text: 'Смотри https://example.com/file/42' });
+    expect(at('14:05')).toMatchObject({ type: 'text', mediaUrl: null });
+    // What cannot be carried over is named, not dropped (nor sent as "14:07").
+    expect(at('14:07')).toMatchObject({ type: 'text', text: '📍 Геопозиция — открой в MAX' });
     await openChat('Bob');
   });
 

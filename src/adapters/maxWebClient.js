@@ -64,7 +64,14 @@ const DOCUMENT_LINK_FALLBACK_SELECTOR = 'a[href][download], a[href*="/file"], a[
 // findAndHoverMessage.
 const BUBBLE_DECOR = {
   graphics: '.emoji, .animoji, [data-lexical-emoji], [data-lexical-animoji]',
-  bigEmoji: '.emojis'
+  bigEmoji: '.emojis',
+  // Kinds of message the bridge cannot carry over (MAX Web's bubble
+  // templates): Telegram gets a note saying what it was.
+  kinds: [
+    ['.bubbleContent > .location', '📍 Геопозиция'],
+    ['.bubbleContent > .attaches-fullWidth, .bubbleContent [class*="pollOption"]', '📊 Опрос'],
+    ['.bubbleContent > .unknownAttachWarning', '⚠️ Сообщение нового вида (MAX Web его не показывает)']
+  ]
 };
 
 // Runs in the MAX page before MAX's own scripts. MAX animates emoji
@@ -106,6 +113,18 @@ const STATIC_ANIMOJI_SCRIPT = `(() => {
 
 // How long the reactions scraped by readMessages are reused by readReactions.
 const REACTION_SCAN_MAX_AGE_MS = 5000;
+
+// Files bigger than this are not downloaded from MAX: a bot may upload at most
+// 50 MB to Telegram, so the bridge could only say it is too big — after the
+// browser had written it all to disk and the bridge read it into memory.
+const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
+// How long a download clicked in MAX may take: a few seconds to start, then
+// as long as it keeps growing, up to this.
+const DOCUMENT_DOWNLOAD_START_MS = 5000;
+const DOCUMENT_DOWNLOAD_MAX_MS = 120000;
+// Sent in place of a voice message or video note that could not be fetched.
+const VOICE_MISSING = '🎤 Голосовое сообщение — не удалось забрать из MAX, послушай его там.';
+const VIDEO_NOTE_MISSING = '📹 Видеосообщение — не удалось забрать из MAX, посмотри его там.';
 
 const reactionRowOf = (row) => ({
   rawId: row.rawId,
@@ -839,7 +858,10 @@ export class MaxWebClient {
         // .text at all; its emoji are drawn big instead.
         const textSource = textEl || safeAll(node, innerSelectors.messageText).find((el) => !isChrome(el)) || null;
         const bigEmojiEl = safeAll(node, decor.bigEmoji).find((el) => !inQuote(el)) || null;
-        const text = readable(textSource).trim() || readable(bigEmojiEl).trim();
+        // A location, a poll…: said in words (they used to come through as
+        // "12:04", their time).
+        const kind = (decor.kinds || []).find(([selector]) => safeAll(node, selector).some((el) => !inQuote(el)));
+        const text = readable(textSource).trim() || readable(bigEmojiEl).trim() || (kind ? `${kind[1]} — открой в MAX` : '');
         const fingerprintText = (textSource ? textSource.textContent : '').trim();
 
         const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
@@ -866,7 +888,15 @@ export class MaxWebClient {
         // re-sent instead of forwarding the reply text. Emoji pictures are not
         // media either: a text with an emoji used to become a "photo" of it.
         const ownEl = (el) => (inQuote(el) ? null : el);
-        const contentEl = (sel) => safeAll(node, sel).find((el) => !inQuote(el) && !isDecor(el)) || null;
+        // A file is a card (.attaches > button.container: its name in .title,
+        // its size in .info — "Скачать • 1.23 MB"). Its preview picture (a
+        // photo or video sent as a file) is not the message's photo: the file
+        // itself is. Nor is the picture of a link's preview card (.share) —
+        // a text with a link used to arrive as a photo of that picture.
+        const fileCard = ownEl(safeAll(node, innerSelectors.messageFileCard)[0] || null);
+        const inLinkPreview = (el) => Boolean(safeClosest(el, innerSelectors.messageLinkPreview));
+        const notContent = (el) => inQuote(el) || isDecor(el) || inLinkPreview(el) || Boolean(fileCard && fileCard.contains(el));
+        const contentEl = (sel) => safeAll(node, sel).find((el) => !notContent(el)) || null;
         const imgEl = contentEl('img');
         // An animated big emoji is a canvas when it cannot be read as an emoji
         // (static-animoji mode off); it is then treated as a sticker, as before.
@@ -881,14 +911,31 @@ export class MaxWebClient {
         const imageUrl = imgEl?.src || '';
         const audioUrl = audioEl?.src || '';
         const videoUrl = videoEl?.src || sourceEl?.src || '';
-        const documentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
+        // The first file-like link, as ids have always taken it (a link in the
+        // text included).
+        const legacyDocumentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
           || ownEl(node.querySelector(docLinkFallbackSelector));
-        const documentEl = documentLink || ownEl(node.querySelector('[class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [class*="fileIcon"], [data-testid*="document"], [data-testid*="file"], button[aria-label*="качать"]'));
+        // A link in the text ("…/file/…", "…/download…") or in its preview
+        // card is not a file to download.
+        const inText = (el) => Boolean(safeClosest(el, innerSelectors.messageText)) || inLinkPreview(el);
+        const documentLink = [...safeAll(node, innerSelectors.messageDocument), ...safeAll(node, docLinkFallbackSelector)]
+          .find((el) => !inQuote(el) && !inText(el)) || null;
+        const documentEl = fileCard || documentLink || ownEl(node.querySelector('[class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [class*="fileIcon"], [data-testid*="document"], [data-testid*="file"], button[aria-label*="качать"]'));
         const documentUrl = documentLink?.href || '';
         const hasDocumentElement = Boolean(documentEl);
-        // Try to extract original filename from document bubble
-        const fileNameEl = ownEl(node.querySelector('[class*="fileName"], [class*="file-name"], [class*="title"]'));
+        // The file's name, and its size as MAX states it — the bridge does not
+        // download what Telegram would not take anyway.
+        const fileNameEl = (fileCard && fileCard.querySelector('.title'))
+          || ownEl(node.querySelector('[class*="fileName"], [class*="file-name"], [class*="title"]'));
         const documentFileName = fileNameEl?.textContent?.trim() || '';
+        const fileInfo = fileCard?.querySelector('.info')?.textContent || '';
+        const sizes = [...fileInfo.matchAll(/(\d+(?:[.,]\d+)?)\s*(B|KB|MB|GB|TB|Б|КБ|МБ|ГБ|ТБ)(?![\p{L}])/giu)];
+        const lastSize = sizes.at(-1);
+        const sizeUnits = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const unitIndex = lastSize ? Math.max(sizeUnits.indexOf(lastSize[2].toUpperCase()), ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'].indexOf(lastSize[2].toUpperCase())) : -1;
+        const documentSize = unitIndex >= 0 ? Math.round(Number.parseFloat(lastSize[1].replace(',', '.')) * 1024 ** unitIndex) : 0;
+        // "Файл удален" / "Файл недоступен", or the card switched off.
+        const documentUnavailable = Boolean(fileCard) && (fileCard.disabled || /удал[её]н|недоступ|deleted|unavailable/i.test(fileInfo));
         const mediaUrl = imageUrl || audioUrl || videoUrl || documentUrl || '';
         // The id: author|time|text|media. Its media part is built the way it
         // always was — the first <img> (emoji pictures included), <audio>,
@@ -898,7 +945,7 @@ export class MaxWebClient {
         const legacySrc = (sel) => ownEl(node.querySelector(sel))?.src || '';
         const fingerprintImg = ownEl(safeAll(node, 'img').find((el) => !isAnimojiStandIn(el)) || null);
         const fingerprintMediaUrl = (fingerprintImg?.src || '') || legacySrc('audio')
-          || legacySrc('video') || legacySrc('source[type="video"], source[type="webm"]') || documentUrl || '';
+          || legacySrc('video') || legacySrc('source[type="video"], source[type="webm"]') || legacyDocumentLink?.href || '';
         const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
         const fallbackId = [author, time, fingerprintText, fingerprintMediaUrl].filter(Boolean).join('|');
         const rawId = explicitId || fallbackId || `visible-${index}`;
@@ -964,6 +1011,8 @@ export class MaxWebClient {
           // order the same way triggerDocumentDownload does (see readMessages).
           hasDocumentElement,
           documentFileName,
+          documentSize,
+          documentUnavailable,
           replyToAuthor,
           replyToSnippet,
           replyToHasMedia,
@@ -1129,7 +1178,7 @@ export class MaxWebClient {
       : [];
 
     const filtered = uniqueMessages(rawMessages
-      .filter((message) => !message.outgoing && (message.text || message.mediaUrl || message.type === 'sticker' || message.hasVoiceElement || message.hasRoundVideoElement || message.hasDuration))
+      .filter((message) => !message.outgoing && (message.text || message.mediaUrl || message.type === 'sticker' || message.type === 'document' || message.hasVoiceElement || message.hasRoundVideoElement || message.hasDuration))
       .map((message) => {
         if (message.type === 'sticker' && !message.mediaUrl) {
           const dataIdx = stickerIndices.indexOf(message.stickerIndex);
@@ -1224,7 +1273,9 @@ export class MaxWebClient {
           replyToSnippet: message.replyToSnippet || undefined,
           replyToHasMedia: message.replyToHasMedia || undefined,
           replyToMediaUrl: message.replyToMediaUrl || undefined,
-          replyLinkPresent: message.replyLinkPresent || undefined
+          replyLinkPresent: message.replyLinkPresent || undefined,
+          fileSize: message.type === 'document' && message.documentSize ? message.documentSize : undefined,
+          fileUnavailable: message.type === 'document' && message.documentUnavailable ? true : undefined
         }
       }));
 
@@ -1371,22 +1422,8 @@ export class MaxWebClient {
       }
     }
 
-    // Position of each voice bubble among the NON-OUTGOING voice bubbles in DOM
-    // order — exactly how triggerVoiceDownload indexes `voiceNodes` inside the
-    // page. This used to be counted inline while walking `messages`, which
-    // incremented for every already-known message of ANY type (text, photo…)
-    // while skipping unknown non-voice ones, so the counter drifted out of sync
-    // with the page: the click landed on a different voice bubble and its audio
-    // was saved onto this message, or the index ran past the end and the real
-    // voice was silently replaced by the '[Voice message]' placeholder.
-    const voiceOrdinalById = new Map();
-    let voiceOrdinal = 0;
-    for (const row of filtered) {
-      if (row.outgoing || !row.hasVoiceElement) continue;
-      voiceOrdinalById.set(stableId('max', this.activeChatId || chatId, row.rawId), voiceOrdinal);
-      voiceOrdinal += 1;
-    }
-
+    // Voice messages and video notes are fetched by clicking their own bubble
+    // (see clickInBubble).
     for (const msg of messages) {
       if (isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) continue;
       if (msg.mediaPath) continue;
@@ -1401,7 +1438,7 @@ export class MaxWebClient {
         if (msgIsKnown) continue;
         let networkVideo = this.findNetworkVideo();
         if (!networkVideo) {
-          networkVideo = await this.triggerVideoNoteDownload(chatId);
+          networkVideo = await this.triggerVideoNoteDownload(chatId, src.rawId);
         }
         if (networkVideo) {
           try {
@@ -1413,18 +1450,19 @@ export class MaxWebClient {
             logger.debug({ chatId, videoPath, size: networkVideo.buffer.length, contentType: networkVideo.contentType }, 'Saved video note from network');
           } catch (error) {
             logger.warn({ err: error, chatId }, 'Failed to save network video note');
-            msg.text = '[Video note]';
+            msg.text = VIDEO_NOTE_MISSING;
+            msg.metadata.fileCaptureFailed = true;
           }
         } else {
-          msg.text = '[Video note]';
+          // Tried again on the next reads before this text goes out.
+          msg.text = VIDEO_NOTE_MISSING;
+          msg.metadata.fileCaptureFailed = true;
         }
       } else if (src.hasVoiceElement || src.type === 'voice') {
         if (msgIsKnown) continue;
         let networkVoice = this.findNetworkVoice();
         if (!networkVoice) {
-          // Ordinal comes from the DOM-order map built above, so it always
-          // refers to this exact bubble regardless of what else was skipped.
-          networkVoice = await this.triggerVoiceDownload(src, chatId, voiceOrdinalById.get(msg.id) ?? 0);
+          networkVoice = await this.triggerVoiceDownload(src, chatId);
         }
         if (networkVoice) {
           try {
@@ -1440,52 +1478,52 @@ export class MaxWebClient {
             logger.debug({ chatId, voicePath, size: networkVoice.buffer.length, contentType: networkVoice.contentType }, 'Saved voice from network');
           } catch (error) {
             logger.warn({ err: error, chatId }, 'Failed to save network voice');
-            msg.text = '[Voice message]';
+            msg.text = VOICE_MISSING;
+            msg.metadata.fileCaptureFailed = true;
           }
         } else {
-          msg.text = '[Voice message]';
+          // Tried again on the next reads before this text goes out.
+          msg.text = VOICE_MISSING;
+          msg.metadata.fileCaptureFailed = true;
         }
       }
     }
 
-    // Handle documents (PDFs, etc.)
-    // Same DOM-order indexing as voice above: triggerDocumentDownload indexes
-    // non-outgoing document bubbles inside the page, so counting inline while
-    // walking `messages` (which incremented for known messages of any type)
-    // pointed the click at the wrong file — or none — and attached the wrong
-    // attachment to this message.
-    const docOrdinalById = new Map();
-    let docOrdinal = 0;
-    for (const row of filtered) {
-      if (row.outgoing || !row.hasDocumentElement) continue;
-      // triggerDocumentDownload skips voice/round-video bubbles before building
-      // its docNodes list, so mirror that here or the ordinals drift apart.
-      if (row.hasVoiceElement || row.hasRoundVideoElement) continue;
-      docOrdinalById.set(stableId('max', this.activeChatId || chatId, row.rawId), docOrdinal);
-      docOrdinal += 1;
-    }
-
+    // Handle documents (PDFs, etc.): fetched by clicking their own bubble
+    // (see clickInBubble).
     for (const msg of messages) {
       if (isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId)) continue;
       if (msg.mediaPath) continue;
       if (msg.type !== 'document') continue;
 
-      const msgIsKnown = isKnown && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId);
-      if (msgIsKnown) continue;
-      const docIndex = docOrdinalById.get(msg.id) ?? 0;
-
       if (msg.mediaUrl) {
         // Document has a direct download URL — use it
         msg.mediaPath = msg.mediaUrl;
+      } else if (msg.metadata.fileUnavailable) {
+        // Deleted in MAX: there is nothing to download (the bridge says so).
+      } else if (msg.metadata.fileSize > MAX_DOCUMENT_BYTES) {
+        // Not downloaded at all: the bridge could not deliver it, and the
+        // browser would have filled the disk with it and the bridge its
+        // memory. The bridge sends a notice instead.
+        msg.metadata.fileTooBig = true;
       } else {
         // Need to trigger click to download
         let networkDoc = this.findNetworkDocument();
         if (!networkDoc) {
-          networkDoc = await this.triggerDocumentDownload(chatId, docIndex);
+          networkDoc = await this.triggerDocumentDownload(chatId, msg.sourceMessageId);
         }
-        if (networkDoc) {
+        if (networkDoc?.tooBig) {
+          msg.metadata.fileTooBig = true;
+          msg.metadata.fileSize = networkDoc.bytes;
+        } else if (networkDoc) {
           try {
-            const originalName = networkDoc.originalName || msg.originalFilename || '';
+            // The name MAX shows on the card first: a file downloaded again
+            // after a failed try comes out of the browser as "name (1).pdf".
+            const cardName = msg.originalFilename || '';
+            const downloadedExt = path.extname(networkDoc.originalName || '');
+            const originalName = cardName
+              ? (path.extname(cardName) || !downloadedExt ? cardName : `${cardName}${downloadedExt}`)
+              : (networkDoc.originalName || '');
             const ext = originalName ? path.extname(originalName) : this.guessDocExtension(networkDoc.contentType, networkDoc.url);
             // A directory per message: named straight into mediaDir, two
             // documents with the same name (or any two Cyrillic names, which
@@ -1498,10 +1536,12 @@ export class MaxWebClient {
             logger.debug({ chatId, docPath, originalName: msg.originalFilename, size: networkDoc.buffer.length, contentType: networkDoc.contentType }, 'Saved document from network');
           } catch (error) {
             logger.warn({ err: error, chatId }, 'Failed to save network document');
-            msg.text = msg.text || '[Document]';
+            msg.metadata.fileCaptureFailed = true;
           }
         } else {
-          msg.text = msg.text || '[Document]';
+          // Tried again on the next reads; after that the bridge says it could
+          // not fetch the file (it used to go out as the text "[Document]").
+          msg.metadata.fileCaptureFailed = true;
         }
       }
     }
@@ -2205,44 +2245,75 @@ export class MaxWebClient {
     });
   }
 
-  async triggerDocumentDownload(chatId, docIndex = 0) {
-    try {
-      const docCountBefore = this.documentUrls.size;
-      const selectors = this.selectors;
-
-      const clicked = await this.page.$$eval(selectors.messageItem, (nodes, innerArgs) => {
-        const docNodes = [];
-        for (let i = 0; i < nodes.length; i++) {
-          const node = nodes[i];
-          if (node.querySelector('.is-outgoing, .outgoing')) continue;
-          // Skip voice/video elements
-          if (node.querySelector('[class*="attachAudio"], [class*="wave"], [class*="roundVideo"], [class*="videoMessage"]')) continue;
-          const docEl = node.querySelector('[class*="fileIcon"], button[aria-label*="качать"], [class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [data-testid*="document"], [data-testid*="file"], a[href][download], a[href*="/file"]');
-          if (!docEl) continue;
-          docNodes.push({ node, docEl });
+  // Clicks the first element matching one of `targets` (tried in order)
+  // inside the bubble read as `rawId`. The bubble is found by the same scrape
+  // that gave it that id — counting bubbles of a kind in the page and in Node
+  // drifted apart (an outgoing bubble is marked on an ancestor, which the
+  // page-side count did not see), and the next file or voice message was
+  // fetched for this one. False when the bubble is gone or has no target.
+  async clickInBubble(rawId, targets) {
+    if (!rawId) return false;
+    const rows = await this.scrapeMessageRows();
+    const index = rows.findIndex((row) => row.rawId === rawId);
+    if (index < 0) return false;
+    return this.page.$$eval(this.selectors.messageItem, (nodes, i, box, selectorList) => {
+      const node = nodes[i];
+      if (!node) return false;
+      // The list must not have moved since it was read.
+      const rect = node.getBoundingClientRect();
+      if (box && (Math.abs(rect.x - box.x) > 2 || Math.abs(rect.y - box.y) > 2)) return false;
+      for (const selector of selectorList) {
+        let target = null;
+        try {
+          target = selector ? node.querySelector(selector) : null;
+        } catch {
+          target = null;
         }
-        const target = docNodes[innerArgs.docIndex];
-        if (!target) return false;
-        const downloadBtn = target.node.querySelector('button[aria-label*="качать"], button[aria-label*="Скачать"], a[href][download], a[href*="/file"], a[href*="/download"], button[class*="download"], [class*="download"]');
-        if (downloadBtn) {
-          downloadBtn.click();
+        if (target) {
+          target.click();
           return true;
         }
-        target.docEl.click();
-        return true;
-      }, { docIndex });
+      }
+      return false;
+    }, index, rows[index].box || null, targets).catch(() => false);
+  }
+
+  async triggerDocumentDownload(chatId, rawId) {
+    try {
+      const docCountBefore = this.documentUrls.size;
+      // Before the click: a file the browser saves is found as a new name in
+      // the downloads folder.
+      const downloadFilesBefore = new Set(fs.readdirSync(this.downloadDir));
+
+      const clicked = await this.clickInBubble(rawId, [
+        this.selectors.messageFileCard,
+        'button[aria-label*="качать"], button[aria-label*="Download"], a[href][download], button[class*="download"], [class*="download"]',
+        // A file link, never one in the text or its preview.
+        `:is(a[href*="/file"], a[href*="/download"]):not(:is(${this.selectors.messageText}, ${this.selectors.messageLinkPreview}) *)`,
+        '[class*="fileIcon"], [class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [data-testid*="document"], [data-testid*="file"]'
+      ]);
 
       if (!clicked) {
-        logger.debug({ chatId, docIndex }, 'triggerDocumentDownload: no document element found');
+        logger.debug({ chatId }, 'triggerDocumentDownload: no document element found');
         return null;
       }
 
-      logger.debug({ chatId, docIndex }, 'triggerDocumentDownload: clicked, waiting for network response');
+      logger.debug({ chatId }, 'triggerDocumentDownload: clicked, waiting for network response');
 
-      // Track download directory for files that bypass network interception
-      const downloadFilesBefore = new Set(fs.readdirSync(this.downloadDir).filter((f) => !f.endsWith('.crdownload')));
+      const sizeOf = (name) => {
+        try {
+          return fs.statSync(path.join(this.downloadDir, name)).size;
+        } catch {
+          return 0;
+        }
+      };
 
-      for (let attempt = 0; attempt < 10; attempt++) {
+      // A few seconds for the download to start, then as long as it keeps
+      // growing: a file of a few MB used to be given up on after 5 seconds.
+      const startedAt = Date.now();
+      let deadline = startedAt + DOCUMENT_DOWNLOAD_START_MS;
+      let partialBytes = 0;
+      while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         if (this.documentUrls.size > docCountBefore) {
           const doc = this.findNetworkDocument();
@@ -2252,16 +2323,33 @@ export class MaxWebClient {
           }
         }
         // Check for new files in download dir (browser download)
-        const currentFiles = fs.readdirSync(this.downloadDir).filter((f) => !f.endsWith('.crdownload'));
-        const newFiles = currentFiles.filter((f) => !downloadFilesBefore.has(f));
+        const entries = fs.readdirSync(this.downloadDir).filter((f) => !downloadFilesBefore.has(f));
+        const newFiles = entries.filter((f) => !f.endsWith('.crdownload'));
         if (newFiles.length > 0) {
           const originalName = newFiles[0];
           const filePath = path.join(this.downloadDir, originalName);
+          const bytes = sizeOf(originalName);
+          if (bytes > MAX_DOCUMENT_BYTES) {
+            // Its card did not say how big it is: never read it into memory.
+            fs.rmSync(filePath, { force: true });
+            logger.info({ chatId, bytes }, 'triggerDocumentDownload: file is over the size limit, not forwarded');
+            return { tooBig: true, bytes, originalName };
+          }
           const buffer = fs.readFileSync(filePath);
           const ext = path.extname(originalName) || '.bin';
           logger.debug({ chatId, filePath, size: buffer.length, originalName }, 'triggerDocumentDownload: captured document from download dir');
           fs.unlinkSync(filePath);
           return { url: filePath, buffer, timestamp: Date.now(), contentType: `application/${ext.slice(1)}`, originalName };
+        }
+        const partial = entries.filter((f) => f.endsWith('.crdownload')).reduce((sum, f) => sum + sizeOf(f), 0);
+        if (partial > MAX_DOCUMENT_BYTES) {
+          // (The browser finishes it on its own; the downloads sweep removes it.)
+          logger.info({ chatId, bytes: partial }, 'triggerDocumentDownload: file is over the size limit, not forwarded');
+          return { tooBig: true, bytes: partial };
+        }
+        if (partial > partialBytes) {
+          partialBytes = partial;
+          deadline = Math.min(startedAt + DOCUMENT_DOWNLOAD_MAX_MS, Date.now() + DOCUMENT_DOWNLOAD_START_MS);
         }
       }
 
@@ -2273,30 +2361,15 @@ export class MaxWebClient {
     }
   }
 
-  async triggerVoiceDownload(src, chatId, voiceIndex = 0) {
+  async triggerVoiceDownload(src, chatId) {
     try {
       const voiceCountBefore = this.voiceUrls.size;
-      const selectors = this.selectors;
 
-      const clicked = await this.page.$$eval(selectors.messageItem, (nodes, innerSrc) => {
-        const voiceNodes = [];
-        for (let i = 0; i < nodes.length; i++) {
-          const node = nodes[i];
-          const voiceEl = node.querySelector('[class*="voice"], [data-testid*="voice"], [class*="audioMessage"], [class*="audio-player"], [class*="attachAudio"], [class*="wave"]');
-          if (!voiceEl) continue;
-          if (node.querySelector('.is-outgoing, .outgoing')) continue;
-          voiceNodes.push({ node, voiceEl });
-        }
-        const target = voiceNodes[innerSrc.voiceIndex];
-        if (!target) return false;
-        const playBtn = target.node.querySelector('button[class*="play"], button[aria-label*="Play"], button[aria-label*="play"], [class*="playBtn"], [class*="play-btn"], [data-testid*="play"], .play, button');
-        if (playBtn) {
-          playBtn.click();
-          return true;
-        }
-        target.voiceEl.click();
-        return true;
-      }, { time: src.time, voiceIndex });
+      const clicked = await this.clickInBubble(src.rawId, [
+        'button[class*="play"], button[aria-label*="Play"], button[aria-label*="play"], [class*="playBtn"], [class*="play-btn"], [data-testid*="play"], .play',
+        '[class*="attachAudio"] button, [class*="voice"] button, [class*="audioMessage"] button',
+        '[class*="voice"], [data-testid*="voice"], [class*="audioMessage"], [class*="audio-player"], [class*="attachAudio"], [class*="wave"]'
+      ]);
 
       if (!clicked) {
         logger.debug({ chatId }, 'triggerVoiceDownload: no voice play button found');
@@ -2327,22 +2400,14 @@ export class MaxWebClient {
     }
   }
 
-  async triggerVideoNoteDownload(chatId) {
+  async triggerVideoNoteDownload(chatId, rawId) {
     try {
       const videoCountBefore = this.videoUrls.size;
-      const selectors = this.selectors;
 
-      const clicked = await this.page.$$eval(selectors.messageItem, (nodes) => {
-        for (let i = nodes.length - 1; i >= 0; i--) {
-          const node = nodes[i];
-          if (node.querySelector('.is-outgoing, .outgoing')) continue;
-          const videoMsg = node.querySelector('[class*="videoMessage"], [class*="videoCanvas"], [class*="roundVideo"]');
-          if (!videoMsg) continue;
-          videoMsg.click();
-          return true;
-        }
-        return false;
-      }, selectors);
+      // (It used to be the newest video note on screen, whichever this was.)
+      const clicked = await this.clickInBubble(rawId, [
+        '[class*="videoMessage"], [class*="videoCanvas"], [class*="roundVideo"]'
+      ]);
 
       if (!clicked) {
         logger.debug({ chatId }, 'triggerVideoNoteDownload: no video note element found');

@@ -98,6 +98,12 @@ const toMb = (bytes) => Math.round(bytes / (1024 * 1024));
 // Reaction problems are reported to the owner at most this often per kind.
 const REACTION_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
 
+// "typing…" (see relayTyping): how often MAX's chat list is looked at, and how
+// often Telegram is told again for a chat — its action lasts 5 seconds, MAX's
+// own 8 after the last keystroke.
+const TYPING_SCAN_INTERVAL_MS = 1500;
+const TYPING_REPEAT_MS = 4000;
+
 // The reaction the bot shows in Telegram for a MAX message: the most used one
 // OTHER people put on it (MAX lists chips most used first; a chip marked as
 // ours counts one less) that a bot is allowed to set. null for none.
@@ -216,6 +222,8 @@ export class BridgeService {
     // Tracks how many polls a brand-new MAX message has been seen but not yet
     // forwarded — used to give lazily-rendered reply quotes time to appear.
     this.pendingSeenCounts = new Map();
+    this.lastTypingScanAt = 0;
+    this.typingSentAt = new Map();
     // Muted MAX chats (/mute): excluded from polling entirely, and anything
     // that still reaches forwardMaxMessage from them is consumed without being
     // sent to Telegram. In-memory mirror of db.listMutedChatIds(); the
@@ -973,10 +981,13 @@ export class BridgeService {
       const chats = this.pickChatsForPoll();
       let failedChats = 0;
       let unreachableChats = 0;
+      await this.relayTyping();
       for (const chat of chats) {
         // Telegram asked us to back off: nothing read now could be forwarded,
         // and everything stays unseen until the window has passed.
         if (this.telegramPaused()) break;
+        // Between chats too: reading one takes a few seconds.
+        await this.relayTyping();
         let messages;
         // First read of this chat since ids carry the time: see legacyAdoptionEnd.
         const firstTimedRead = !this.chatOnTimedIds(chat.id);
@@ -1124,6 +1135,27 @@ export class BridgeService {
         logger.warn('Every chat became unreachable because the MAX session is signed out — starting QR sign-in');
         await this.ensureMaxLogin({ reason: 'session-expired' });
       }
+    }
+  }
+
+  // Someone typing in MAX shows as "typing…" (or "recording a voice
+  // message"…) in that chat's topic. Read from MAX's chat list, so no chat is
+  // opened for it; only chats that already have a Telegram route.
+  async relayTyping(now = Date.now()) {
+    if (!this.config.typingEnabled || typeof this.maxClient.typingChats !== 'function'
+        || typeof this.telegramBot.sendChatAction !== 'function') return;
+    if (now - this.lastTypingScanAt < TYPING_SCAN_INTERVAL_MS || this.telegramPaused(now)) return;
+    this.lastTypingScanAt = now;
+    const typing = await this.maxClient.typingChats().catch(() => []);
+    for (const { chatId, action } of typing) {
+      if (this.mutedChatIds.has(chatId) || now - (this.typingSentAt.get(chatId) || 0) < TYPING_REPEAT_MS) continue;
+      const mapping = this.db.getChatMapping(chatId);
+      if (!mapping) continue;
+      this.typingSentAt.set(chatId, now);
+      // Not awaited: the browser lock is held, and it is only a hint.
+      this.telegramBot.sendChatAction(mapping, action).catch((error) => {
+        logger.debug({ err: error?.message, chatId }, 'Failed to show typing in Telegram');
+      });
     }
   }
 

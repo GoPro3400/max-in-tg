@@ -255,6 +255,21 @@ describe.skipIf(!chrome)('MaxWebClient in Chromium', { timeout: 30000 }, () => {
     await openChat('Bob');
   });
 
+  it('sees who is typing in the chat list, and what they are doing', async () => {
+    expect(await client.typingChats()).toEqual([]);
+    await client.page.evaluate(() => {
+      window.__chats[0].typing = 'печатает';
+      window.__chats[1].typing = 'Анна записывает аудио';
+      window.renderChats();
+    });
+    expect(await client.typingChats()).toEqual([
+      { chatId: 'Bob', action: 'typing' },
+      { chatId: 'Group', action: 'record_voice' }
+    ]);
+    // The chat titles still read the same.
+    expect((await client.listChats()).map((chat) => chat.title)).toEqual(['Bob', 'Group', 'Files']);
+  });
+
   it('notices a crashed page at once', async () => {
     expect(client.isAlive()).toBe(true);
     await client.page.goto('chrome://crash').catch(() => null);

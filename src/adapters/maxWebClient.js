@@ -114,6 +114,18 @@ const STATIC_ANIMOJI_SCRIPT = `(() => {
 // How long the reactions scraped by readMessages are reused by readReactions.
 const REACTION_SCAN_MAX_AGE_MS = 5000;
 
+// What MAX says someone is doing ("записывает аудио", "sending a file"…), as
+// the Telegram chat action showing the same.
+const TYPING_ACTIONS = [
+  [/аудио|голосов|voice|audio/i, 'record_voice'],
+  [/видеосообщ|video message/i, 'record_video_note'],
+  [/видео|video/i, 'upload_video'],
+  [/фото|photo/i, 'upload_photo'],
+  [/файл|file/i, 'upload_document'],
+  [/стикер|sticker/i, 'choose_sticker']
+];
+export const typingAction = (label) => TYPING_ACTIONS.find(([pattern]) => pattern.test(label || ''))?.[1] || 'typing';
+
 // Files bigger than this are not downloaded from MAX: a bot may upload at most
 // 50 MB to Telegram, so the bridge could only say it is too big — after the
 // browser had written it all to disk and the bridge read it into memory.
@@ -2080,6 +2092,26 @@ export class MaxWebClient {
     }
 
     logger.debug({ chatId, filePath: absolutePath }, 'Sent file');
+  }
+
+  // Chats where someone is typing right now, as MAX's chat list shows it —
+  // "печатает", "Иван записывает аудио"… in place of the last message; the
+  // chat need not be open. [{ chatId, action }], action being the Telegram
+  // chat action for what they are doing.
+  async typingChats() {
+    if (!this.page || this.page.isClosed?.()) return [];
+    const found = await this.page.$$eval(this.selectors.chatItem, (nodes, sel) => nodes.map((node) => {
+      let typing = null;
+      try {
+        typing = node.querySelector(sel.chatTyping);
+      } catch {
+        return null;
+      }
+      if (!typing) return null;
+      const title = node.querySelector(sel.chatTitle)?.textContent?.trim() || '';
+      return title ? { title, label: (typing.textContent || '').replace(/\s+/g, ' ').trim() } : null;
+    }).filter(Boolean), this.selectors).catch(() => []);
+    return found.map(({ title, label }) => ({ chatId: title, action: typingAction(label) }));
   }
 
   async isTyping() {

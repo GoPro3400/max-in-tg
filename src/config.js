@@ -120,7 +120,10 @@ export const config = {
       attachMenuMedia: process.env.MAX_SELECTORS_ATTACH_MENU_MEDIA || 'button[role="menuitem"][aria-label*="Photo"]',
       attachMenuFile: process.env.MAX_SELECTORS_ATTACH_MENU_FILE || 'button[role="menuitem"][aria-label*="File"]',
       sendButton: process.env.MAX_SELECTORS_SEND_BUTTON || '[data-testid="composer"] button[aria-label="Send message"], button[aria-label="Send message"]',
-      typing: process.env.MAX_SELECTORS_TYPING || '[data-testid="typing-indicator"]',
+      // "печатает…" in the open chat's header, and in a chat list item (MAX
+      // shows it there in place of the last message, for any chat).
+      typing: process.env.MAX_SELECTORS_TYPING || 'h2#main-header-title + .header .subtitle .typing, main .header .subtitle .typing',
+      chatTyping: process.env.MAX_SELECTORS_CHAT_TYPING || '.typing',
       // Attachment staging: elements that appear in the composer preview area
       // after a file has been accepted by the file-chooser. If any of these are
       // present the attachment has been staged and the send button can be clicked.
@@ -177,5 +180,7 @@ export const config = {
   browserRecycleMinutes: Math.max(0, int('MAX_BROWSER_RECYCLE_MINUTES', 360)),
   maxDeliveryAttempts: Math.max(1, int('MAX_DELIVERY_ATTEMPTS', 5)),
   // Mirror reactions between MAX and Telegram (see BridgeService).
-  reactionsEnabled: bool('SYNC_REACTIONS', true)
+  reactionsEnabled: bool('SYNC_REACTIONS', true),
+  // Show "typing…" in Telegram while someone types in MAX (see relayTyping).
+  typingEnabled: bool('SYNC_TYPING', true)
 };

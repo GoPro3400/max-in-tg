@@ -106,16 +106,19 @@ window.renderMessages = function renderMessages() {
   box.innerHTML = chat ? chat.messages.map(renderMessage).join('') : '';
   loadLotties(box);
 };
-function renderChats() {
+// A chat list item shows "печатает…" in place of its last message: <span class="text"><span class="typing"><span class="text"></span> [lottie] label
+window.renderChats = function renderChats() {
   const list = document.querySelector('aside .scrollListContent');
-  list.innerHTML = window.__chats.map((c, i) => '<div class="item" data-index="' + i + '"><button class="cell"><h3 class="title"><span class="name"><span class="text">' + esc(c.title) + '</span></span></h3></button></div>').join('');
+  list.innerHTML = window.__chats.map((c, i) => '<div class="item" data-index="' + i + '"><button class="cell"><h3 class="title"><span class="name"><span class="text">' + esc(c.title) + '</span></span></h3>'
+    + '<span class="text">' + (c.typing ? '<span class="typing"><span class="text"></span> <span class="lottie"></span> ' + esc(c.typing) + '</span>' : esc(c.preview || '')) + '</span>'
+    + '</button></div>').join('');
   list.querySelectorAll('.item').forEach((item) => item.querySelector('button').addEventListener('click', () => {
     window.__active = window.__chats[Number(item.getAttribute('data-index'))].title;
     document.getElementById('main-header-title').textContent = 'Окно чата с ' + window.__active;
     document.querySelector('main .header .title').textContent = window.__active;
     window.renderMessages();
   }));
-}
+};
 const findMsg = (id) => { for (const c of window.__chats) for (const m of c.messages) if (m.id === id) return m; return null; };
 function setReaction(m, emoji) {
   m.reactions = m.reactions || [];

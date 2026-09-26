@@ -147,6 +147,12 @@ export class MaxWebClient {
       userDataDir: this.config.userDataDir,
       protocolTimeout: this.config.protocolTimeoutMs,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      // Puppeteer would kill Chromium itself on SIGTERM/SIGINT, before the
+      // bridge's shutdown lets an in-flight send finish (bridge.stop drains
+      // maxLock first). index.js handles the signals and closes the browser.
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',

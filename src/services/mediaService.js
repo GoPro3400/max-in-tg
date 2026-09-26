@@ -172,7 +172,8 @@ export class MediaService {
     const outputPath = replaceExtension(inputPath, targetExtension);
     if (inputPath === outputPath && fs.existsSync(outputPath)) return outputPath;
 
-    let audioCommand = ffmpeg(inputPath).output(outputPath);
+    await assertPlainMedia(inputPath);
+    let audioCommand = ffmpeg(inputPath).inputOptions(LOCAL_FILES_ONLY).output(outputPath);
     if (targetExtension === 'ogg') {
       audioCommand = audioCommand.audioCodec('libopus').format('ogg');
     }
@@ -209,7 +210,8 @@ export class MediaService {
     const outputPath = replaceExtension(inputPath, targetExtension);
     if (inputPath === outputPath && fs.existsSync(outputPath)) return outputPath;
 
-    let videoCommand = ffmpeg(inputPath).output(outputPath);
+    await assertPlainMedia(inputPath);
+    let videoCommand = ffmpeg(inputPath).inputOptions(LOCAL_FILES_ONLY).output(outputPath);
     if (targetExtension === 'mp4') {
       videoCommand = videoCommand.videoCodec('libx264').audioCodec('aac').format('mp4');
     }
@@ -288,9 +290,10 @@ export class MediaService {
   // ffmpeg's native VP9 decoder, hence the explicit input codec.
   async videoStickerToGif(inputPath, fps = 20) {
     const outputPath = path.join(path.dirname(inputPath), `${path.basename(inputPath, path.extname(inputPath))}.gif`);
+    await assertPlainMedia(inputPath);
     const gifCommand = ffmpeg()
       .input(inputPath)
-      .inputOptions(['-c:v', 'libvpx-vp9'])
+      .inputOptions([...LOCAL_FILES_ONLY, '-c:v', 'libvpx-vp9'])
       .complexFilter([
         { filter: 'fps', options: String(fps), inputs: '0:v', outputs: 'timed' },
         { filter: 'scale', options: `${STICKER_SIDE}:-2:flags=lanczos`, inputs: 'timed', outputs: 'scaled' },
@@ -420,12 +423,59 @@ export const redactUrl = (url) => {
   }
 };
 
+// ffmpeg picks a demuxer by the file's contents, and a few of them follow
+// references to OTHER files or to the network: an HLS playlist (#EXTM3U), a
+// concat script (ffconcat), a DASH manifest (<MPD>) or an SDP description
+// (v=0, opens RTP sockets). A "voice message" from a MAX contact made like
+// that would have the converter read local files or reach internal hosts.
+// Real media never starts like that; the protocol whitelist is the second
+// line of defence.
+const LOCAL_FILES_ONLY = ['-protocol_whitelist', 'file'];
+
+export const assertPlainMedia = async (filePath) => {
+  const handle = await fsp.open(filePath, 'r');
+  let head;
+  try {
+    const { buffer, bytesRead } = await handle.read(Buffer.alloc(512), 0, 512, 0);
+    head = buffer.subarray(0, bytesRead).toString('latin1');
+  } finally {
+    await handle.close();
+  }
+  const text = head.replace(/^\xEF\xBB\xBF/, '').trimStart().toLowerCase();
+  if (text.startsWith('#extm3u') || text.startsWith('ffconcat') || text.startsWith('<mpd')
+      || (text.startsWith('<?xml') && text.includes('<mpd')) || /^v=0\r?\n/.test(text)) {
+    throw new Error('Refused to convert a playlist/manifest posing as media');
+  }
+};
+
+// The eight 16-bit groups of an IPv6 address (a trailing dotted IPv4 part
+// included), or null.
+const ipv6Groups = (ip) => {
+  let text = ip;
+  const dotted = /(\d+\.\d+\.\d+\.\d+)$/.exec(text);
+  if (dotted) {
+    if (!net.isIPv4(dotted[1])) return null;
+    const [a, b, c, d] = dotted[1].split('.').map(Number);
+    text = text.slice(0, -dotted[1].length) + `${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const groups = [...head, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...tail].map((group) => Number.parseInt(group, 16));
+  return groups.length === 8 && groups.every((group) => Number.isInteger(group) && group >= 0 && group <= 0xffff) ? groups : null;
+};
+
+const ipv4From = (high, low) => `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
+
 // Loopback, private, link-local, CGNAT, multicast and reserved ranges, IPv4
-// and IPv6 (including IPv4-mapped IPv6).
+// and IPv6 — including IPv6 forms that carry an IPv4 address (mapped
+// ::ffff:7f00:1, which is how a URL spells [::ffff:127.0.0.1]; NAT64
+// 64:ff9b::/96; 6to4 2002::/16; the old IPv4-compatible ::a.b.c.d).
 export const isPrivateAddress = (address) => {
-  const ip = String(address || '').toLowerCase();
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
-  if (mapped) return isPrivateAddress(mapped[1]);
+  const ip = String(address || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, '');
   if (net.isIPv4(ip)) {
     const [a, b] = ip.split('.').map(Number);
     return a === 0 || a === 10 || a === 127 || a >= 224
@@ -436,10 +486,18 @@ export const isPrivateAddress = (address) => {
       || (a === 198 && (b === 18 || b === 19));
   }
   if (net.isIPv6(ip)) {
-    return ip === '::' || ip === '::1'
-      || /^f[cd]/.test(ip) // fc00::/7 unique local
-      || /^fe[89ab]/.test(ip) // fe80::/10 link-local
-      || /^ff/.test(ip); // multicast
+    const g = ipv6Groups(ip);
+    if (!g) return true;
+    const zeros = (from, to) => g.slice(from, to).every((group) => group === 0);
+    if (zeros(0, 8) || (zeros(0, 7) && g[7] === 1)) return true; // :: and ::1
+    if (zeros(0, 5) && g[5] === 0xffff) return isPrivateAddress(ipv4From(g[6], g[7])); // IPv4-mapped
+    if (zeros(0, 6)) return isPrivateAddress(ipv4From(g[6], g[7])); // IPv4-compatible
+    if (g[0] === 0x64 && g[1] === 0xff9b && zeros(2, 6)) return isPrivateAddress(ipv4From(g[6], g[7])); // NAT64
+    if (g[0] === 0x2002) return isPrivateAddress(ipv4From(g[1], g[2])); // 6to4
+    return (g[0] & 0xfe00) === 0xfc00 // fc00::/7 unique local
+      || (g[0] & 0xffc0) === 0xfe80 // fe80::/10 link-local
+      || (g[0] & 0xff00) === 0xff00 // multicast
+      || (g[0] === 0x2001 && g[1] === 0x0db8); // documentation
   }
   return true; // not an IP at all: refuse rather than guess
 };

@@ -56,6 +56,9 @@ telegramBot.onFatal(fatal('telegram-polling-stopped'));
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+// Chromium no longer dies with us by itself (see MaxWebClient.start): close it
+// on a hang-up too, e.g. when the terminal of a bare `npm start` goes away.
+process.on('SIGHUP', () => shutdown('SIGHUP'));
 
 process.on('unhandledRejection', (error) => {
   logger.error({ err: error }, 'Unhandled promise rejection');

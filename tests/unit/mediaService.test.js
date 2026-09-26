@@ -429,3 +429,51 @@ describe('MediaService', () => {
     });
   });
 });
+
+describe('MediaService: untrusted media for ffmpeg', () => {
+  let dir;
+  let service;
+
+  beforeEach(async () => {
+    dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'media-guard-'));
+    service = new MediaService(dir, { lookup: vi.fn(async () => [{ address: '93.184.216.34', family: 4 }]) });
+  });
+
+  afterEach(async () => {
+    await fsp.rm(dir, { recursive: true, force: true });
+  });
+
+  // A "voice message" that is really a playlist would have ffmpeg read other
+  // files (or reach the network) while converting it.
+  it.each([
+    ['HLS playlist', '#EXTM3U\n#EXTINF:1,\nfile:///etc/passwd\n'],
+    ['concat script', 'ffconcat version 1.0\nfile /etc/passwd\n'],
+    ['DASH manifest', '<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>\n'],
+    ['SDP description', 'v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\nc=IN IP4 127.0.0.1\r\n']
+  ])('refuses a %s posing as a voice message', async (_name, contents) => {
+    const input = path.join(dir, 'voice.ogg');
+    await fsp.writeFile(input, contents);
+    await expect(service.convertAudio(input, 'mp3')).rejects.toThrow(/playlist\/manifest/);
+    expect(fs.existsSync(path.join(dir, 'voice.mp3'))).toBe(false);
+  });
+
+  it('still converts real audio', async () => {
+    const { default: ffmpegPath } = await import('ffmpeg-static');
+    const { execFileSync } = await import('node:child_process');
+    const input = path.join(dir, 'tone.wav');
+    execFileSync(ffmpegPath, ['-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.3', input]);
+    const output = await service.convertAudio(input, 'ogg');
+    expect((await fsp.stat(output)).size).toBeGreaterThan(100);
+  }, 30000);
+});
+
+describe('isPrivateAddress: IPv6 forms that carry an IPv4 address', () => {
+  it('sees through mapped, compatible, NAT64 and 6to4 forms', () => {
+    for (const ip of ['::ffff:7f00:1', '[::ffff:7f00:1]', '0:0:0:0:0:ffff:7f00:1', '::7f00:1', '64:ff9b::a00:1', '2002:c0a8:101::1', 'fe80::1%eth0', '2001:db8::1', '1::2::3']) {
+      expect(isPrivateAddress(ip)).toBe(true);
+    }
+    for (const ip of ['64:ff9b::808:808', '2002:808:808::1', '2a00:1450:4010:c05::66']) {
+      expect(isPrivateAddress(ip)).toBe(false);
+    }
+  });
+});

@@ -83,6 +83,9 @@ export const config = {
     // while loading — the only form in which a reaction says which emoji it
     // is (see STATIC_ANIMOJI_SCRIPT in maxWebClient.js). Stickers stay animated.
     staticAnimoji: bool('MAX_STATIC_ANIMOJI', true),
+    // DevTools port for scripts/devtools-repl.js (reachable only inside the
+    // container). 0: any free port, chosen by Puppeteer.
+    remoteDebuggingPort: Math.max(0, int('MAX_REMOTE_DEBUGGING_PORT', 9222)),
     selectors: {
       chatList: process.env.MAX_SELECTORS_CHAT_LIST || 'aside[aria-labelledby="aside-header-title"] .scrollListContent',
       chatItem: process.env.MAX_SELECTORS_CHAT_ITEM || 'aside[aria-labelledby="aside-header-title"] .item[data-index]',

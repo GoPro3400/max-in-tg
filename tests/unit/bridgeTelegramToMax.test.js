@@ -172,7 +172,7 @@ describe('handleTelegramMessage', () => {
 
     expect(telegramBot.sendText).toHaveBeenCalledTimes(1);
     const [notice, route] = telegramBot.sendText.mock.calls[0];
-    expect(notice).toContain('Failed to send to MAX');
+    expect(notice).toContain('Не ушло в MAX');
     expect(notice).toContain('MAX exploded');
     expect(route).toEqual({ telegramChatId: -100500, telegramThreadId: 77 });
   });

@@ -172,8 +172,10 @@ export class MaxWebClient {
         // debugging to 127.0.0.1 by default and this port is not published
         // in docker-compose, so it is reachable only from inside the
         // container's network namespace (e.g. via `docker exec`) — never
-        // exposed to the host network or the internet.
-        '--remote-debugging-port=9222'
+        // exposed to the host network or the internet. 0 leaves the port to
+        // Puppeteer (any free one), so several browsers can run side by side
+        // (the browser tests do).
+        ...(this.config.remoteDebuggingPort === 0 ? [] : [`--remote-debugging-port=${this.config.remoteDebuggingPort || 9222}`])
       ]
     });
     // A close requested through stop() also fires 'disconnected'; only a

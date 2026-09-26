@@ -1734,13 +1734,8 @@ export class BridgeService {
     // browser recycle is different: it holds maxLock until the new page is
     // usable, so the send below simply waits for it instead of being refused.
     if (this.loginInProgress || (!this.maxClient.page && !this.browserRecycling)) {
-      await this.telegramBot.sendText(
-        '⏳ MAX ещё не подключён — сообщение НЕ отправлено. Пришли его снова, когда придёт «✅ MAX подключён».',
-        {
-          telegramChatId: message.metadata.telegramChatId,
-          telegramThreadId: message.metadata.telegramThreadId
-        }
-      ).catch(() => null);
+      await this.notifyNotSent(message, '⏳ MAX ещё не подключён — сообщение НЕ отправлено. Нажми «Повторить», когда придёт «✅ MAX подключён».')
+        .catch(() => null);
       return;
     }
 
@@ -1837,16 +1832,24 @@ export class BridgeService {
     } catch (error) {
       this.db.updateDeliveryStatus(deliveryId, 'failed', error.message);
       logger.error({ err: error, messageId: enriched.id, chatId: mapping.maxChatId }, 'Failed to forward Telegram message to Max');
-      await this.telegramBot.sendText(
-        `⚠️ Failed to send to MAX: ${error.message}`,
-        {
-          telegramChatId: message.metadata.telegramChatId,
-          telegramThreadId: message.metadata.telegramThreadId
-        }
-      ).catch((notifyError) => {
+      await this.notifyNotSent(message, `⚠️ Не ушло в MAX: ${error.message}`).catch((notifyError) => {
         logger.warn({ err: notifyError }, 'Failed to notify Telegram user about forwarding failure');
       });
     }
+  }
+
+  // Tells the owner a message of theirs did not reach MAX: as a reply to it,
+  // with a "Повторить" button that sends it again (TelegramBotAdapter).
+  async notifyNotSent(message, text) {
+    const route = {
+      telegramChatId: message.metadata.telegramChatId,
+      telegramThreadId: message.metadata.telegramThreadId
+    };
+    const replyTo = Number(message.sourceMessageId) || null;
+    if (replyTo && typeof this.telegramBot.sendRetryNotice === 'function') {
+      return this.telegramBot.sendRetryNotice(text, route, replyTo);
+    }
+    return this.telegramBot.sendText(text, route);
   }
 
   // Telegram→MAX replies: if this Telegram message replies to one the bridge

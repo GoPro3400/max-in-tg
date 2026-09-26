@@ -326,6 +326,16 @@ export class TelegramBotAdapter {
     );
   }
 
+  // Tells the owner that one of their messages did not reach MAX: a reply to
+  // it, with a button that sends it again (see the RETRY_ACTION handler).
+  async sendRetryNotice(text, route = {}, replyToMessageId = null) {
+    return this.bot.telegram.sendMessage(route.telegramChatId || this.targetChatId(), text, {
+      ...threadExtra(route),
+      ...replyParameters(replyToMessageId),
+      reply_markup: { inline_keyboard: [[{ text: '🔁 Повторить', callback_data: RETRY_ACTION }]] }
+    });
+  }
+
   async sendPinnedText(text, route = {}) {
     const chatId = route.telegramChatId || this.targetChatId();
     const sent = await this.bot.telegram.sendMessage(chatId, text, threadExtra(route));
@@ -869,6 +879,23 @@ export class TelegramBotAdapter {
       return undefined;
     });
 
+    // "Повторить" under a notice that a message did not reach MAX: the
+    // notice is a reply to that message, so Telegram hands it back here and
+    // it goes through the ordinary path again — nothing has to be resent.
+    this.bot.action(RETRY_ACTION, async (ctx) => {
+      const notice = ctx.callbackQuery?.message;
+      const original = notice?.reply_to_message;
+      if (!original || !this.onOutboundMessage) {
+        await ctx.answerCbQuery('Исходное сообщение не найдено — пришли его ещё раз.').catch(() => {});
+        return;
+      }
+      await ctx.answerCbQuery('Отправляю ещё раз…').catch(() => {});
+      await ctx.deleteMessage().catch(() => {});
+      const task = this.outboundQueue.then(() => this.processOutbound(ctx, original));
+      this.outboundQueue = task.catch(() => {});
+      await task;
+    });
+
     this.bot.on('message', (ctx) => {
       if (!this.onOutboundMessage || !ctx.message) return undefined;
       // Skip only real bot commands (already served by their own handlers).
@@ -888,20 +915,22 @@ export class TelegramBotAdapter {
     });
   }
 
-  async processOutbound(ctx) {
+  // `msg`: the owner's message — the update's own, or the one a "retry"
+  // button points back to.
+  async processOutbound(ctx, msg = ctx.message) {
+    const answer = (text) => ctx.telegram.sendMessage(msg.chat.id, text, threadExtra({ telegramThreadId: msg.message_thread_id || null })).catch(() => {});
     try {
-      const message = await this.telegramMessageToDomain(ctx);
+      const message = await this.telegramMessageToDomain(ctx, msg);
       if (message) {
         await this.onOutboundMessage(message);
-      } else if (UNSUPPORTED_CONTENT.some((key) => key in ctx.message)) {
+      } else if (UNSUPPORTED_CONTENT.some((key) => key in msg)) {
         // These used to vanish without a word, so the owner assumed they
         // were delivered. (Service messages also land here and stay quiet.)
-        await ctx.reply('⚠️ Такой тип сообщения в MAX не пересылается — отправь текстом или файлом.', threadExtraFromContext(ctx)).catch(() => {});
+        await answer('⚠️ Такой тип сообщения в MAX не пересылается — отправь текстом или файлом.');
       }
     } catch (error) {
-      logger.error({ err: error, chatId: ctx.chat?.id }, 'Failed to process outbound Telegram message');
-      const text = error?.userFacing ? `⚠️ ${error.message}` : `⚠️ Failed to process message: ${error.message}`;
-      await ctx.reply(text, threadExtraFromContext(ctx)).catch(() => {});
+      logger.error({ err: error, chatId: msg.chat?.id }, 'Failed to process outbound Telegram message');
+      await answer(error?.userFacing ? `⚠️ ${error.message}` : `⚠️ Failed to process message: ${error.message}`);
     }
   }
 
@@ -939,8 +968,7 @@ export class TelegramBotAdapter {
     return ctx.chat?.type === 'private' && ctx.chat.id === this.config.ownerId;
   }
 
-  async telegramMessageToDomain(ctx) {
-    const msg = ctx.message;
+  async telegramMessageToDomain(ctx, msg = ctx.message) {
     const base = {
       id: stableId('tg', msg.chat.id, msg.message_thread_id || 0, msg.message_id, msg.date),
       direction: Direction.TG_TO_MAX,
@@ -1045,7 +1073,10 @@ const userFacingError = (message) => Object.assign(new Error(message), { userFac
 
 // The update types the bot handles. Listing them is required to receive
 // message_reaction at all.
-const ALLOWED_UPDATES = ['message', 'my_chat_member', 'message_reaction'];
+const ALLOWED_UPDATES = ['message', 'my_chat_member', 'message_reaction', 'callback_query'];
+
+// callback_data of the "Повторить" button (see sendRetryNotice).
+const RETRY_ACTION = 'retry';
 
 // Telegram content the bridge cannot represent in MAX; the sender is told.
 const UNSUPPORTED_CONTENT = ['location', 'venue', 'contact', 'poll', 'dice', 'game', 'story'];

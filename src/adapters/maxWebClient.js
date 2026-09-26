@@ -63,6 +63,9 @@ export class MaxWebClient {
     this.page = null;
     this.activeChatId = null;
     this.activeChatTitle = null;
+    // The chat whose network traffic media captures are attributed to (set
+    // when a chat is being opened, before it is verified — see selectChat).
+    this.captureChatId = null;
     this.selectors = maxConfig.selectors;
     this.diagnosticDir = options.diagnosticDir;
     this.diagnosticRetentionFiles = options.diagnosticRetentionFiles ?? 80;
@@ -151,7 +154,10 @@ export class MaxWebClient {
         const ct = response.headers()['content-type'] || '';
         // H5: tag every capture with the chat that is active at capture time so
         // that a slow network response from chat A cannot be attributed to chat B.
-        const capturedChatId = this.activeChatId;
+        // captureChatId, not activeChatId: the chat being opened is only
+        // marked active after its header is verified, while its stickers and
+        // media start loading right after the click.
+        const capturedChatId = this.captureChatId ?? this.activeChatId;
 
         const isStickerUrl = url.includes('/sticker') || url.includes('/emoji') ||
           url.includes('sticker') || url.includes('emoji') ||
@@ -506,12 +512,17 @@ export class MaxWebClient {
     // would then read or type into whatever chat the page actually shows.
     this.activeChatId = null;
     this.activeChatTitle = null;
+    this.captureChatId = chat.id;
 
     // Clicked inside the page: no ElementHandles, so nothing is pinned (see
-    // disposeHandles).
+    // disposeHandles). The resource-timing list is cleared at the same time:
+    // fetchRecentLottieFromPage reads the newest sticker files from it, and
+    // in a page that lives for days that list (250 entries, then it stops
+    // recording) otherwise held stickers from long-gone chats.
     const clicked = await this.page.evaluate((selector, index) => {
       const node = document.querySelectorAll(selector)[index];
       if (!node) return false;
+      try { performance.clearResourceTimings(); } catch { /* not available */ }
       const btn = node.querySelector('button.cell') || node;
       btn.scrollIntoView({ block: 'center' });
       btn.click();
@@ -910,9 +921,19 @@ export class MaxWebClient {
         }
       }));
 
+    const stickerSourceFor = (msg) => filtered.find((f) => (f._stickerDataUrl || f._needsScreenshot)
+      && stableId('max', this.activeChatId || chatId, f.rawId) === msg.id);
+    // Network captures (a Lottie file, a sticker image) cannot be tied to a
+    // particular bubble: with two new stickers at once the newest capture went
+    // to the first one and the next to the second — the animations came out
+    // swapped. They are only used when a single sticker is waiting; otherwise
+    // each sticker is captured from its own canvas.
+    const pendingStickers = messages.filter((msg) => !(isKnown && isKnown(msg.id, msg.sourceMessageId)) && stickerSourceFor(msg)).length;
+    const networkStickerUsable = pendingStickers <= 1;
+
     for (const msg of messages) {
       if (isKnown && isKnown(msg.id, msg.sourceMessageId)) continue;
-      const src = filtered.find((f) => (f._stickerDataUrl || f._needsScreenshot) && stableId('max', this.activeChatId || chatId, f.rawId) === msg.id);
+      const src = stickerSourceFor(msg);
       if (!src) continue;
 
       let saved = false;
@@ -921,7 +942,7 @@ export class MaxWebClient {
       // Strategy 0a (preferred): render the Lottie JSON captured from the network
       // ourselves with lottie-web (reliable in headless) → PNG frames → the
       // bridge encodes a real animated .webm sticker.
-      if (!saved) {
+      if (!saved && networkStickerUsable) {
         let lottie = this.findNetworkLottie();
         if (!lottie?.buffer) {
           // Not intercepted (served from cache) — fetch it from the page.
@@ -975,7 +996,9 @@ export class MaxWebClient {
           if (buffer.length > 2000) {
             const stickerPath = saveBuffer(this.mediaDir, `sticker-${msg.id}.png`, buffer);
             msg.mediaPath = stickerPath;
-            msg.type = 'photo';
+            // Kept a sticker (not a photo): the bridge sends it as a real
+            // Telegram sticker, transparent, instead of a picture.
+            msg.type = 'sticker';
             saved = true;
             logger.info({ chatId, stickerPath, size: buffer.length }, 'Sticker SAVED from canvas toDataURL');
           } else {
@@ -986,7 +1009,7 @@ export class MaxWebClient {
         }
       }
 
-      if (!saved) {
+      if (!saved && networkStickerUsable) {
         const networkSticker = this.findNetworkSticker();
         logger.debug({ chatId, hasNetworkSticker: Boolean(networkSticker), cacheSize: this.stickerUrls.size }, 'Sticker strategy 2: network intercept');
         if (networkSticker) {
@@ -994,7 +1017,7 @@ export class MaxWebClient {
             const ext = (networkSticker.contentType || '').includes('webp') ? 'webp' : 'png';
             const stickerPath = saveBuffer(this.mediaDir, `sticker-${msg.id}-${Date.now()}.${ext}`, networkSticker.buffer);
             msg.mediaPath = stickerPath;
-            msg.type = 'photo';
+            msg.type = 'sticker';
             saved = true;
             logger.info({ chatId, stickerPath, size: networkSticker.buffer.length, url: networkSticker.url }, 'Sticker SAVED from network');
           } catch (error) {
@@ -1006,20 +1029,23 @@ export class MaxWebClient {
       // NOTE: the old "bubble screenshot" strategy was removed — it captured the
       // chat wallpaper behind an unrendered sticker and sent it as a photo.
 
-      if (!saved && src._needsScreenshot) {
-        let elements = [];
+      if (!saved && src._needsScreenshot && src.stickerIndex >= 0) {
+        // The canvas INSIDE this sticker's bubble. `${messageItem} canvas`
+        // only appended " canvas" to the last selector of the list, so it
+        // matched every bubble — and the screenshot taken was of the chat's
+        // first bubble, whatever text it held.
+        let bubbles = [];
+        let canvas = null;
         try {
-          const selector = `${selectors.messageItem} canvas`;
-          elements = await this.page.$$(selector);
-          const stickerIdx = stickerIndices.indexOf(src.stickerIndex);
-          const el = elements[stickerIdx];
-          logger.debug({ chatId, hasCanvasEl: Boolean(el), canvasCount: elements.length }, 'Sticker strategy: canvas element screenshot');
-          if (el) {
-            const screenshotBuffer = await el.screenshot({ type: 'png' });
+          bubbles = await this.page.$$(selectors.messageItem);
+          canvas = await bubbles[src.stickerIndex]?.$('canvas');
+          logger.debug({ chatId, hasCanvasEl: Boolean(canvas), stickerIndex: src.stickerIndex }, 'Sticker strategy: canvas element screenshot');
+          if (canvas) {
+            const screenshotBuffer = await canvas.screenshot({ type: 'png', omitBackground: true });
             if (screenshotBuffer && screenshotBuffer.length > 2000) {
               const stickerPath = saveBuffer(this.mediaDir, `sticker-${msg.id}.png`, screenshotBuffer);
               msg.mediaPath = stickerPath;
-              msg.type = 'photo';
+              msg.type = 'sticker';
               saved = true;
               logger.info({ chatId, stickerPath, size: screenshotBuffer.length }, 'Sticker SAVED via canvas screenshot');
             }
@@ -1027,14 +1053,14 @@ export class MaxWebClient {
         } catch (error) {
           logger.warn({ err: error, chatId }, 'Failed to screenshot sticker canvas');
         } finally {
-          await disposeHandles(elements);
+          await disposeHandles(canvas, bubbles);
         }
       }
 
       if (!saved) {
-        msg.text = '[Sticker]';
+        msg.text = '[Стикер]';
         msg.type = 'text';
-        logger.info({ chatId, msgId: msg.id }, 'Sticker could not be captured — sent as [Sticker] text');
+        logger.info({ chatId, msgId: msg.id }, 'Sticker could not be captured — sent as [Стикер] text');
       }
     }
 
@@ -1850,7 +1876,11 @@ export class MaxWebClient {
       throw new Error('Lottie payload is not valid JSON');
     }
     if (!this._lottieScript) {
-      const scriptPath = path.join(process.cwd(), 'node_modules', 'lottie-web', 'build', 'player', 'lottie.min.js');
+      // The "light" canvas build has no expression support. The full build
+      // eval()s JavaScript embedded in the animation — and these animations
+      // come from other people (MAX stickers, Telegram .tgs), played in the
+      // tab that holds the logged-in MAX session.
+      const scriptPath = path.join(process.cwd(), 'node_modules', 'lottie-web', 'build', 'player', 'lottie_light_canvas.min.js');
       this._lottieScript = fs.readFileSync(scriptPath, 'utf8');
     }
 
@@ -1933,6 +1963,7 @@ export class MaxWebClient {
     this.page = null;
     this.activeChatId = null;
     this.activeChatTitle = null;
+    this.captureChatId = null;
     this.clearMediaCaches();
     if (!browser) return;
 
@@ -1983,6 +2014,7 @@ export class MaxWebClient {
     await this.ensurePage();
     this.activeChatId = null;
     this.activeChatTitle = null;
+    this.captureChatId = null;
     this.clearMediaCaches();
     // A beforeunload prompt would block the reload forever.
     const acceptDialog = (dialog) => { dialog.accept().catch(() => {}); };

@@ -109,3 +109,39 @@ describe('TelegramBotAdapter.sendMessage limits', () => {
     expect(api.sendMessage).not.toHaveBeenCalled();
   });
 });
+
+describe('TelegramBotAdapter.sendStickerFile', () => {
+  function stickerAdapter(sendSticker) {
+    const adapter = new TelegramBotAdapter({ token: 'test:token', ownerId: 1, relayChatId: -100, useTopics: true }, {});
+    const api = { sendSticker: vi.fn(sendSticker), deleteMessage: vi.fn(async () => true) };
+    Object.assign(adapter.bot.telegram, api);
+    return { adapter, api };
+  }
+
+  it('returns the message when Telegram shows it as a sticker, with thread and quote', async () => {
+    const { adapter, api } = stickerAdapter(async () => ({ message_id: 7, sticker: { file_id: 'x' } }));
+
+    const sent = await adapter.sendStickerFile('/tmp/s.webm', { telegramChatId: -100, telegramThreadId: 5 }, 42);
+
+    expect(sent.message_id).toBe(7);
+    expect(api.sendSticker).toHaveBeenCalledWith(-100, { source: '/tmp/s.webm' }, {
+      message_thread_id: 5,
+      reply_parameters: { message_id: 42, allow_sending_without_reply: true }
+    });
+  });
+
+  it('removes a file Telegram posted as a plain document and reports failure, so the caller falls back', async () => {
+    const { adapter, api } = stickerAdapter(async () => ({ message_id: 8, document: { file_id: 'x' } }));
+
+    await expect(adapter.sendStickerFile('/tmp/s.webm', { telegramChatId: -100 })).resolves.toBeNull();
+    expect(api.deleteMessage).toHaveBeenCalledWith(-100, 8);
+  });
+
+  it('treats a rejected upload as "fall back", but lets flood control through', async () => {
+    const rejected = stickerAdapter(async () => { throw Object.assign(new Error('400: Bad Request: STICKER_VIDEO_LONG'), { code: 400 }); });
+    await expect(rejected.adapter.sendStickerFile('/tmp/s.webm', {})).resolves.toBeNull();
+
+    const flooded = stickerAdapter(async () => { throw Object.assign(new Error('429: retry after 9'), { code: 429, parameters: { retry_after: 9 } }); });
+    await expect(flooded.adapter.sendStickerFile('/tmp/s.webm', {})).rejects.toThrow('429');
+  });
+});

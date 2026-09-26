@@ -316,3 +316,69 @@ describe('routing without topics (no relay group)', () => {
     expect(history).not.toContain('dinner at 7');
   });
 });
+
+describe('Telegram stickers into MAX', () => {
+  function stickerBridge(overrides = {}) {
+    const mediaService = makeFakeMediaService({
+      ensureMaxCompatible: vi.fn(async (file) => file.replace(/\.webp$/, '.png')),
+      videoStickerToGif: vi.fn(async (file) => file.replace(/\.webm$/, '.gif')),
+      framesDirToGif: vi.fn(async (dir) => `${dir}.gif`),
+      ...overrides.mediaService
+    });
+    const maxClient = makeFakeMaxClient({
+      renderLottieToFrames: vi.fn(async () => ({ frames: [Buffer.from('a'), Buffer.from('b'), Buffer.from('c')], fps: 20 })),
+      saveFrameBuffers: vi.fn((id) => `/tmp/media/sticker-frames-${id}`),
+      ...overrides.maxClient
+    });
+    const harness = makeBridge({ mediaService, maxClient });
+    linkChat(harness.db, 'max-1');
+    return harness;
+  }
+  const sticker = (id, file) => telegramMessage(id, { type: 'sticker', mediaPath: file, text: '', metadata: { stickerEmoji: '😂' } });
+
+  it('a static sticker goes as a PNG (transparent), not a black-backed JPEG', async () => {
+    const { bridge, maxClient, mediaService } = stickerBridge();
+
+    await bridge.handleTelegramMessage(sticker('tg-s1', '/tmp/tg-1/sticker.webp'));
+
+    expect(mediaService.ensureMaxCompatible).toHaveBeenCalledWith('/tmp/tg-1/sticker.webp', 'sticker');
+    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/tg-1/sticker.png');
+  });
+
+  it('a video sticker becomes an animated GIF', async () => {
+    const { bridge, maxClient, mediaService } = stickerBridge();
+
+    await bridge.handleTelegramMessage(sticker('tg-s2', '/tmp/tg-2/sticker.webm'));
+
+    expect(mediaService.videoStickerToGif).toHaveBeenCalledWith('/tmp/tg-2/sticker.webm');
+    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/tg-2/sticker.gif');
+  });
+
+  it('an animated .tgs sticker is rendered frame by frame and sent as a GIF', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tgs-'));
+    const tgs = path.join(dir, 'sticker.tgs');
+    fs.writeFileSync(tgs, 'gzipped lottie');
+    const { bridge, maxClient, mediaService } = stickerBridge();
+
+    await bridge.handleTelegramMessage(sticker('tg-s3', tgs));
+
+    expect(maxClient.renderLottieToFrames).toHaveBeenCalledWith(Buffer.from('gzipped lottie'));
+    expect(mediaService.framesDirToGif).toHaveBeenCalledWith('/tmp/media/sticker-frames-tg-tg-s3', 20);
+    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/media/sticker-frames-tg-tg-s3.gif');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('when nothing MAX can show can be made, the emoji is sent instead', async () => {
+    const { bridge, maxClient } = stickerBridge({
+      mediaService: { videoStickerToGif: vi.fn(async () => { throw new Error('ffmpeg failed'); }) }
+    });
+
+    await bridge.handleTelegramMessage(sticker('tg-s4', '/tmp/tg-4/sticker.webm'));
+
+    expect(maxClient.sendFile).not.toHaveBeenCalled();
+    expect(maxClient.sendText).toHaveBeenCalledWith('max-1', '😂');
+  });
+});

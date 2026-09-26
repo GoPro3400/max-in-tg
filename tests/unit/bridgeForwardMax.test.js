@@ -228,9 +228,74 @@ describe('forwardMaxMessage', () => {
     const [outgoing] = telegramBot.sendMessage.mock.calls[0];
     expect(outgoing.type).toBe('sticker');
     expect(outgoing.mediaPath).toBe('/tmp/frames/stick-1/out.gif');
-    // Non-photo media identity uses the content hash of the encoded file.
-    expect(mediaService.fileContentHash).toHaveBeenCalledWith('/tmp/frames/stick-1/out.gif');
+    // The sticker's identity is its first frame — the same whichever encoder
+    // (video sticker or GIF) ends up being used.
+    expect(mediaService.fileContentHash).toHaveBeenCalledWith('/tmp/frames/stick-1/frame-000.png');
     expect(db.getDeliveryStats()).toEqual([{ status: 'sent', count: 1 }]);
+  });
+
+  describe('stickers as real Telegram stickers', () => {
+    function stickerBridge({ sendStickerFile = vi.fn(async () => ({ message_id: 555, sticker: {} })) } = {}) {
+      const mediaService = makeFakeMediaService({
+        framesDirToWebmSticker: vi.fn(async (dir) => `${dir}/sticker.webm`),
+        toWebpSticker: vi.fn(async (file) => `${file}-tg-sticker.webp`)
+      });
+      const telegramBot = makeFakeTelegramBot({ sendStickerFile });
+      const harness = makeBridge({ mediaService, telegramBot });
+      linkChat(harness.db, 'chat-s');
+      return harness;
+    }
+
+    it('an animated MAX sticker goes out as a VP9 video sticker, not as a GIF', async () => {
+      const { bridge, telegramBot, mediaService } = stickerBridge();
+
+      const result = await bridge.forwardMaxMessage(maxMessage('st1', 'chat-s', {
+        type: 'sticker', mediaPath: '/tmp/frames/st1', metadata: { animated: true, fps: 24 }
+      }));
+
+      expect(result).toBe(true);
+      expect(mediaService.framesDirToWebmSticker).toHaveBeenCalledWith('/tmp/frames/st1', 24);
+      expect(telegramBot.sendStickerFile).toHaveBeenCalledWith('/tmp/frames/st1/sticker.webm', expect.objectContaining({ maxChatId: 'chat-s' }), null);
+      expect(mediaService.framesDirToGif).not.toHaveBeenCalled();
+      expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the GIF when Telegram does not take the video sticker', async () => {
+      const { bridge, telegramBot, mediaService } = stickerBridge({ sendStickerFile: vi.fn(async () => null) });
+
+      await bridge.forwardMaxMessage(maxMessage('st2', 'chat-s', {
+        type: 'sticker', mediaPath: '/tmp/frames/st2', metadata: { animated: true, fps: 24 }
+      }));
+
+      expect(mediaService.framesDirToGif).toHaveBeenCalledWith('/tmp/frames/st2', 24);
+      expect(telegramBot.sendMessage.mock.calls[0][0].mediaPath).toBe('/tmp/frames/st2/out.gif');
+    });
+
+    it('a static MAX sticker goes out as a WEBP sticker, with the photo as fallback', async () => {
+      const { bridge, telegramBot, mediaService } = stickerBridge();
+
+      await bridge.forwardMaxMessage(maxMessage('st3', 'chat-s', {
+        type: 'sticker', mediaPath: '/tmp/media/sticker-st3.png'
+      }));
+
+      expect(mediaService.toWebpSticker).toHaveBeenCalledWith('/tmp/media/sticker-st3.png');
+      expect(telegramBot.sendStickerFile.mock.calls[0][0]).toBe('/tmp/media/sticker-st3.png-tg-sticker.webp');
+      expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('a sticker reply keeps its quote', async () => {
+      const { bridge, db, telegramBot } = stickerBridge();
+      db.insertMessage({
+        id: 'orig', chatId: 'chat-s', direction: 'max_to_tg', type: 'text', text: 'как дела?',
+        sourceMessageId: 'o', createdAt: Date.now(), metadata: {}, telegramMessageId: 321
+      });
+
+      await bridge.forwardMaxMessage(maxMessage('st4', 'chat-s', {
+        type: 'sticker', mediaPath: '/tmp/media/sticker-st4.png', metadata: { replyToSnippet: 'как дела?' }
+      }));
+
+      expect(telegramBot.sendStickerFile.mock.calls[0][2]).toBe(321);
+    });
   });
 
   it('falls back to the first frame as a photo when GIF encoding fails', async () => {

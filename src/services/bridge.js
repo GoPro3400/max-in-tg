@@ -1,3 +1,4 @@
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { MessageType, humanMessage } from '../domain/messages.js';
 import { logger } from '../logger.js';
@@ -1469,21 +1470,11 @@ export class BridgeService {
       // guaranteed to be reproducible byte-for-byte.
       let sourceForHash = null;
 
-      // Animated stickers are sent as an autoplaying GIF. Telegram accepts a
-      // .tgs upload without error but renders MAX's Lottie as a plain document
-      // ("Unknown Track"), so the native-sticker path is intentionally not used.
       if (message.type === MessageType.STICKER && message.metadata?.animated && message.mediaPath) {
-        // GIF fallback: mediaPath is a directory of captured PNG frames. Telegram
-        // autoplays the GIF (no transparency). If encoding fails, degrade to the
-        // first frame as a photo rather than dropping the sticker.
-        try {
-          outgoing.mediaPath = await this.mediaService.framesDirToGif(message.mediaPath, message.metadata.fps);
-        } catch (encodeError) {
-          logger.warn({ err: encodeError, messageId: message.id }, 'Animated sticker encode failed; sending first frame as photo');
-          outgoing.mediaPath = path.join(message.mediaPath, 'frame-000.png');
-          outgoing.type = MessageType.PHOTO;
-          outgoing.metadata = { ...message.metadata, animated: false };
-        }
+        // mediaPath is a directory of PNG frames; it is encoded when sent (see
+        // sendToTelegram). Its first frame is the identity for the re-forward
+        // guard — independent of which encoder ends up being used.
+        sourceForHash = path.join(message.mediaPath, 'frame-000.png');
       } else if (message.mediaUrl) {
         outgoing.mediaPath = await this.mediaService.downloadUrl(message.mediaUrl, `max-${message.type}`);
         // Hash the ORIGINAL download, not the converted output: re-encoding is
@@ -1527,7 +1518,7 @@ export class BridgeService {
         }
       }
 
-      const sent = await this.telegramBot.sendMessage(outgoing, mapping);
+      const sent = await this.sendToTelegram(message, outgoing, mapping);
       // Persist the Telegram message_id on the original message object so that
       // the subsequent insertMessage call (in pollMax) stores it in the DB.
       // This enables future reply-linking features via getMessageByTelegramMessageId.
@@ -1573,6 +1564,76 @@ export class BridgeService {
 
   telegramPaused(now = Date.now()) {
     return now < this.telegramPausedUntil;
+  }
+
+  // Stickers go out as real Telegram stickers — a WEBP, or a VP9 WEBM video
+  // sticker for animated ones — so they look like stickers: transparent, no
+  // bubble, no "GIF" badge. Before, animated ones were GIFs, which Telegram
+  // turns into looping videos with a black background, and static ones plain
+  // photos. If Telegram does not take the sticker, the old way is the fallback:
+  // an animated GIF (or its first frame), or a photo.
+  async sendToTelegram(message, outgoing, mapping) {
+    if (message.type === MessageType.STICKER && typeof this.telegramBot.sendStickerFile === 'function') {
+      const stickerFile = await this.telegramStickerFile(message, outgoing).catch((error) => {
+        logger.warn({ err: error?.message || String(error), messageId: message.id }, 'Could not encode a Telegram sticker; falling back');
+        return null;
+      });
+      if (stickerFile) {
+        const sent = await this.telegramBot.sendStickerFile(stickerFile, mapping, outgoing.replyToMessageId);
+        if (sent) {
+          if (message.metadata?.animated && message.mediaPath) {
+            await fsp.rm(message.mediaPath, { recursive: true, force: true }).catch(() => {});
+          }
+          return sent;
+        }
+      }
+    }
+    if (message.type === MessageType.STICKER && message.metadata?.animated && message.mediaPath) {
+      // Telegram autoplays the GIF. If encoding fails, degrade to the first
+      // frame as a photo rather than dropping the sticker.
+      try {
+        outgoing.mediaPath = await this.mediaService.framesDirToGif(message.mediaPath, message.metadata.fps);
+      } catch (encodeError) {
+        logger.warn({ err: encodeError, messageId: message.id }, 'Animated sticker encode failed; sending first frame as photo');
+        outgoing.mediaPath = path.join(message.mediaPath, 'frame-000.png');
+        outgoing.type = MessageType.PHOTO;
+        outgoing.metadata = { ...message.metadata, animated: false };
+      }
+    }
+    return this.telegramBot.sendMessage(outgoing, mapping);
+  }
+
+  async telegramStickerFile(message, outgoing) {
+    if (message.metadata?.animated && message.mediaPath) {
+      return this.mediaService.framesDirToWebmSticker(message.mediaPath, message.metadata.fps);
+    }
+    if (outgoing.mediaPath && typeof this.mediaService.toWebpSticker === 'function') {
+      return this.mediaService.toWebpSticker(outgoing.mediaPath);
+    }
+    return null;
+  }
+
+  // What MAX gets for a Telegram sticker: a PNG for a static one, an animated
+  // GIF for a .tgs (rendered with lottie-web in the MAX browser) or a .webm
+  // video sticker — transparency kept in both. null when it cannot be made;
+  // the caller then sends the sticker's emoji instead.
+  async prepareStickerForMax(message) {
+    const input = message.mediaPath;
+    const ext = path.extname(input || '').toLowerCase();
+    try {
+      if (ext === '.tgs') {
+        if (typeof this.maxClient.renderLottieToFrames !== 'function') return null;
+        const { frames, fps } = await this.maxClient.renderLottieToFrames(await fsp.readFile(input));
+        if (frames.length < 2) return null;
+        const framesDir = this.maxClient.saveFrameBuffers(`tg-${message.id}`, frames);
+        return await this.mediaService.framesDirToGif(framesDir, fps);
+      }
+      if (ext === '.webm') return await this.mediaService.videoStickerToGif(input);
+      return await this.mediaService.ensureMaxCompatible(input, MessageType.STICKER);
+    } catch (error) {
+      logger.warn({ err: error?.message || String(error), messageId: message.id }, 'Could not convert a Telegram sticker for MAX');
+      return null;
+    }
   }
 
   async handleTelegramMessage(message) {
@@ -1632,6 +1693,17 @@ export class BridgeService {
           // which the poller skips by itself: the echo record is no longer
           // needed and would only swallow an identical reply from the contact.
           if (enriched.maxFingerprint) this.forgetSentToMax(mapping.maxChatId, enriched.text);
+        } else if (enriched.type === MessageType.STICKER) {
+          const filePath = await this.prepareStickerForMax(enriched);
+          if (filePath) {
+            await this.maxClient.sendFile(mapping.maxChatId, filePath);
+            enriched.mediaPath = filePath;
+          } else {
+            // Nothing MAX could show: the emoji the sticker stands for.
+            const text = enriched.metadata?.stickerEmoji || '[стикер]';
+            await this.maxClient.sendText(mapping.maxChatId, text);
+            this.rememberSentToMax(mapping.maxChatId, text);
+          }
         } else {
           const filePath = await this.mediaService.ensureMaxCompatible(enriched.mediaPath, enriched.type);
           await this.maxClient.sendFile(mapping.maxChatId, filePath);

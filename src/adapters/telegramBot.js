@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { Telegraf } from 'telegraf';
 import { Direction, MessageType, stableId } from '../domain/messages.js';
 import { logger } from '../logger.js';
+import { documentDisplayName } from '../utils/fileHelpers.js';
 
 export class TelegramBotAdapter {
   constructor(telegramConfig, mediaService) {
@@ -395,28 +396,35 @@ export class TelegramBotAdapter {
     } else if (message.type === MessageType.VIDEO) {
       return await this.bot.telegram.sendVideo(chatId, { source: filePath }, extra);
     } else {
-      const docSource = { source: filePath };
-      if (message.originalFilename) {
-        docSource.filename = message.originalFilename;
-      }
+      // The name comes from MAX's page, where it can carry invisible bidi
+      // characters (and so lose its extension in the eyes of Telegram
+      // clients, which then add it again: "report.pdf.pdf").
+      const docSource = { source: filePath, filename: documentDisplayName(message.originalFilename, filePath) };
       return await this.bot.telegram.sendDocument(chatId, docSource, extra);
     }
   }
 
-  // Try to send a file as a Telegram sticker (.tgs/.webm). Returns true on
-  // success, false if Telegram rejects it (so the caller can fall back). The
-  // rejection reason is logged so we can tell whether MAX's Lottie conforms.
-  async trySendSticker(filePath, route = {}) {
+  // Sends a file as a real Telegram sticker (a .webp, or a .webm video
+  // sticker). Telegram does not always refuse a file it cannot use as a
+  // sticker: it may post it as a plain document instead. So the result is
+  // checked and such a stray message removed. Returns the sent message, or
+  // null so the caller can fall back (GIF / photo). Flood control (429) is
+  // rethrown: the bridge has to pause, not fall back and send again.
+  async sendStickerFile(filePath, route = {}, replyToMessageId = null) {
+    const chatId = route.telegramChatId || this.targetChatId();
     try {
-      await this.bot.telegram.sendSticker(
-        route.telegramChatId || this.targetChatId(),
-        { source: filePath },
-        threadExtra(route)
-      );
-      return true;
+      const sent = await this.bot.telegram.sendSticker(chatId, { source: filePath }, {
+        ...threadExtra(route),
+        ...replyParameters(replyToMessageId)
+      });
+      if (sent?.sticker) return sent;
+      if (sent?.message_id) await this.bot.telegram.deleteMessage(chatId, sent.message_id).catch(() => {});
+      logger.warn({ filePath }, 'Telegram did not take the file as a sticker');
+      return null;
     } catch (error) {
+      if ((error?.code ?? error?.response?.error_code) === 429) throw error;
       logger.warn({ err: error?.message || String(error), filePath }, 'sendSticker rejected by Telegram');
-      return false;
+      return null;
     }
   }
 
@@ -923,14 +931,18 @@ export class TelegramBotAdapter {
     }
 
     if ('sticker' in msg) {
-      // Animated (.tgs) and video (.webm) stickers cannot be turned into an
-      // image here and reached MAX as unreadable files: send the sticker's
-      // static preview, or its emoji when it has none.
+      // The sticker file itself: .webp (static), .tgs (animated Lottie) or
+      // .webm (video). The bridge turns it into something MAX shows — a PNG
+      // or an animated GIF, transparency kept — and sends the emoji instead
+      // if that fails.
       const sticker = msg.sticker;
-      const preview = sticker.is_animated || sticker.is_video ? (sticker.thumbnail || sticker.thumb) : sticker;
-      if (!preview) return { ...base, type: MessageType.TEXT, text: sticker.emoji || '[sticker]' };
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, preview.file_id, 'sticker');
-      return { ...base, type: MessageType.STICKER, mediaPath };
+      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, sticker.file_id, 'sticker');
+      return {
+        ...base,
+        type: MessageType.STICKER,
+        mediaPath,
+        metadata: { ...base.metadata, stickerEmoji: sticker.emoji || null }
+      };
     }
 
     return null;

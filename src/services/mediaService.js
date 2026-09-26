@@ -150,10 +150,12 @@ export class MediaService {
     if (type === 'video_note') return this.convertVideo(inputPath, 'mp4');
     if (type === 'photo') return this.convertImage(inputPath, 'jpg');
     if (type === 'sticker') {
+      // PNG, not JPEG: a sticker is mostly transparency, which JPEG turned
+      // into a black square.
       try {
-        return await this.convertImage(inputPath, 'jpg');
+        return await this.convertImage(inputPath, 'png');
       } catch (error) {
-        logger.warn({ inputPath, error }, 'Sticker image conversion failed; sending original file');
+        logger.warn({ inputPath, err: error?.message || String(error) }, 'Sticker image conversion failed; sending original file');
         return inputPath;
       }
     }
@@ -191,7 +193,8 @@ export class MediaService {
 
     const image = sharp(inputPath, { animated: false }).rotate();
     if (targetExtension === 'jpg' || targetExtension === 'jpeg') {
-      await image.jpeg({ quality: 90 }).toFile(outputPath);
+      // JPEG has no alpha: without flattening, transparent pixels come out black.
+      await image.flatten({ background: '#ffffff' }).jpeg({ quality: 90 }).toFile(outputPath);
     } else if (targetExtension === 'png') {
       await image.png().toFile(outputPath);
     } else {
@@ -218,35 +221,88 @@ export class MediaService {
     return outputPath;
   }
 
+  // A static sticker the way Telegram's sendSticker wants it: WEBP, 512 px on
+  // the longer side, transparency kept — shown as a real sticker instead of a
+  // photo on a white (or black) background.
+  async toWebpSticker(inputPath) {
+    const outputPath = path.join(path.dirname(inputPath), `${path.basename(inputPath, path.extname(inputPath))}-tg-sticker.webp`);
+    await sharp(inputPath, { animated: false })
+      .resize(STICKER_SIDE, STICKER_SIDE, { fit: 'inside' })
+      .webp({ quality: 90, alphaQuality: 100 })
+      .toFile(outputPath);
+    return outputPath;
+  }
+
   // Encode a directory of PNG frames (frame-000.png …) into a Telegram video
-  // sticker: VP9 .webm, 512x512, <3s, no audio, transparent. Telegram requires
-  // VP9 alpha, which libvpx-vp9 only produces correctly with `-auto-alt-ref 0`
-  // — without it Telegram silently treats the upload as a plain document.
+  // sticker, within Telegram's limits for them: VP9 WEBM with alpha, 512 px
+  // on the longer side, at most 3 s, at most 30 fps, no audio, at most 256 KB.
+  // A longer animation is played faster rather than cut short. Telegram
+  // requires VP9 alpha, which libvpx-vp9 only produces correctly with
+  // `-auto-alt-ref 0` — without it the upload silently becomes a document.
+  // The frames are left in place: if Telegram refuses the sticker, the caller
+  // falls back to a GIF made from the same frames.
   async framesDirToWebmSticker(framesDir, fps = 20) {
+    const frameCount = (await fsp.readdir(framesDir)).filter((name) => /^frame-\d+\.png$/.test(name)).length;
+    if (frameCount < 2) throw new Error(`Not enough frames for a video sticker: ${frameCount}`);
+    let inputFps = Math.min(STICKER_MAX_FPS, Math.max(1, Number(fps) || 20));
+    if (frameCount / inputFps > STICKER_MAX_SECONDS) inputFps = frameCount / STICKER_MAX_SECONDS;
+    const durationSec = frameCount / inputFps;
     const outputPath = path.join(this.mediaDir, `sticker-${path.basename(framesDir)}.webm`);
-    const webmCommand = ffmpeg()
-      .input(path.join(framesDir, 'frame-%03d.png'))
-      .inputFPS(fps)
-      .videoCodec('libvpx-vp9')
-      .videoFilters('scale=512:512:flags=lanczos')
-      .outputOptions([
-        '-pix_fmt', 'yuva420p',
-        '-an',
-        '-auto-alt-ref', '0',
-        '-cpu-used', '5',
-        '-deadline', 'realtime'
-      ])
-      .videoBitrate('400k')
-      .format('webm');
-    const webmDone = runFfmpeg(webmCommand, 'framesDirToWebmSticker');
-    webmCommand.save(outputPath);
-    await webmDone;
-    // Frames are dropped only on success: on failure the caller falls back to
-    // sending frame-000.png from this directory (deleting it here made that
-    // fallback fail every time). A leftover directory is reclaimed by
-    // cleanupOlderThan (sticker-frames-* is one of its temp prefixes).
-    await fsp.rm(framesDir, { recursive: true, force: true }).catch(() => {});
-    logger.debug({ framesDir, outputPath }, 'Encoded animated sticker webm');
+
+    // Quality first, then a bitrate that fits 256 KB if the first pass is too big.
+    const attempts = [
+      ['-crf', '32', '-b:v', '0'],
+      ['-b:v', `${Math.floor((STICKER_MAX_BYTES * 8 * 0.9) / durationSec / 1000)}k`]
+    ];
+    for (const [index, rateOptions] of attempts.entries()) {
+      const webmCommand = ffmpeg()
+        .input(path.join(framesDir, 'frame-%03d.png'))
+        .inputFPS(inputFps)
+        .videoCodec('libvpx-vp9')
+        .videoFilters([
+          `scale=${STICKER_SIDE}:${STICKER_SIDE}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos`,
+          `fps=${Math.min(STICKER_MAX_FPS, Math.ceil(inputFps))}`
+        ])
+        .outputOptions([
+          '-pix_fmt', 'yuva420p',
+          '-an',
+          '-auto-alt-ref', '0',
+          '-cpu-used', '5',
+          '-deadline', 'realtime',
+          '-t', String(STICKER_MAX_SECONDS),
+          ...rateOptions
+        ])
+        .format('webm');
+      const webmDone = runFfmpeg(webmCommand, 'framesDirToWebmSticker');
+      webmCommand.save(outputPath);
+      await webmDone;
+      const { size } = await fsp.stat(outputPath);
+      logger.debug({ framesDir, outputPath, size, durationSec, pass: index + 1 }, 'Encoded animated sticker webm');
+      if (size <= STICKER_MAX_BYTES) return outputPath;
+    }
+    throw new Error(`Video sticker is larger than ${STICKER_MAX_BYTES} bytes even at a reduced bitrate`);
+  }
+
+  // Telegram's video sticker (VP9 WEBM with alpha) as an animated GIF with
+  // transparency, for MAX. The alpha channel is only decoded by libvpx, not by
+  // ffmpeg's native VP9 decoder, hence the explicit input codec.
+  async videoStickerToGif(inputPath, fps = 20) {
+    const outputPath = path.join(path.dirname(inputPath), `${path.basename(inputPath, path.extname(inputPath))}.gif`);
+    const gifCommand = ffmpeg()
+      .input(inputPath)
+      .inputOptions(['-c:v', 'libvpx-vp9'])
+      .complexFilter([
+        { filter: 'fps', options: String(fps), inputs: '0:v', outputs: 'timed' },
+        { filter: 'scale', options: `${STICKER_SIDE}:-2:flags=lanczos`, inputs: 'timed', outputs: 'scaled' },
+        { filter: 'split', inputs: 'scaled', outputs: ['s0', 's1'] },
+        { filter: 'palettegen', options: 'reserve_transparent=1', inputs: 's0', outputs: 'pal' },
+        { filter: 'paletteuse', options: 'alpha_threshold=128', inputs: ['s1', 'pal'], outputs: 'out' }
+      ], 'out')
+      .outputOptions(['-loop', '0'])
+      .format('gif');
+    const gifDone = runFfmpeg(gifCommand, 'videoStickerToGif');
+    gifCommand.save(outputPath);
+    await gifDone;
     return outputPath;
   }
 
@@ -323,6 +379,12 @@ export class MediaService {
       }));
   }
 }
+
+// Telegram's limits for stickers sent with sendSticker.
+const STICKER_SIDE = 512;
+const STICKER_MAX_SECONDS = 2.9; // "up to 3 seconds", with a margin
+const STICKER_MAX_FPS = 30;
+const STICKER_MAX_BYTES = 256 * 1024;
 
 // Hard cap on any single download. Media comes from remote sources (MAX's CDN
 // and Telegram) and lands on the container's small bind-mounted volume, which

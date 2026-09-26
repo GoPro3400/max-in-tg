@@ -425,16 +425,15 @@ describe('outbound message order', () => {
     expect(api.sendMessage).toHaveBeenCalledWith(OWNER_ID, expect.stringContaining('не пересылается'), expect.anything());
   });
 
-  it('sends the static preview of an animated sticker, or its emoji', async () => {
+  it('downloads the sticker file itself (tgs/webm/webp) and keeps its emoji as a fallback', async () => {
     const { adapter } = makeAdapter({ ownerId: OWNER_ID });
     adapter.mediaService = { telegramFileToLocal: vi.fn(async (ctx, fileId) => `/tmp/${fileId}`) };
     const delivered = [];
     adapter.onMessage(async (message) => { delivered.push(message); });
 
     await adapter.bot.handleUpdate(messageUpdate({ sticker: { file_id: 'tgs', is_animated: true, thumbnail: { file_id: 'thumb' }, emoji: '😀' } }));
-    await adapter.bot.handleUpdate(messageUpdate({ sticker: { file_id: 'webm', is_video: true, emoji: '🔥' } }));
 
-    expect(delivered[0]).toMatchObject({ type: 'sticker', mediaPath: '/tmp/thumb' });
-    expect(delivered[1]).toMatchObject({ type: 'text', text: '🔥' });
+    expect(adapter.mediaService.telegramFileToLocal).toHaveBeenCalledWith(expect.anything(), 'tgs', 'sticker');
+    expect(delivered[0]).toMatchObject({ type: 'sticker', mediaPath: '/tmp/tgs', metadata: { stickerEmoji: '😀' } });
   });
 });

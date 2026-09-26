@@ -13,7 +13,7 @@ export const TELEGRAM_REACTIONS = new Set([
 
 // The comparable core of an emoji: no variation selectors, no skin tones.
 export const normalizeEmoji = (emoji) => String(emoji ?? '')
-  .replace(/[︎️]/gu, '')
+  .replace(/[\uFE0E\uFE0F]/gu, '')
   .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '')
   .trim();
 

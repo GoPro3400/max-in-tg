@@ -5,7 +5,7 @@
 <p>
   <a href="https://github.com/GoPro3400/max-in-tg/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GoPro3400/max-in-tg/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-3DA639?style=for-the-badge" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/Node.js-20-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js 20" />
+  <img src="https://img.shields.io/badge/Node.js-22-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js 22" />
   <img src="https://img.shields.io/badge/Telegram-Bot_API-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram Bot API" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
 </p>
@@ -180,7 +180,7 @@ MAX Relay
 
 ### Поддерживаемые системы
 
-Бот целиком работает в Docker: образ собирается на `node:20-bookworm-slim`, и Chromium, Xvfb, ffmpeg и все нужные библиотеки устанавливаются внутри контейнера. Хостовая ОС изолирована от рантайма Docker'ом, поэтому почти не имеет значения.
+Бот целиком работает в Docker: образ собирается на `node:22-bookworm-slim`, и Chromium, Xvfb, ffmpeg и все нужные библиотеки устанавливаются внутри контейнера. Хостовая ОС изолирована от рантайма Docker'ом, поэтому почти не имеет значения.
 
 | Требование | Статус |
 |---|---|
@@ -192,7 +192,7 @@ MAX Relay
 | RAM | **Минимум 2 ГБ** (`mem_limit: 2048m`, `shm_size: 1gb`). На 1 ГБ сборка падает с `Killed` / `exit code: 137`: в контейнере компилируется better-sqlite3 и работает Chromium |
 | Диск | Минимум ~10 ГБ свободных под образ и данные |
 | Windows / macOS | Подходят для разработки и тестов через Docker Desktop; для прода рекомендован Linux-сервер (аптайм, ресурсы) |
-| Нативная установка без Docker | Возможна на Debian/Ubuntu (нужны Node 20, Chromium, Xvfb, ffmpeg), но это неофициальный путь — не поддерживается как основной сценарий |
+| Нативная установка без Docker | Возможна на Debian/Ubuntu (нужны Node 22, Chromium, Xvfb, ffmpeg), но это неофициальный путь — не поддерживается как основной сценарий |
 
 ### Шаг 1: Установка
 

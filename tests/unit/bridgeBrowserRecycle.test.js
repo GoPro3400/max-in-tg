@@ -62,6 +62,34 @@ describe('BridgeService planned browser recycle', () => {
       expect(telegramBot.sendOwnerText).not.toHaveBeenCalled();
     });
 
+    it('relaunches at once when the browser crashed or disconnected, however young', async () => {
+      const { bridge, maxClient } = recyclingBridge({
+        maxClient: makeFakeMaxClient({
+          isAlive: vi.fn(() => false),
+          getBrowserMemoryUsage: vi.fn(async () => ({ bytes: 100 * MB, processes: 1, method: 'pss' }))
+        })
+      });
+      bridge.browserStartedAt = Date.now() - 1 * MIN;
+
+      await expect(bridge.maybeRecycleBrowser()).resolves.toBe(true);
+
+      expect(maxClient.stop).toHaveBeenCalledTimes(1);
+      expect(maxClient.start).toHaveBeenCalledTimes(1);
+      expect(bridge.lastBrowserRecycle).toMatchObject({ tier: 'relaunch', reason: 'browser-gone', ok: true });
+    });
+
+    it('leaves a live browser alone', async () => {
+      const { bridge, maxClient } = recyclingBridge({
+        maxClient: makeFakeMaxClient({
+          isAlive: vi.fn(() => true),
+          getBrowserMemoryUsage: vi.fn(async () => ({ bytes: 100 * MB, processes: 1, method: 'pss' }))
+        })
+      });
+
+      await expect(bridge.maybeRecycleBrowser()).resolves.toBe(false);
+      expect(maxClient.stop).not.toHaveBeenCalled();
+    });
+
     it('recycles as soon as Chromium is above the memory limit', async () => {
       const { bridge, maxClient } = recyclingBridge();
       bridge.browserStartedAt = Date.now() - 40 * MIN;

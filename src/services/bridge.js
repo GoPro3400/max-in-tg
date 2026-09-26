@@ -239,6 +239,7 @@ export class BridgeService {
 
   async start() {
     this.restoreIdentity();
+    this.duplicateIdsSince = this.firstRunOf('duplicate_ids_since');
     this.bindTelegramHandlers();
     // Telegram comes up FIRST now: on a fresh install it is the channel that
     // carries the pairing code and the MAX sign-in QR, so nothing about MAX can
@@ -747,6 +748,12 @@ export class BridgeService {
     if (!this.browserStartedAt || !this.maxClient.page) return null;
 
     const ageMs = now - this.browserStartedAt;
+    // A browser that went away — crashed renderer, killed or disconnected
+    // Chromium — is replaced right away. Before, nothing noticed it until
+    // maxPollFailuresBeforeRestart polls in a row had failed.
+    if (typeof this.maxClient.isAlive === 'function' && this.maxClient.isAlive() === false) {
+      return { tier: 'relaunch', reason: 'browser-gone', ageMs, memory: this.lastBrowserMemory };
+    }
     const maxAgeMs = Math.max(0, this.config.browserRecycleMinutes || 0) * 60 * 1000;
     if (maxAgeMs > 0 && ageMs >= maxAgeMs) {
       return { tier: 'relaunch', reason: 'age', ageMs, memory: this.lastBrowserMemory };
@@ -819,7 +826,8 @@ export class BridgeService {
         if (!this.running || this.loginInProgress) return;
         logger.info(
           { tier, reason, ageMin: Math.round(ageMs / 60000), memoryMb: memory ? toMb(memory.bytes) : null },
-          tier === 'reload' ? 'Reloading the MAX page to release renderer memory' : 'Relaunching the MAX browser to release Chromium memory'
+          tier === 'reload' ? 'Reloading the MAX page to release renderer memory'
+            : (reason === 'browser-gone' ? 'Relaunching the MAX browser: it crashed or lost its connection' : 'Relaunching the MAX browser to release Chromium memory')
         );
         if (tier === 'reload' && typeof this.maxClient.reloadPage === 'function') {
           try {
@@ -991,7 +999,7 @@ export class BridgeService {
           // Stop at the first message that cannot go out while Telegram's
           // flood control lasts, so the rest of the chat keeps its order.
           if (this.telegramPaused()) break;
-          if (backlog.has(message.id)) {
+          if (backlog.has(message.id) || this.isOldDuplicate(message)) {
             this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
             continue;
           }
@@ -1073,6 +1081,28 @@ export class BridgeService {
         await this.ensureMaxLogin({ reason: 'session-expired' });
       }
     }
+  }
+
+  // When this installation first ran a version with `key`'s behaviour —
+  // remembered in the settings, so it stays the same across restarts.
+  firstRunOf(key) {
+    const stored = Number(this.db.getSetting(key, '')) || 0;
+    if (stored) return stored;
+    const now = Date.now();
+    this.db.setSetting(key, String(now));
+    return now;
+  }
+
+  // A second identical bubble (same sender, minute and text) used to be taken
+  // for the first and dropped; it now has its own id ("#dN", see
+  // scrapeMessageRows). Those whose first copy was delivered before that
+  // change are old news — they must not all arrive at once after the update.
+  isOldDuplicate(message) {
+    if (!this.duplicateIdsSince) return false;
+    const match = /#d\d+$/.exec(message.sourceMessageId || '');
+    if (!match) return false;
+    const first = this.db.getMessage(stableId('max', message.chatId, message.sourceMessageId.slice(0, match.index)));
+    return Boolean(first && first.createdAt < this.duplicateIdsSince);
   }
 
   // Old history MAX shows in a chat the database knows nothing about, on a

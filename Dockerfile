@@ -1,4 +1,5 @@
-FROM node:20-bookworm-slim
+# Node 22 LTS: Node 20 reached end of life in April 2026 (no security fixes).
+FROM node:22-bookworm-slim
 
 ENV NODE_ENV=production
 ENV PUPPETEER_SKIP_DOWNLOAD=true
@@ -37,10 +38,13 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY . .
+# Only the data directories belong to the runtime user. `chown -R /app` used
+# to copy all of node_modules into one more layer (doubling the image) and
+# let the bridge rewrite its own code.
 RUN groupadd --system --gid 10001 app \
   && useradd --system --uid 10001 --gid app --home-dir /app app \
   && mkdir -p /app/data /app/tmp/media /app/logs \
-  && chown -R app:app /app
+  && chown -R app:app /app/data /app/tmp /app/logs
 
 USER app
 

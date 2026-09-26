@@ -5,7 +5,7 @@
 <p>
   <a href="https://github.com/GoPro3400/max-in-tg/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GoPro3400/max-in-tg/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-3DA639?style=for-the-badge" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/Node.js-20-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js 20" />
+  <img src="https://img.shields.io/badge/Node.js-22-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js 22" />
   <img src="https://img.shields.io/badge/Telegram-Bot_API-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram Bot API" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
 </p>
@@ -133,7 +133,7 @@ MAX Relay
 
 | Компонент | Технология |
 |-----------|-----------|
-| Runtime | Node.js 20 (ESM) — образ и CI собираются на Node 20 |
+| Runtime | Node.js 22 (ESM) — образ и CI собираются на Node 22 |
 | Telegram | Telegraf 4.x |
 | Browser automation | Puppeteer 24 + stealth plugin (его задача — не дать веб-клиенту MAX распознать автоматизацию) |
 | Database | better-sqlite3 |
@@ -164,7 +164,7 @@ MAX Relay
 
 ### Поддерживаемые системы
 
-Проект полностью работает в Docker (`node:20-bookworm-slim` внутри контейнера — Chromium, Xvfb, ffmpeg и все библиотеки уже установлены в образе), поэтому хостовая ОС практически не влияет на работу бота.
+Проект полностью работает в Docker (`node:22-bookworm-slim` внутри контейнера — Chromium, Xvfb, ffmpeg и все библиотеки уже установлены в образе), поэтому хостовая ОС практически не влияет на работу бота.
 
 | Требование | Статус |
 |---|---|
@@ -175,7 +175,7 @@ MAX Relay
 | RAM | **Минимум 2 ГБ** (`mem_limit: 2048m`, `shm_size: 1gb`). На 1 ГБ сборка падает с `Killed` / `exit code: 137`: в контейнере компилируется better-sqlite3 и работает Chromium |
 | Диск | Минимум ~10 ГБ свободных под образ и данные |
 | Windows / macOS | Подходят для разработки/тестов через Docker Desktop; для продакшена рекомендуется Linux-сервер |
-| Без Docker (нативная установка) | Технически возможна на Debian/Ubuntu (Node 20, Chromium, Xvfb, ffmpeg), но это неофициальный путь — поддерживается только через Docker |
+| Без Docker (нативная установка) | Технически возможна на Debian/Ubuntu (Node 22, Chromium, Xvfb, ffmpeg), но это неофициальный путь — поддерживается только через Docker |
 
 ### 1. Установка
 

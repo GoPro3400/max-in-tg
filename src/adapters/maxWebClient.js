@@ -188,6 +188,16 @@ export class MaxWebClient {
     });
 
     this.page = await this.browser.newPage();
+    // A crashed renderer ("Page crashed!") leaves a page object on which every
+    // later call fails or hangs; isAlive() reports it so the bridge relaunches
+    // the browser at once instead of after several failed polls.
+    this.pageCrashed = false;
+    const page = this.page;
+    page.on('error', (error) => {
+      if (this.page !== page) return;
+      this.pageCrashed = true;
+      logger.error({ err: error?.message || String(error) }, 'MAX page crashed');
+    });
     // Before the first navigation, so it is in place for every load (reloads
     // included) — see STATIC_ANIMOJI_SCRIPT.
     if (this.config.staticAnimoji !== false) {
@@ -691,7 +701,7 @@ export class MaxWebClient {
         return Boolean(glyph) && glyph.parentElement !== big;
       };
       // --- End of the shared part. ---
-      const pictographic = /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u;
+      const pictographic = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20E3/u;
       const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
       const emojiIn = (value) => (segmenter ? [...segmenter.segment(value || '')].map((part) => part.segment) : Array.from(value || ''))
         .filter((grapheme) => pictographic.test(grapheme));
@@ -776,7 +786,7 @@ export class MaxWebClient {
         return { emoji, count: parseCount(counter), active, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
       };
 
-      return nodes.map((node, index) => {
+      const rows = nodes.map((node, index) => {
         // Detect reply quote: present only on reply bubbles as a direct child .link
         const bubbleContent = node.querySelector('.bubbleContent') || node;
         const replyLink = bubbleContent.querySelector(':scope > .link') || node.querySelector('.bubbleContent > .link');
@@ -933,6 +943,27 @@ export class MaxWebClient {
           _htmlSnippet: node.innerHTML.substring(0, 200)
         };
       });
+
+      // Bubbles whose content gives them the same id — two "ок" from the same
+      // person in the same minute — are numbered in page order, the first
+      // keeping the plain id. The second used to be dropped as the same
+      // message. Voice messages keep their own "#vN" numbering.
+      const voiceCounts = new Map();
+      const sameCounts = new Map();
+      for (const row of rows) {
+        if (row.rawId.startsWith('visible-')) continue;
+        if (!row.outgoing && (row.hasVoiceElement || row.hasRoundVideoElement || row.hasDuration)) {
+          const n = (voiceCounts.get(row.rawId) || 0) + 1;
+          voiceCounts.set(row.rawId, n);
+          if (n > 1) row.rawId = `${row.rawId}#v${n}`;
+          continue;
+        }
+        const key = `${row.outgoing ? 'out' : 'in'}\u0000${row.rawId}`;
+        const n = (sameCounts.get(key) || 0) + 1;
+        sameCounts.set(key, n);
+        if (n > 1) row.rawId = `${row.rawId}#d${n}`;
+      }
+      return rows;
     }, selectors, DOCUMENT_LINK_FALLBACK_SELECTOR, BUBBLE_DECOR);
   }
 
@@ -1000,18 +1031,8 @@ export class MaxWebClient {
 
     logger.trace({ chatId, rawCount: rawMessages.length, selector: selectors.messageItem }, 'readMessages raw');
 
-    // Disambiguate voice messages that share the same rawId (same time, no text/media).
-    // Append #vN suffix so uniqueMessages() doesn't collapse them into one entry.
-    const voiceIdCounts = new Map();
-    for (const msg of rawMessages) {
-      if (msg.outgoing) continue;
-      if (!(msg.hasVoiceElement || msg.hasRoundVideoElement || msg.hasDuration)) continue;
-      if (msg.rawId.startsWith('visible-')) continue;
-      const base = msg.rawId;
-      const n = (voiceIdCounts.get(base) || 0) + 1;
-      voiceIdCounts.set(base, n);
-      if (n > 1) msg.rawId = `${base}#v${n}`;
-    }
+    // Bubbles sharing an id are already numbered by scrapeMessageRows ("#vN"
+    // for voice messages, "#dN" otherwise), so uniqueMessages() keeps them all.
     // Kept for readReactions, which the bridge calls right after this.
     this.lastReactionScan = { chatId: this.activeChatId || chatId, at: Date.now(), rows: rawMessages.map(reactionRowOf) };
 
@@ -1450,76 +1471,20 @@ export class MaxWebClient {
   // src can lazy-swap resolution (fn=w_180 -> fn=w_1280) between when it was
   // first read and when we search for it again — the token stays stable.
   async findAndHoverMessage(fingerprint) {
-    const selectors = this.selectors;
+    // The unstable index fallback can never be found again (see scrapeMessageRows).
+    if (!fingerprint || fingerprint.startsWith('visible-')) return null;
     const maxScrollAttempts = 8;
     const mediaTokenPrefix = 'media-token:';
     const mediaToken = fingerprint.startsWith(mediaTokenPrefix) ? fingerprint.slice(mediaTokenPrefix.length) : null;
     for (let attempt = 0; attempt <= maxScrollAttempts; attempt++) {
-      const box = await this.page.evaluate((sel, innerSelectors, target, tokenTarget, docLinkFallbackSelector, decor) => {
-        const extractToken = (url) => {
-          const m = /[?&]r=([^&]+)/.exec(url || '');
-          return m ? m[1] : null;
-        };
-        // --- Shared with scrapeMessageRows: keep the two in step. ---
-        const safeClosest = (el, sel) => {
-          try { return sel && el ? el.closest(sel) : null; } catch { return null; }
-        };
-        const safeAll = (root, sel) => {
-          try { return sel && root ? [...root.querySelectorAll(sel)] : []; } catch { return []; }
-        };
-        const isDecor = (el) => Boolean(safeClosest(el, decor.graphics) || safeClosest(el, decor.bigEmoji)
-          || safeClosest(el, innerSelectors.messageReactions));
-        const isAnimojiStandIn = (el) => {
-          if (safeClosest(el, innerSelectors.messageReactions)) return true;
-          const big = safeClosest(el, decor.bigEmoji);
-          const glyph = big && safeClosest(el, decor.graphics);
-          return Boolean(glyph) && glyph.parentElement !== big;
-        };
-        // --- End of the shared part. ---
-        const nodes = [...document.querySelectorAll(sel)];
-        for (let i = nodes.length - 1; i >= 0; i--) {
-          const node = nodes[i];
-          const bubbleContent = node.querySelector('.bubbleContent') || node;
-          const replyLink = bubbleContent.querySelector(':scope > .link') || node.querySelector('.bubbleContent > .link');
-          const inQuote = (el) => Boolean(el && replyLink && replyLink.contains(el));
-          const ownEl = (el) => (inQuote(el) ? null : el);
-          const documentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
-            || ownEl(node.querySelector(docLinkFallbackSelector));
-          const documentUrl = documentLink?.href || '';
-
-          if (tokenTarget) {
-            // The bubble's own media — never an emoji picture — by its CDN token.
-            const contentSrc = (s) => safeAll(node, s).find((el) => !inQuote(el) && !isDecor(el))?.src || '';
-            const mediaUrl = contentSrc('img') || contentSrc('audio') || contentSrc('video')
-              || contentSrc('source[type="video"], source[type="webm"]') || documentUrl;
-            if (mediaUrl && extractToken(mediaUrl) === tokenTarget) {
-              const r = node.getBoundingClientRect();
-              return { x: r.x, y: r.y, w: r.width, h: r.height };
-            }
-            continue;
-          }
-
-          // The same id scrapeMessageRows gives the bubble.
-          let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
-          if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
-          const text = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
-          const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
-          const timeNode = node.querySelector(innerSelectors.messageTime);
-          const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
-          const legacySrc = (s) => ownEl(node.querySelector(s))?.src || '';
-          const fingerprintImg = ownEl(safeAll(node, 'img').find((el) => !isAnimojiStandIn(el)) || null);
-          const mediaUrl = (fingerprintImg?.src || '') || legacySrc('audio')
-            || legacySrc('video') || legacySrc('source[type="video"], source[type="webm"]') || documentUrl || '';
-          const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
-          const fallbackId = [author, time, text, mediaUrl].filter(Boolean).join('|');
-          const rawId = explicitId || fallbackId;
-          if (rawId && rawId === target) {
-            const r = node.getBoundingClientRect();
-            return { x: r.x, y: r.y, w: r.width, h: r.height };
-          }
-        }
-        return null;
-      }, selectors.messageItem, selectors, fingerprint, mediaToken, DOCUMENT_LINK_FALLBACK_SELECTOR, BUBBLE_DECOR);
+      // The same scrape readMessages uses, so a bubble is found under exactly
+      // the id it was given (numbering of identical bubbles included) — the
+      // two used to compute it separately and drift apart.
+      const rows = await this.scrapeMessageRows();
+      const row = [...rows].reverse().find((candidate) => (mediaToken
+        ? mediaTokenOf(candidate.mediaUrl) === mediaToken
+        : candidate.rawId === fingerprint));
+      const box = row?.box;
 
       if (box) {
         const cx = box.x + box.w / 2;
@@ -1730,11 +1695,11 @@ export class MaxWebClient {
   // menu. Resolves to { found, clicked, emoji, available }.
   async clickReactionOption(wanted) {
     return this.page.evaluate((sel, target) => {
-      const pictographic = /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u;
+      const pictographic = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20E3/u;
       const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
       const emojiIn = (value) => (segmenter ? [...segmenter.segment(value || '')].map((part) => part.segment) : Array.from(value || ''))
         .filter((grapheme) => pictographic.test(grapheme));
-      const normalize = (value) => String(value || '').replace(/[︎️]/gu, '').replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
+      const normalize = (value) => String(value || '').replace(/[\uFE0E\uFE0F]/gu, '').replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
       let elements = [];
       try {
         elements = [...document.querySelectorAll(sel)];
@@ -1819,6 +1784,7 @@ export class MaxWebClient {
 
   async sendText(chatId, text, replyToFingerprint = null) {
     await this.ensureActiveChat(chatId);
+    await this.clearComposer();
     if (replyToFingerprint) {
       const replied = await this.replyToMessage(replyToFingerprint);
       logger.debug({ chatId, replyToFingerprint, replied }, 'sendText: reply engagement result');
@@ -1838,6 +1804,11 @@ export class MaxWebClient {
       await this.typeIntoComposer(text, { timeoutMs: this.config.protocolTimeoutMs || 60000 });
       await this.submitComposer();
     } catch (error) {
+      // Whatever was typed stays in the composer as the chat's draft and went
+      // out together with the next message into this chat.
+      await this.clearComposer().catch((clearError) => {
+        logger.warn({ err: clearError, chatId }, 'sendText: could not clear the composer after a failed send');
+      });
       if (replyToFingerprint) {
         // A throw anywhere after reply mode was engaged would otherwise leave
         // the shared composer stuck in reply-to-X mode forever — there is no
@@ -1856,6 +1827,27 @@ export class MaxWebClient {
         await this.scrollMessageListToBottom();
       }
     }
+  }
+
+  // Empties the composer. MAX keeps whatever is typed as the chat's draft, so
+  // the remains of a send that failed half-way used to be sent along with the
+  // next message into that chat (or as the caption of the next file).
+  async clearComposer() {
+    const hasContent = await this.page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return Boolean(el && ((el.textContent || '').trim() || el.querySelector('img, [data-lexical-decorator]')));
+    }, this.selectors.composer).catch(() => false);
+    if (!hasContent) return;
+    await this.page.focus(this.selectors.composer);
+    const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+    await this.page.keyboard.down(modifier);
+    try {
+      await this.page.keyboard.press('KeyA');
+    } finally {
+      await this.page.keyboard.up(modifier);
+    }
+    await this.page.keyboard.press('Backspace');
+    logger.info('Cleared text left over in the MAX composer');
   }
 
   // Types a message into the focused composer. Puppeteer's keyboard.type maps
@@ -1893,6 +1885,8 @@ export class MaxWebClient {
   // in, so the bridge sends a caption as a separate text message.
   async sendFile(chatId, filePath) {
     await this.ensureActiveChat(chatId);
+    // Text left in the composer would go out as the file's caption.
+    await this.clearComposer();
 
     const absolutePath = path.resolve(filePath);
 
@@ -2459,7 +2453,7 @@ export class MaxWebClient {
   // relaunch). A crashed renderer can leave both looking alive, so callers
   // that must notice that also count failing page calls.
   isAlive() {
-    return Boolean(this.browser?.connected && this.page && !this.page.isClosed?.());
+    return Boolean(this.browser?.connected && this.page && !this.page.isClosed?.() && !this.pageCrashed);
   }
 
   // Memory held by the whole Chromium process tree (see measureProcessTreeMemory):
@@ -2646,6 +2640,13 @@ const normalizeEmojiInPage = (emoji) => String(emoji ?? '')
   .replace(/[\uFE0E\uFE0F]/gu, '')
   .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '')
   .trim();
+
+// The CDN identity of a MAX media URL (its r= parameter): the same for every
+// size of a picture, and across the re-signing of URLs on page loads.
+const mediaTokenOf = (url) => {
+  const match = /[?&]r=([^&]+)/.exec(url || '');
+  return match ? match[1] : null;
+};
 
 const normalizeMaxType = (type) => {
   if (Object.values(MessageType).includes(type)) return type;

@@ -5,7 +5,7 @@
 <p>
   <a href="https://github.com/GoPro3400/max-in-tg/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GoPro3400/max-in-tg/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-3DA639?style=for-the-badge" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/Node.js-20-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js 20" />
+  <img src="https://img.shields.io/badge/Node.js-22-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js 22" />
   <img src="https://img.shields.io/badge/Telegram-Bot_API-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram Bot API" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
 </p>
@@ -178,7 +178,7 @@ MAX Relay
 
 ### Supported Systems
 
-The bot runs entirely in Docker: the image is built from `node:20-bookworm-slim`, with Chromium, Xvfb, ffmpeg and all required libraries installed inside the container. Docker isolates the runtime from the host OS, so the host barely matters.
+The bot runs entirely in Docker: the image is built from `node:22-bookworm-slim`, with Chromium, Xvfb, ffmpeg and all required libraries installed inside the container. Docker isolates the runtime from the host OS, so the host barely matters.
 
 | Requirement | Status |
 |---|---|
@@ -190,7 +190,7 @@ The bot runs entirely in Docker: the image is built from `node:20-bookworm-slim`
 | RAM | **2 GB minimum** (`mem_limit: 2048m`, `shm_size: 1gb`). On 1 GB the build dies with `Killed` / `exit code: 137` — better-sqlite3 is compiled inside the container and Chromium runs there |
 | Disk | ~10 GB free, minimum, for the image and data |
 | Windows / macOS | Fine for development/testing via Docker Desktop; a Linux server is recommended for production (uptime, resources) |
-| Native install without Docker | Possible on Debian/Ubuntu (needs Node 20, Chromium, Xvfb, ffmpeg), but this is not the officially supported path |
+| Native install without Docker | Possible on Debian/Ubuntu (needs Node 22, Chromium, Xvfb, ffmpeg), but this is not the officially supported path |
 
 ### Step 1: Install
 

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { MessageType, humanMessage, stableId } from '../domain/messages.js';
@@ -106,6 +107,14 @@ const TYPING_REPEAT_MS = 4000;
 
 const PLACEHOLDER_CHAT_TITLES = new Set(['Чат не найден', 'Chat not found']);
 
+// /new: how long a list of what MAX found stays usable, and how many of its
+// entries are offered.
+const NEW_CHAT_SESSION_MS = 10 * 60 * 1000;
+const NEW_CHAT_CHOICES = 8;
+const NEW_CHAT_USAGE = 'Как начать новый чат в MAX: /new <имя или номер телефона>, например\n'
+  + '/new Иван Петров\n/new +7 999 123-45-67\n'
+  + 'Бот покажет, что нашлось, и откроет чат только после выбора. Ничего никому не отправляется.';
+
 // How long after a chat's first read with the time in its ids (or after it
 // was renamed) the ids its bubbles had before still count (legacyWindowOpen).
 const LEGACY_ID_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
@@ -142,6 +151,32 @@ const formatBytes = (bytes) => {
     unit += 1;
   }
   return `${value.toFixed(unit ? 1 : 0).replace('.', ',')} ${units[unit]}`;
+};
+
+// A phone number as MAX's "Найти по номеру" wants it: +<country><number>.
+// "8 999 …", "7999…" and a ten-digit "999…" are Russian numbers. null when
+// the query is not a phone number (a name).
+export const phoneQuery = (query) => {
+  const compact = String(query || '').replace(/[\s()\-.]/g, '');
+  if (!/^\+?\d{10,15}$/.test(compact)) return null;
+  const digits = compact.replace(/^\+/, '');
+  if (!compact.startsWith('+')) {
+    if (digits.length === 11 && /^[78]/.test(digits)) return `+7${digits.slice(1)}`;
+    if (digits.length === 10 && digits.startsWith('9')) return `+7${digits}`;
+  }
+  return `+${digits}`;
+};
+
+const formatPhone = (phone) => {
+  const russian = /^\+7(\d{3})(\d{3})(\d{2})(\d{2})$/.exec(phone || '');
+  return russian ? `+7 ${russian[1]} ${russian[2]}-${russian[3]}-${russian[4]}` : phone;
+};
+
+// A link to a topic of the relay group (a supergroup: its id is -100…).
+const topicLink = (mapping) => {
+  const chatId = String(mapping?.telegramChatId ?? '');
+  if (!mapping?.telegramThreadId || !/^-100\d+$/.test(chatId)) return null;
+  return `https://t.me/c/${chatId.slice(4)}/${mapping.telegramThreadId}`;
 };
 
 // Whether a record made at `timestamp` belongs to a bubble showing the time
@@ -244,11 +279,17 @@ export class BridgeService {
     this.pendingSeenCounts = new Map();
     this.lastTypingScanAt = 0;
     this.typingSentAt = new Map();
+    // /new: what MAX's search found, until the owner picks one (by id).
+    this.newChatSessions = new Map();
     // Muted MAX chats (/mute): excluded from polling entirely, and anything
     // that still reaches forwardMaxMessage from them is consumed without being
     // sent to Telegram. In-memory mirror of db.listMutedChatIds(); the
     // optional call keeps lightweight test fakes without the method working.
     this.mutedChatIds = new Set(this.db.listMutedChatIds ? this.db.listMutedChatIds() : []);
+    // The MAX client can open a chat MAX does not list (a new one) by its id.
+    for (const { key, value } of this.db.listSettings?.('max_chat:') || []) {
+      if (value) this.maxClient.rememberChatId?.(value, key.slice('max_chat:'.length));
+    }
     // True while the QR sign-in flow owns the MAX page: polling steps aside so
     // it does not spam failures against a logged-out page (and so the failure
     // counter does not trigger a pointless browser restart mid-login).
@@ -398,6 +439,8 @@ export class BridgeService {
     this.telegramBot.onUnmerge((sourceName) => this.unmergeChat(sourceName));
     this.telegramBot.onMute((chatName) => this.muteChat(chatName));
     this.telegramBot.onUnmute((chatName) => this.unmuteChat(chatName));
+    this.telegramBot.onNewChat?.((query) => this.startNewChat(query));
+    this.telegramBot.onNewChatChoice?.((sessionId, choice) => this.chooseNewChat(sessionId, choice));
     this.telegramBot.onLogin(() => this.requestLogin());
     this.telegramBot.onIdentityDiscovered((identity) => this.persistIdentity(identity));
     this.telegramBot.onRelayLost?.((chatId, reason) => this.handleRelayLost(chatId, reason));
@@ -1172,6 +1215,129 @@ export class BridgeService {
     }
   }
 
+  // /new <имя или номер>: what MAX's search finds, for the owner to pick
+  // from (a chat opens only on their choice, and nothing is sent to anyone).
+  // { text, choices: [{ label, data }] }.
+  async startNewChat(rawQuery) {
+    const query = String(rawQuery || '').replace(/\s+/g, ' ').trim();
+    if (!query) return { text: NEW_CHAT_USAGE };
+    if (await this.maxSessionState() !== 'ready') return { text: '⏳ MAX не подключён — сначала /login.' };
+    const phone = phoneQuery(query);
+    let found;
+    try {
+      found = await this.maxLock.run(() => this.maxClient.searchChats(phone || query));
+    } catch (error) {
+      logger.warn({ err: error?.message }, '/new: MAX search failed');
+      return { text: `⚠️ Поиск в MAX не удался: ${error.message}` };
+    }
+    // For a number, only MAX's own "Найти по номеру" is that number's owner.
+    const candidates = found.filter((candidate) => (phone ? candidate.kind === 'phone' : candidate.kind !== 'phone'))
+      .slice(0, NEW_CHAT_CHOICES);
+    if (!candidates.length) {
+      return {
+        text: phone
+          ? `MAX не предлагает искать по номеру ${formatPhone(phone)} — нужен полный номер с кодом страны, например +7 999 123-45-67.`
+          : `В MAX ничего не нашлось по «${query}».`
+      };
+    }
+    const id = randomBytes(6).toString('base64url');
+    this.pruneNewChatSessions();
+    this.newChatSessions.set(id, { query: phone || query, phone, candidates, createdAt: Date.now() });
+    const label = (candidate) => {
+      if (candidate.kind === 'phone') return `📞 ${formatPhone(phone)} — найти в MAX`;
+      const hasTopic = candidate.kind === 'chat' && this.db.getChatMapping(candidate.title);
+      const text = candidate.kind === 'chat'
+        ? `💬 ${candidate.title}${hasTopic ? ' (тема уже есть)' : ''}`
+        : `👤 ${candidate.title}${candidate.hint ? ` · ${candidate.hint}` : ''}`;
+      return text.length > 60 ? `${text.slice(0, 59)}…` : text;
+    };
+    return {
+      text: phone
+        ? `Найти в MAX человека с номером ${formatPhone(phone)} и начать с ним чат? (Ничего не отправляется.)`
+        : `Что нашлось в MAX по «${query}» — выбери, с кем начать чат (ничего не отправляется):`,
+      choices: [
+        ...candidates.map((candidate, index) => ({ label: label(candidate), data: `new:${id}:${index}` })),
+        { label: 'Отмена', data: `new:${id}:x` }
+      ]
+    };
+  }
+
+  // The owner's pick from startNewChat: opens that chat in MAX (checking it
+  // is the one picked) and gives it a topic. Returns what to tell them.
+  async chooseNewChat(sessionId, choice) {
+    const session = this.newChatSessions.get(sessionId);
+    this.newChatSessions.delete(sessionId);
+    if (!session || Date.now() - session.createdAt > NEW_CHAT_SESSION_MS) return 'Этот поиск устарел — пришли /new ещё раз.';
+    if (choice === 'x') return 'Отменено — ничего не создано.';
+    const candidate = session.candidates[Number(choice)];
+    if (!candidate) return 'Нет такого варианта — пришли /new ещё раз.';
+    if (await this.maxSessionState() !== 'ready') return '⏳ MAX не подключён — сначала /login.';
+
+    let opened;
+    let messages = [];
+    try {
+      opened = await this.maxLock.run(async () => {
+        const result = await this.maxClient.openSearchResult(session.query, candidate);
+        // What it already shows is history: recorded below, not delivered
+        // (and nothing is fetched for it).
+        messages = await this.maxClient.readMessages(result.title, { isKnown: () => true }).catch(() => []);
+        return result;
+      });
+    } catch (error) {
+      logger.warn({ err: error?.message, kind: candidate.kind }, '/new: could not open the chat in MAX');
+      return `⚠️ ${error.message}`;
+    }
+
+    const chat = { id: opened.title, title: opened.title };
+    // Chats are known by their names here: another chat of MAX with the same
+    // name would share its topic (and the owner's replies would go to either).
+    const namesake = (this.db.listSettings?.('max_chat:') || [])
+      .find(({ key, value }) => value === chat.id && key !== `max_chat:${opened.maxId}`);
+    if (namesake) {
+      return `⚠️ В MAX есть и другой чат с именем «${chat.title}» — мост различает чаты по имени, и переписка двух чатов смешалась бы в одной теме. `
+        + 'Переименуй один из них в MAX (например, контакт) и повтори /new.';
+    }
+    if (!this.db.listChats().some((item) => item.id === chat.id)) {
+      this.db.upsertChat({ id: chat.id, title: chat.title, lastSeenAt: Date.now(), metadata: { unread: false, startedWithNew: true } });
+    }
+    // Its id in MAX: MAX does not list a chat without messages, so it is
+    // opened by its id until it does (and a renamed chat is recognised).
+    await this.noteMaxChatId(chat);
+    for (const message of messages) {
+      if (this.db.hasMessage(message.id) || this.adoptLegacyId(message)) continue;
+      this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
+    }
+    if (!this.chatOnTimedIds(chat.id)) this.db.setSetting(`timed_ids:${chat.id}`, String(Date.now()));
+
+    const before = this.db.getChatMapping(chat.id);
+    const mapping = await this.ensureMapping(chat, { createTopics: true });
+    if (!mapping) {
+      return `⚠️ Чат «${chat.title}» открыт в MAX, но тему в Telegram создать не удалось`
+        + `${this.topicCreationBlockedReason ? `: ${this.topicCreationBlockedReason}` : ''}. Проверь /status.`;
+    }
+    const link = topicLink(mapping);
+    const reused = before && before.telegramChatId === mapping.telegramChatId && before.telegramThreadId === mapping.telegramThreadId;
+    logger.info({ byPhone: Boolean(session.phone), reused: Boolean(reused), kind: candidate.kind }, 'Started a MAX chat from Telegram (/new)');
+    if (!this.requiresTelegramTopic()) {
+      // Without topics the owner's messages go to the selected chat.
+      this.db.selectChat(chat.id);
+      return `✅ Чат с «${chat.title}» открыт в MAX и выбран — твои сообщения пойдут туда (сменить: /select).`;
+    }
+    if (reused) return `💬 С «${chat.title}» тема уже есть${link ? `: ${link}` : ''} — пиши туда.`;
+    if (session.phone) {
+      await this.telegramBot.sendText(`📞 ${formatPhone(session.phone)} — этот чат начат по номеру телефона.`, mapping).catch(() => null);
+    }
+    return `✅ Чат с «${chat.title}» готов${link ? `: ${link}` : ''}. Пиши в эту тему — сообщения уйдут в MAX.`;
+  }
+
+  pruneNewChatSessions(now = Date.now()) {
+    for (const [id, session] of this.newChatSessions) {
+      if (now - session.createdAt > NEW_CHAT_SESSION_MS) this.newChatSessions.delete(id);
+    }
+    // Never more than a handful waiting: the oldest go first.
+    while (this.newChatSessions.size >= 20) this.newChatSessions.delete(this.newChatSessions.keys().next().value);
+  }
+
   // Someone typing in MAX shows as "typing…" (or "recording a voice
   // message"…) in that chat's topic. Read from MAX's chat list, so no chat is
   // opened for it; only chats that already have a Telegram route.
@@ -1272,6 +1438,7 @@ export class BridgeService {
       }
     }
     this.db.setSetting(key, chat.id);
+    this.maxClient.rememberChatId?.(chat.id, maxId);
     return Boolean(known);
   }
 
@@ -1322,6 +1489,7 @@ export class BridgeService {
       });
     });
     if (muted) this.mutedChatIds.add(chat.id);
+    this.maxClient.rememberChatId?.(oldChatId, null);
     if (!oldMapping) return true;
 
     if (!mergedInto) {

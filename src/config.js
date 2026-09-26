@@ -124,6 +124,15 @@ export const config = {
       // shows it there in place of the last message, for any chat).
       typing: process.env.MAX_SELECTORS_TYPING || 'h2#main-header-title + .header .subtitle .typing, main .header .subtitle .typing',
       chatTyping: process.env.MAX_SELECTORS_CHAT_TYPING || '.typing',
+      // /new: the search above the chat list, its results, the button that
+      // clears it, the tab of all chats (after a search by phone number MAX
+      // shows its contacts instead), and the title of a window MAX opens
+      // ("Не нашли номер …").
+      searchInput: process.env.MAX_SELECTORS_SEARCH_INPUT || 'aside[aria-labelledby="aside-header-title"] .search input.field, aside input[placeholder="Найти"], aside input[placeholder="Search"]',
+      searchResults: process.env.MAX_SELECTORS_SEARCH_RESULTS || 'aside .searchResultsList',
+      searchClear: process.env.MAX_SELECTORS_SEARCH_CLEAR || 'aside .search button[aria-label="Очистить"], aside .search button[aria-label="Clear"]',
+      chatsTab: process.env.MAX_SELECTORS_CHATS_TAB || 'nav [aria-labelledby*="-all-folder-title"], nav[aria-label="Папки и профиль"] .foldersViewport .item button',
+      modalTitle: process.env.MAX_SELECTORS_MODAL_TITLE || 'dialog[data-testid="modal"][open] #modalHeaderTitle',
       // Attachment staging: elements that appear in the composer preview area
       // after a file has been accepted by the file-chooser. If any of these are
       // present the attachment has been staged and the send button can be clicked.

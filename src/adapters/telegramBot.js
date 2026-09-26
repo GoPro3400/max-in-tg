@@ -52,6 +52,7 @@ export class TelegramBotAdapter {
     const commands = [
       { command: 'status', description: 'Состояние моста' },
       { command: 'chats', description: 'Список чатов MAX и маршрутов' },
+      { command: 'new', description: 'Начать чат в MAX: /new <имя или номер>' },
       { command: 'login', description: 'Прислать QR для входа в MAX' },
       { command: 'relay', description: 'Сделать эту группу местом для чатов MAX' },
       { command: 'sync', description: 'Обновить чаты и темы' },
@@ -159,6 +160,16 @@ export class TelegramBotAdapter {
 
   onMute(handler) {
     this.onMuteRequested = handler;
+  }
+
+  // /new <query>: returns { text, choices: [{ label, data }] }.
+  onNewChat(handler) {
+    this.onNewChatRequested = handler;
+  }
+
+  // A button under /new's answer: (sessionId, choice) → text.
+  onNewChatChoice(handler) {
+    this.onNewChatChosen = handler;
   }
 
   onUnmute(handler) {
@@ -525,6 +536,7 @@ export class TelegramBotAdapter {
       '/check - run Max Web selector healthcheck',
       '/diagnostics - send latest Max Web diagnostic files',
       '/chats - route list',
+      '/new <имя или +7…> - начать новый чат в MAX',
       '/sync - force refresh if a topic is missing',
       '/history - last messages in this topic'
     ].join('\n')));
@@ -841,6 +853,43 @@ export class TelegramBotAdapter {
       } catch (error) {
         logger.error({ err: error }, 'my_chat_member handling failed');
       }
+    });
+
+    // /new <имя или номер>: MAX's search, then a button per chat found. Only
+    // the owner reaches it (see isAllowedContext), and nothing is sent to
+    // anyone in MAX.
+    this.bot.command('new', async (ctx) => {
+      const extra = threadExtraFromContext(ctx);
+      try {
+        const arg = ctx.message.text.replace(/^\/new(@\w+)?/i, '').trim();
+        if (arg) await ctx.sendChatAction('typing', extra).catch(() => {});
+        const result = await this.onNewChatRequested?.(arg);
+        const choices = result?.choices || [];
+        await ctx.reply(result?.text || '/new is not available.', {
+          ...extra,
+          ...(choices.length ? { reply_markup: { inline_keyboard: choices.map((choice) => [{ text: choice.label, callback_data: choice.data }]) } } : {})
+        });
+      } catch (error) {
+        logger.error({ err: error }, 'Command /new failed');
+        await ctx.reply(`⚠️ /new: ${error.message}`, extra).catch(() => {});
+      }
+    });
+
+    this.bot.action(/^new:([A-Za-z0-9_-]{1,32}):(\d{1,2}|x)$/, async (ctx) => {
+      const [, sessionId, choice] = ctx.match;
+      await ctx.answerCbQuery(choice === 'x' ? 'Отменено' : 'Открываю чат в MAX…').catch(() => {});
+      // The buttons go at once: a second press must not open a second chat.
+      await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+      let text;
+      try {
+        text = await this.onNewChatChosen?.(sessionId, choice);
+      } catch (error) {
+        logger.error({ err: error }, '/new choice failed');
+        text = `⚠️ ${error.message}`;
+      }
+      const reply = text || '/new is not available.';
+      await ctx.editMessageText(reply, { link_preview_options: { is_disabled: true } })
+        .catch(() => ctx.reply(reply, { ...threadExtra({ telegramThreadId: ctx.callbackQuery?.message?.message_thread_id || null }) }).catch(() => {}));
     });
 
     this.bot.command('mute', async (ctx) => {

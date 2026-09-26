@@ -318,6 +318,7 @@ export class AppDatabase {
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `);
     this.getSettingStmt = this.db.prepare('SELECT value FROM settings WHERE key = ?');
+    this.listSettingsStmt = this.db.prepare("SELECT key, value FROM settings WHERE key LIKE ? ESCAPE '\\'");
 
     this.createDeliveryStmt = this.db.prepare(`
       INSERT INTO message_deliveries (message_id, direction, status, attempts, created_at, updated_at)
@@ -627,6 +628,18 @@ export class AppDatabase {
     } catch {
       return fallback;
     }
+  }
+
+  // Every setting whose key starts with `prefix`: [{ key, value }].
+  listSettings(prefix) {
+    const pattern = `${String(prefix).replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    return this.listSettingsStmt.all(pattern).map((row) => {
+      try {
+        return { key: row.key, value: JSON.parse(row.value) };
+      } catch {
+        return { key: row.key, value: null };
+      }
+    });
   }
 
   close() {

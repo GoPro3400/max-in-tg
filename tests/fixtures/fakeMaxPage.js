@@ -6,6 +6,12 @@
 //   file:     .bubbleContent > <div class="attaches"><button class="container" aria-label="Скачать"> .title (name) .info ("Скачать • 1.23 MB");
 //             a click makes a temporary <a href download=name> and clicks it (MAX asks its API for the URL first)
 //   links:    <a class="link" href> in the text; a preview card: .bubbleContent > <div class="share"><a class="container" href> [picture] .host .title .description
+//   search (aside .search input.field, placeholder «Найти»): while it has a query the chat list gives way to
+//             .searchResultsList — own chats first, then <span class="separator">Глобальный поиск</span> (a moment later),
+//             <span class="separator">Сообщения</span>; for a whole phone number first «Действия» / «Найти по номеру»,
+//             which opens that person's chat and switches the list to MAX's contacts (a.cell links) — back through
+//             nav «Папки и профиль» [aria-labelledby$=-all-folder-title]; an unknown number opens «Не нашли номер …»
+//   a chat opens by its address too: MAX's router takes over a click on <a href="/<id>">
 //   text:     <span class="text"> with emoji as <span class="emoji"><img alt></span>
 //             and animoji as <span class="animoji" data-lexical-animoji-emoji><img class="img" src="data:…" alt>…
 //   emoji-only message: <div class="emojis"> with big emoji (plain img, or a lottie player)
@@ -25,6 +31,8 @@ export const PAGE = (opts = {}) => `<!doctype html><html><head><meta charset="ut
  aside{width:300px;height:100vh}
  aside .scrollable{height:900px;overflow:auto;position:relative}
  aside .item{height:72px}
+ aside .results:empty{display:none}
+ dialog{position:fixed;top:40%;left:40%}
  main{flex:1;display:flex;flex-direction:column;height:100vh}
  main .scrollable{flex:1;overflow:auto}
  .row{padding:6px 12px;position:relative}
@@ -40,8 +48,11 @@ export const PAGE = (opts = {}) => `<!doctype html><html><head><meta charset="ut
  .row:hover .toolbar{display:block}
  [data-testid=composer]{height:60px}
 </style></head><body>
+<nav aria-label="Папки и профиль"><div class="navigation"><div><div class="foldersViewport"><div class="item"><button id="all-chats" aria-labelledby="nav-all-folder-title nav-all-folder-counter"><span id="nav-all-folder-title">Все</span></button></div></div></div></div></nav>
 <aside aria-labelledby="aside-header-title"><h1 id="aside-header-title">Chats</h1>
- <div class="scrollable"><div class="scrollListContent"></div></div></aside>
+ <div class="search"><div class="input"><input class="field" type="text" placeholder="Найти"></div><div class="clear"></div></div>
+ <div class="scrollable"><div class="scrollListContent"></div></div>
+ <div class="results"></div></aside>
 <main><h2 id="main-header-title" class="sr-only"></h2><div class="header"><span class="title"></span></div>
  <div class="scrollable" id="scroller"><div class="scrollListContent" id="msgs"></div></div>
  <div data-testid="composer"><button aria-label="Upload file">+</button><div contenteditable="true" role="textbox" id="composer"></div><button aria-label="Send message" id="send">send</button></div>
@@ -51,6 +62,8 @@ const opts = ${JSON.stringify(opts)};
 window.__escapeClosedChat = 0;
 window.__chats = opts.chats;
 window.__active = null;
+window.__directory = opts.directory || [];
+window.__tab = 'chats';
 const AVAILABLE = opts.available || ['👍', '❤️', '😂', '🔥', '😮', '😢', '🙏', '👎', '🎉'];
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const cp = (e) => [...e].map((c) => c.codePointAt(0).toString(16)).filter((h) => h !== 'fe0f').join('-');
@@ -107,20 +120,71 @@ window.renderMessages = function renderMessages() {
   loadLotties(box);
 };
 // A chat list item shows "печатает…" in place of its last message: <span class="text"><span class="typing"><span class="text"></span> [lottie] label
+window.openChat = function openChat(opened) {
+  window.__active = opened.title;
+  // Like MAX: the address names the open chat (/<id>).
+  if (opened.maxId) history.pushState({}, '', '/web.max.ru/' + opened.maxId);
+  document.getElementById('main-header-title').textContent = 'Окно чата с ' + window.__active;
+  document.querySelector('main .header .title').textContent = window.__active;
+  window.renderMessages();
+  // MAX clears its search when a chat opens.
+  window.setSearch('');
+};
 window.renderChats = function renderChats() {
   const list = document.querySelector('aside .scrollListContent');
+  if (window.__tab === 'contacts') {
+    const people = window.__chats.concat(window.__directory).filter((c) => c.maxId);
+    list.innerHTML = people.map((c, i) => '<div class="item" data-index="' + i + '"><div class="wrapper"><a class="cell" href="/' + c.maxId + '"><span class="title">' + esc(c.title) + '</span><span class="description">в сети</span></a></div></div>').join('');
+    return;
+  }
   list.innerHTML = window.__chats.map((c, i) => '<div class="item" data-index="' + i + '"><button class="cell"><h3 class="title"><span class="name"><span class="text">' + esc(c.title) + '</span></span></h3>'
     + '<span class="text">' + (c.typing ? '<span class="typing"><span class="text"></span> <span class="lottie"></span> ' + esc(c.typing) + '</span>' : esc(c.preview || '')) + '</span>'
     + '</button></div>').join('');
   list.querySelectorAll('.item').forEach((item) => item.querySelector('button').addEventListener('click', () => {
-    const opened = window.__chats[Number(item.getAttribute('data-index'))];
-    window.__active = opened.title;
-    // Like MAX: the address names the open chat (/<id>).
-    if (opened.maxId) history.pushState({}, '', '/web.max.ru/' + opened.maxId);
-    document.getElementById('main-header-title').textContent = 'Окно чата с ' + window.__active;
-    document.querySelector('main .header .title').textContent = window.__active;
-    window.renderMessages();
+    window.openChat(window.__chats[Number(item.getAttribute('data-index'))]);
   }));
+};
+const phoneOf = (value) => {
+  if (!/^[+8][\\d\\s()-]+$/.test(value)) return null;
+  let digits = value.replace(/[^\\d+]/g, '');
+  if (digits.startsWith('8')) digits = '+7' + digits.slice(1);
+  return digits.length === 12 ? digits : null;
+};
+const resultItem = (title, attrs, text) => '<button class="item" ' + attrs + '><div class="cell"><div class="image"></div><span class="title"><span class="title"><span class="name"><span class="text">' + esc(title) + '</span></span></span></span><span class="text">' + esc(text || '') + '</span><div class="meta"></div></div></button>';
+let searchTimer = null;
+window.setSearch = function setSearch(value) {
+  const input = document.querySelector('aside .search input.field');
+  if (input.value !== value) input.value = value;
+  const results = document.querySelector('aside .results');
+  const scrollable = document.querySelector('aside .scrollable');
+  const clear = document.querySelector('aside .search .clear');
+  clearTimeout(searchTimer);
+  if (!value) {
+    results.innerHTML = '';
+    scrollable.style.display = '';
+    clear.innerHTML = '';
+    return;
+  }
+  clear.innerHTML = '<button aria-label="Очистить">×</button>';
+  scrollable.style.display = 'none';
+  const q = value.toLowerCase();
+  const phone = phoneOf(value);
+  const own = window.__chats.filter((c) => c.title.toLowerCase().includes(q));
+  const messages = [];
+  for (const c of window.__chats) for (const m of c.messages) if ((m.text || []).some((p) => typeof p === 'string' && p.toLowerCase().includes(q))) messages.push(c);
+  const render = (withGlobal) => {
+    const global = withGlobal ? window.__directory.filter((p) => p.title.toLowerCase().includes(q)) : [];
+    let html = '';
+    if (phone) html += '<span class="separator">Действия</span><button class="item" data-phone="' + phone + '">Найти по номеру</button>';
+    html += own.map((c) => resultItem(c.title, 'data-open-title="' + esc(c.title) + '"', c.preview)).join('');
+    if (global.length) html += '<span class="separator">Глобальный поиск</span>' + global.map((p) => resultItem(p.title, 'data-open-directory="' + esc(p.maxId) + '"', p.hint)).join('');
+    if (messages.length) html += '<span class="separator">Сообщения</span>' + messages.map((c) => resultItem(c.title, 'data-message-of="' + esc(c.title) + '"', value)).join('');
+    if (!html) html = '<div class="empty">Ничего не нашли</div>';
+    results.innerHTML = '<div class="content searchResultsList">' + html + '</div>';
+  };
+  render(false);
+  // Global results come from MAX's server a moment later.
+  searchTimer = setTimeout(() => render(true), 300);
 };
 const findMsg = (id) => { for (const c of window.__chats) for (const m of c.messages) if (m.id === id) return m; return null; };
 function setReaction(m, emoji) {
@@ -160,7 +224,45 @@ document.addEventListener('contextmenu', (ev) => {
   ev.preventDefault();
   openMenu(findMsg(row.getAttribute('data-mid')), ev.clientX, ev.clientY, false);
 });
+document.querySelector('aside .search input.field').addEventListener('input', (ev) => window.setSearch(ev.target.value));
+// MAX's router takes over clicks on its own links: /<id> opens that chat.
 document.addEventListener('click', (ev) => {
+  const link = ev.target.closest('a[href]');
+  if (!link || link.hasAttribute('download')) return;
+  const id = (link.getAttribute('href') || '').split('/').pop();
+  const found = window.__chats.concat(window.__directory).find((c) => c.maxId === id);
+  if (found) {
+    ev.preventDefault();
+    window.__openedByAddress = (window.__openedByAddress || []).concat([id]);
+    window.openChat(found);
+  }
+}, true);
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('aside .search .clear button')) { window.setSearch(''); return; }
+  if (ev.target.closest('#all-chats')) { window.__tab = 'chats'; window.renderChats(); return; }
+  const result = ev.target.closest('.searchResultsList button.item');
+  if (result) {
+    const title = result.getAttribute('data-open-title');
+    const person = result.getAttribute('data-open-directory');
+    const phone = result.getAttribute('data-phone');
+    if (title) window.openChat(window.__chats.find((c) => c.title === title));
+    else if (person) window.openChat(window.__directory.find((p) => p.maxId === person));
+    else if (phone) {
+      const found = window.__directory.concat(window.__chats).find((p) => p.phone === phone);
+      if (!found) {
+        const modal = document.createElement('dialog');
+        modal.setAttribute('data-testid', 'modal');
+        modal.setAttribute('open', '');
+        modal.innerHTML = '<h2 id="modalHeaderTitle">Не нашли номер ' + esc(phone) + '</h2>';
+        document.body.appendChild(modal);
+        return;
+      }
+      window.openChat(found);
+      window.__tab = 'contacts';
+      window.renderChats();
+    }
+    return;
+  }
   const file = ev.target.closest('.attaches button.container[data-mid]');
   if (file && !file.disabled) {
     const name = findMsg(file.getAttribute('data-mid')).file.name;
@@ -180,12 +282,27 @@ document.addEventListener('click', (ev) => {
 });
 // Like MAX: an open popover eats Escape (capture phase); otherwise Escape closes the chat.
 window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && menu) { ev.preventDefault(); ev.stopPropagation(); closeMenu(); } }, { capture: true });
+window.addEventListener('keydown', (ev) => {
+  const modal = document.querySelector('dialog[data-testid="modal"][open]');
+  if (ev.key === 'Escape' && modal) { ev.preventDefault(); ev.stopPropagation(); modal.remove(); }
+}, { capture: true });
 document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') { window.__escapeClosedChat += 1; document.getElementById('main-header-title').textContent = ''; window.__active = null; window.renderMessages(); } });
 document.getElementById('send').addEventListener('click', () => {
   const ed = document.getElementById('composer');
   const text = ed.textContent;
   if (!text.trim()) return;
   const chat = window.__chats.find((c) => c.title === window.__active);
+  const person = window.__directory.find((p) => p.title === window.__active);
+  if (person && person.restricted) {
+    // Someone who takes messages only from their contacts: MAX refuses.
+    ed.textContent = '';
+    const modal = document.createElement('dialog');
+    modal.setAttribute('data-testid', 'modal');
+    modal.setAttribute('open', '');
+    modal.innerHTML = '<h2 id="modalHeaderTitle">Хотите написать первым?</h2>';
+    document.body.appendChild(modal);
+    return;
+  }
   window.__sent = (window.__sent || []).concat([{ chat: window.__active, text }]);
   if (chat) chat.messages.push({ id: 's' + window.__sent.length, time: '23:59', out: true, text: [text] });
   ed.textContent = '';

@@ -162,6 +162,12 @@ export class MaxWebClient {
     this.activeChatTitle = null;
     // The open chat's own id in MAX (see currentMaxChatId), when known.
     this.activeMaxChatId = null;
+    // Ids in MAX of chats known by title (see rememberChatId): a chat not in
+    // MAX's list — a new one without messages yet — is opened by its id.
+    this.knownChatIds = new Map();
+    // Of those, the ones MAX did not list last time: opened by their id
+    // straight away, without scrolling the whole list first.
+    this.unlistedChatIds = new Set();
     // The chat whose network traffic media captures are attributed to (set
     // when a chat is being opened, before it is verified — see selectChat).
     this.captureChatId = null;
@@ -561,6 +567,9 @@ export class MaxWebClient {
     await this.ensurePage();
     const selectors = this.selectors;
     return this.page.$$eval(selectors.chatItem, (nodes, innerSelectors) => nodes.map((node, index) => {
+      // MAX's contacts (shown in place of the chats after a search by phone
+      // number) are links, chats are buttons: a contact is never a chat.
+      if (node.querySelector('a.cell') && !node.querySelector('button.cell')) return null;
       const titleNode = node.querySelector(innerSelectors.chatTitle);
       const unreadNode = node.querySelector(innerSelectors.chatUnread);
       const title = titleNode?.textContent?.trim() || node.textContent?.trim() || `Chat ${index + 1}`;
@@ -578,7 +587,7 @@ export class MaxWebClient {
           unreadText: unreadNode?.textContent?.trim() || ''
         }
       };
-    }), selectors);
+    }).filter(Boolean), selectors);
   }
 
   async selectChat(chatIdOrIndex, { detour = true } = {}) {
@@ -598,7 +607,8 @@ export class MaxWebClient {
     // to load virtualized items that are off-screen.
     let chat = null;
     let chats = [];
-    const maxScrollAttempts = 10;
+    const key = String(chatIdOrIndex);
+    const maxScrollAttempts = this.unlistedChatIds.has(key) && this.knownChatIds.has(key) ? 0 : 10;
     for (let attempt = 0; attempt <= maxScrollAttempts; attempt++) {
       chats = await this.listChats();
       chat = chats.find((candidate, index) =>
@@ -620,6 +630,12 @@ export class MaxWebClient {
       }
     }
 
+    // Not in MAX's list — a chat started with /new has no messages yet, and
+    // MAX lists it only after the first one — but its id is known: it is
+    // opened by its address.
+    const openById = !chat ? this.knownChatIds.get(key) || null : null;
+    if (chat) this.unlistedChatIds.delete(key);
+    else if (openById) this.unlistedChatIds.add(key);
     if (!chat) {
       // Scroll back to top for next operation
       await this.page.evaluate((sel) => {
@@ -627,7 +643,8 @@ export class MaxWebClient {
         const scrollable = content?.closest('.scrollable, .scrollListScrollable') || content?.parentElement;
         if (scrollable) scrollable.scrollTop = 0;
       }, this.selectors.chatList).catch(() => null);
-      throw new Error(`Max chat not found: ${chatIdOrIndex}`);
+      if (!openById) throw new Error(`Max chat not found: ${chatIdOrIndex}`);
+      chat = { id: String(chatIdOrIndex), title: String(chatIdOrIndex), lastSeenAt: Date.now(), metadata: {} };
     }
 
     // From the click on, the page no longer shows the previous chat. Forget it
@@ -647,16 +664,18 @@ export class MaxWebClient {
     // fetchRecentLottieFromPage reads the newest sticker files from it, and
     // in a page that lives for days that list (250 entries, then it stops
     // recording) otherwise held stickers from long-gone chats.
-    const clicked = await this.page.evaluate((selector, index) => {
-      const node = document.querySelectorAll(selector)[index];
-      if (!node) return false;
-      try { performance.clearResourceTimings(); } catch { /* not available */ }
-      const btn = node.querySelector('button.cell') || node;
-      btn.scrollIntoView({ block: 'center' });
-      btn.click();
-      return true;
-    }, this.selectors.chatItem, chat.metadata.index);
-    if (!clicked) throw new Error(`Chat node index not found: ${chat.metadata.index}`);
+    const clicked = openById
+      ? await this.openChatByAddress(openById)
+      : await this.page.evaluate((selector, index) => {
+        const node = document.querySelectorAll(selector)[index];
+        if (!node) return false;
+        try { performance.clearResourceTimings(); } catch { /* not available */ }
+        const btn = node.querySelector('button.cell') || node;
+        btn.scrollIntoView({ block: 'center' });
+        btn.click();
+        return true;
+      }, this.selectors.chatItem, chat.metadata.index);
+    if (!clicked) throw new Error(openById ? `Max chat not found: ${chat.id}` : `Chat node index not found: ${chat.metadata.index}`);
 
     // Scroll chat list back to top so future listChats sees top items
     await this.page.evaluate((sel) => {
@@ -677,7 +696,7 @@ export class MaxWebClient {
     // Its id in MAX — only once the address has changed with the switch, so
     // it can never be the previous chat's.
     const maxIdAfter = await this.currentMaxChatId();
-    this.activeMaxChatId = maxIdAfter && maxIdAfter !== maxIdBefore ? maxIdAfter : null;
+    this.activeMaxChatId = maxIdAfter && (maxIdAfter !== maxIdBefore || maxIdAfter === openById) ? maxIdAfter : null;
     // Another title opened and the address stayed: the chat that was open,
     // renamed in MAX — or the address is late. Opening another chat and
     // coming back tells which, and gives a renamed chat its id (the bridge
@@ -703,8 +722,9 @@ export class MaxWebClient {
     this.activeChatId = chat.id;
     this.activeChatTitle = chat.title;
 
-    // Wait for message bubbles to render (lazy-loaded after chat opens)
-    await this.waitForSelectorFree(this.selectors.messageItem, { timeout: 5000 }).catch(() => null);
+    // Wait for message bubbles to render (lazy-loaded after chat opens). A
+    // chat opened by its id is most likely new, without any.
+    await this.waitForSelectorFree(this.selectors.messageItem, { timeout: openById ? 1500 : 5000 }).catch(() => null);
 
     // Scroll message area to bottom to ensure newest messages are visible
     await this.scrollMessageListToBottom();
@@ -727,6 +747,298 @@ export class MaxWebClient {
       return null;
     }
     return String(pathname || '').split('/').find((segment) => /^-?\d+$/.test(segment)) || null;
+  }
+
+  // Remembers a chat's id in MAX, so it can be opened when MAX does not list
+  // it (see selectChat). null forgets it.
+  rememberChatId(chatId, maxId) {
+    if (maxId) this.knownChatIds.set(String(chatId), String(maxId));
+    else this.knownChatIds.delete(String(chatId));
+  }
+
+  // Opens a chat by its address (/<id>) the way MAX itself does: a click on
+  // a link, which MAX's router takes over — no page reload. True once the
+  // address shows it.
+  async openChatByAddress(maxId) {
+    await this.page.evaluate((id) => {
+      try { performance.clearResourceTimings(); } catch { /* not available */ }
+      const link = document.createElement('a');
+      link.href = `/${id}`;
+      link.style.display = 'none';
+      document.body.append(link);
+      link.click();
+      link.remove();
+    }, String(maxId));
+    return this.page.waitForFunction(
+      (id) => location.pathname.split('/').includes(id),
+      { timeout: 10000 },
+      String(maxId)
+    ).then(() => true, () => false);
+  }
+
+  // --- MAX's search, for /new ---
+
+  // What MAX's search above the chat list finds for `query`, once its list
+  // stops changing: the owner's chats first, then "Глобальный поиск"
+  // (people and public chats), and for a whole phone number the "Найти по
+  // номеру" action; found messages are left out. [{ kind: 'chat' | 'global'
+  // | 'phone', title, hint, ordinal }]. The search is cleared afterwards:
+  // while it shows, MAX lists no chats.
+  async searchChats(query, { settleMs = 1200, timeoutMs = 12000 } = {}) {
+    await this.ensurePage();
+    try {
+      await this.typeSearch(query);
+      return (await this.readSettledSearch({ settleMs, timeoutMs })).results;
+    } finally {
+      await this.clearSearch();
+    }
+  }
+
+  // Opens what searchChats found (`candidate`), after searching again: MAX
+  // clears its search when a chat opens, and the results may have changed.
+  // Returns { title, maxId } of the chat that opened, and leaves it open.
+  // Throws — nothing opened, or not that — rather than guess: a route is
+  // made for what this returns.
+  async openSearchResult(query, candidate) {
+    await this.ensurePage();
+    const maxIdBefore = await this.currentMaxChatId();
+    const titleBefore = await this.openChatTitle();
+    let results;
+    try {
+      await this.typeSearch(query);
+      ({ results } = await this.readSettledSearch());
+    } catch (error) {
+      await this.clearSearch();
+      throw error;
+    }
+    const matching = results.filter((result) => result.kind === candidate.kind
+      && (candidate.kind === 'phone' || sameTitle(result.title, candidate.title)));
+    const target = matching[candidate.ordinal || 0] || null;
+    if (!target) {
+      await this.clearSearch();
+      throw new Error('MAX больше не находит этот вариант — пришли /new ещё раз.');
+    }
+
+    // From the click on, the page shows another chat (or tries to).
+    this.activeChatId = null;
+    this.activeChatTitle = null;
+    this.activeMaxChatId = null;
+    const clicked = await this.page.evaluate((sel, position, expected) => {
+      const button = document.querySelector(sel)?.querySelectorAll('button.item')[position];
+      if (!button) return false;
+      const text = (button.textContent || '').replace(/\s+/g, ' ').trim();
+      if (expected && !text.toLowerCase().includes(expected.toLowerCase())) return false;
+      button.click();
+      return true;
+    }, this.selectors.searchResults, target.position, candidate.kind === 'phone' ? '' : candidate.title).catch(() => false);
+    if (!clicked) {
+      await this.clearSearch();
+      throw new Error('MAX успел поменять результаты поиска — пришли /new ещё раз.');
+    }
+
+    // The chat opens, or MAX says why not. It counts as open once its
+    // address and header have both moved on — the header may still name the
+    // previous chat for a moment, and that name must never be taken for a
+    // new contact's — and read the same twice in a row.
+    const deadline = Date.now() + 15000;
+    let opened = null;
+    let seen = null;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const refusal = await this.searchRefusal();
+      if (refusal) {
+        await this.page.keyboard.press('Escape').catch(() => {});
+        await this.clearSearch();
+        await this.showChatList();
+        throw new Error(refusal);
+      }
+      const maxId = await this.currentMaxChatId();
+      const title = await this.openChatTitle();
+      let ready;
+      if (candidate.kind === 'phone') {
+        // The number's owner is known only once their chat shows.
+        ready = maxId && maxId !== maxIdBefore && title && title !== titleBefore;
+      } else {
+        // A chat found by name: that name in the header; its address has
+        // changed, unless it was the chat already open.
+        ready = maxId && sameTitle(title, candidate.title) && (maxId !== maxIdBefore || sameTitle(titleBefore, candidate.title));
+      }
+      const current = ready ? `${maxId}\u0000${title}` : null;
+      if (current && current === seen) {
+        opened = { maxId, title };
+        break;
+      }
+      seen = current;
+    }
+    await this.showChatList();
+    await this.clearSearch();
+    if (!opened) throw new Error('Чат в MAX так и не открылся — попробуй /new ещё раз.');
+    if (candidate.kind !== 'phone' && !sameTitle(opened.title, candidate.title)) {
+      throw new Error(`Вместо «${candidate.title}» в MAX открылся «${opened.title}» — ничего не создаю.`);
+    }
+
+    this.activeChatId = opened.title;
+    this.activeChatTitle = opened.title;
+    this.activeMaxChatId = opened.maxId;
+    this.captureChatId = opened.title;
+    await this.waitForSelectorFree(this.selectors.messageItem, { timeout: 3000 }).catch(() => null);
+    await this.scrollMessageListToBottom();
+    logger.info({ kind: candidate.kind }, 'Opened a chat found in MAX search');
+    return opened;
+  }
+
+  // A chat MAX does not list yet (started with /new) may belong to someone
+  // who takes messages only from their contacts: MAX then refuses the first
+  // one and opens its "Хотите написать первым?" window. Said as an error
+  // rather than taken for a delivery.
+  async checkFirstMessageAccepted(chatId) {
+    if (!this.unlistedChatIds.has(String(chatId))) return;
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const refusal = await this.page.evaluate((sel) => document.querySelector(sel)?.textContent || '', this.selectors.modalTitle)
+      .catch(() => '');
+    if (!refusal.trim()) return;
+    await this.page.keyboard.press('Escape').catch(() => {});
+    throw new Error(`MAX не дал отправить: ${refusal.replace(/\s+/g, ' ').trim()}`);
+  }
+
+  // The open chat's name, from its (hidden) header; '' when none is open.
+  async openChatTitle() {
+    return chatTitleFromHeader(await this.page.evaluate(
+      (sel) => document.querySelector(sel)?.textContent || '', this.selectors.activeChatTitle
+    ).catch(() => ''));
+  }
+
+  // Types into MAX's search (the field above the chat list), replacing what
+  // was there.
+  async typeSearch(query) {
+    const focused = await this.page.evaluate((selector) => {
+      const input = document.querySelector(selector);
+      if (!input) return false;
+      input.focus();
+      input.select?.();
+      return true;
+    }, this.selectors.searchInput).catch(() => false);
+    if (!focused) throw new Error('Не нашёл поиск в MAX Web (поле «Найти» над списком чатов).');
+    await this.page.keyboard.press('Backspace');
+    await this.page.keyboard.type(String(query), { delay: 15 });
+  }
+
+  // The search results once they have not changed for `settleMs` (MAX adds
+  // the global ones a moment after its own chats), or what is there when
+  // time runs out.
+  async readSettledSearch({ settleMs = 1200, timeoutMs = 12000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    let lastSignature = '';
+    let stableSince = Date.now();
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const current = await this.readSearchResults().catch(() => null);
+      const signature = JSON.stringify(current);
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        stableSince = Date.now();
+        last = current;
+      } else if (current && Date.now() - stableSince >= settleMs) {
+        break;
+      }
+    }
+    return last || { results: [], empty: true };
+  }
+
+  async readSearchResults() {
+    return this.page.evaluate((selector) => {
+      const list = document.querySelector(selector);
+      if (!list) return null;
+      const results = [];
+      let section = 'chat';
+      let position = 0;
+      for (const el of list.querySelectorAll('.separator, button.item')) {
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!el.matches('button.item')) {
+          section = /Действия|Actions/i.test(text) ? 'actions'
+            : /Глобальный поиск|Global search/i.test(text) ? 'global'
+              : /Сообщения|Messages/i.test(text) ? 'messages'
+                : 'other';
+          continue;
+        }
+        const itemPosition = position;
+        position += 1;
+        if (section === 'actions') {
+          if (/Найти по номеру|Search by number/i.test(text)) results.push({ kind: 'phone', title: '', hint: '', position: itemPosition });
+          continue;
+        }
+        if (section !== 'chat' && section !== 'global') continue;
+        const titleEl = el.querySelector('.title .name .text, .title .text, .title');
+        const title = (titleEl?.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!title) continue;
+        // For people and public chats, what MAX shows under the name (a
+        // description, an @name) — never a chat's last message.
+        const hintEl = section === 'global'
+          ? el.querySelector('.cell > .text') || [...el.querySelectorAll('.text')].find((candidate) => !candidate.closest('.title'))
+          : null;
+        const hint = (hintEl?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+        results.push({ kind: section, title, hint, position: itemPosition });
+      }
+      const seen = new Map();
+      for (const result of results) {
+        const key = `${result.kind}\u0000${result.title.toLowerCase()}`;
+        result.ordinal = seen.get(key) || 0;
+        seen.set(key, result.ordinal + 1);
+      }
+      return { results, empty: Boolean(list.querySelector('.empty')) };
+    }, this.selectors.searchResults);
+  }
+
+  async clearSearch() {
+    await this.page.evaluate((sel) => {
+      const clear = document.querySelector(sel.searchClear);
+      if (clear) {
+        clear.click();
+        return;
+      }
+      const input = document.querySelector(sel.searchInput);
+      if (input && input.value) {
+        input.value = '';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }, this.selectors).catch(() => null);
+    await this.page.waitForFunction((selector) => !document.querySelector(selector), { timeout: 5000 }, this.selectors.searchResults)
+      .catch(() => null);
+  }
+
+  // Why MAX did not open anything: its "Не нашли номер …" window, or its
+  // "Не получилось найти" notice. null when it says nothing.
+  async searchRefusal() {
+    const said = await this.page.evaluate((sel) => {
+      const modal = document.querySelector(sel.modalTitle)?.textContent || '';
+      const snackbar = document.querySelector('.snackbar')?.textContent || '';
+      return (modal || snackbar).replace(/\s+/g, ' ').trim();
+    }, this.selectors).catch(() => '');
+    if (!said) return null;
+    if (/принадлежит вам|belongs to you/i.test(said)) return 'Это твой собственный номер в MAX.';
+    if (/Не нашли|not found|Не получилось найти/i.test(said)) return `MAX не нашёл такой номер (${said}).`;
+    return `MAX ответил: ${said}`;
+  }
+
+  // After a search by phone number MAX shows its contacts in place of the
+  // chats (its "Контакты" tab): back to all chats. The chat list would read
+  // contacts otherwise.
+  async showChatList() {
+    const contactsShown = () => this.page.evaluate(
+      (selector) => [...document.querySelectorAll(selector)].some((item) => item.querySelector('a.cell') && !item.querySelector('button.cell')),
+      this.selectors.chatItem
+    ).catch(() => false);
+    if (!await contactsShown()) return true;
+    await this.page.evaluate((selector) => document.querySelector(selector)?.click(), this.selectors.chatsTab).catch(() => null);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      if (!await contactsShown()) return true;
+    }
+    logger.warn('MAX still shows its contacts instead of the chats');
+    await this.captureDiagnostics('contacts-tab-stuck', { throttleMs: 60000 }).catch(() => null);
+    return false;
   }
 
   // Scrolls every scrollable message-list container to the bottom (newest
@@ -2000,6 +2312,7 @@ export class MaxWebClient {
       await this.page.focus(this.selectors.composer);
       await this.typeIntoComposer(text, { timeoutMs: this.config.protocolTimeoutMs || 60000 });
       await this.submitComposer();
+      await this.checkFirstMessageAccepted(chatId);
     } catch (error) {
       // Whatever was typed stays in the composer as the chat's draft and went
       // out together with the next message into this chat.
@@ -2933,6 +3246,13 @@ const normalizeTitle = (value) => String(value || '')
   .replace(/\s+/g, ' ')
   .trim()
   .toLowerCase();
+
+// The open chat's name, as its (hidden) header reads: "Окно чата с {name}".
+const chatTitleFromHeader = (value) => String(value || '')
+  .replace(/\u00a0/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim()
+  .replace(/^(chat window with|окно чата с|чат с)\s+/i, '');
 
 const stripActiveChatPrefix = (value) => value.replace(
   /^(chat window with|окно чата с|чат с)\s+/,

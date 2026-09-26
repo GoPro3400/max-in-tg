@@ -88,6 +88,7 @@ MAX Relay
 | Emoji in text | :white_check_mark: | :white_check_mark: | MAX emoji and animoji arrive as text (they used to vanish, and the message went out as a "photo" of the emoji) |
 | Typing | :white_check_mark: | — | While the contact types in MAX (or records a voice message, picks a sticker…), their topic shows the bot "typing…". `SYNC_TYPING=false` turns it off |
 | Group chats | :white_check_mark: | :white_check_mark: | The author's name in bold above each group message |
+| New chat | — | :white_check_mark: | `/new Ivan Petrov` or `/new +7 999 123-45-67`: find it in MAX, pick it with a button, get a topic |
 
 > :bulb: Media & stickers: how TG→MAX photo/file sending works through MAX's attach
 > menu, and how stickers become real Telegram stickers (and back) — see [docs/MEDIA_PIPELINE.md](docs/MEDIA_PIPELINE.md).
@@ -335,6 +336,7 @@ topics for every current chat.
 | `/diagnostics` | Send latest diagnostic files |
 | `/sync` | Force refresh chats and topics |
 | `/chats` | List Max chats and routes |
+| `/new <name or number>` | Start a new MAX chat: MAX's search (your chats, people, public chats; a phone number via "Найти по номеру"), a button per result, and only on your choice the chat is opened and gets a topic. Nothing is sent to anyone |
 | `/history` | Recent messages in current topic |
 | `/deliveries` | Delivery stats (sent/failed/pending) |
 | `/merge <name>` | Merge a duplicate chat into current topic |
@@ -402,7 +404,7 @@ topics for every current chat.
 
 ### P1 (Priority)
 
-- [ ] **`/new <phone|name>`** — start a new Max chat from Telegram with candidate confirmation
+- [x] **`/new <name|number>`** — start a new MAX chat from Telegram with confirmation, by phone number too
 - [ ] **Extended contact card** — avatar, phone, username, metadata
 - [ ] **MAX chat ids instead of titles** — tell same-named chats apart (renames are already recognised by the id in the page's address)
 

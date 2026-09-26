@@ -56,6 +56,64 @@ const capMap = (map, maxSize = MAX_CAPTURE_MAP_SIZE) => {
 // evaluate blocks had drifted out of sync).
 const DOCUMENT_LINK_FALLBACK_SELECTOR = 'a[href][download], a[href*="/file"], a[href*="/download"], a[href*="blob:"], [class*="document"] a[href], [class*="attach"] a[href], [class*="file"] a[href]';
 
+// What MAX draws in a bubble as pictures that are never the message's own
+// media: an emoji in text is <span class="emoji"><img alt="😀">, an animoji a
+// <span class="animoji" data-lexical-animoji-emoji="😀">, and an emoji-only
+// message shows its emoji big in .emojis (reaction chips come from the
+// messageReactions selector). Shared by scrapeMessageRows and
+// findAndHoverMessage.
+const BUBBLE_DECOR = {
+  graphics: '.emoji, .animoji, [data-lexical-emoji], [data-lexical-animoji]',
+  bigEmoji: '.emojis'
+};
+
+// Runs in the MAX page before MAX's own scripts. MAX animates emoji
+// ("animoji") by fetching a Lottie JSON with fetch(url, { mode: 'cors' }) and
+// drawing it on a canvas — and a canvas does not say which emoji it shows,
+// so reactions could not be read or picked. Handing the page an empty body for
+// those files makes MAX keep the stand-in it shows while loading: a plain
+// <img alt="👍">. Only what MAX uses the result for changes: the request
+// itself still goes out (the network capture sees it), and sticker animations
+// ("lottie=true" URLs, see findNetworkLottie) are left alone.
+const STATIC_ANIMOJI_SCRIPT = `(() => {
+  try {
+    const nativeFetch = window.fetch;
+    if (typeof nativeFetch !== 'function' || nativeFetch.__maxInTgStaticAnimoji) return;
+    const isLottieJson = (text) => text.length > 1 && text.length < 5000000 && text.charCodeAt(0) === 123
+      && text.includes('"layers"') && text.includes('"fr"');
+    const staticFetch = function (input, init) {
+      const result = nativeFetch.apply(window, arguments);
+      try {
+        const url = typeof input === 'string' ? input : String((input && input.url) || input || '');
+        if (!init || init.mode !== 'cors' || /lottie=true|sticker/i.test(url)) return result;
+        return result.then((response) => {
+          if (!response || !response.ok) return response;
+          return response.clone().text().then(
+            (text) => (isLottieJson(text) ? new Response('', { status: 200, headers: { 'content-type': 'application/json' } }) : response),
+            () => response
+          );
+        });
+      } catch (error) {
+        return result;
+      }
+    };
+    staticFetch.__maxInTgStaticAnimoji = true;
+    window.fetch = staticFetch;
+  } catch (error) {
+    // Never break the page over this.
+  }
+})();`;
+
+// How long the reactions scraped by readMessages are reused by readReactions.
+const REACTION_SCAN_MAX_AGE_MS = 5000;
+
+const reactionRowOf = (row) => ({
+  rawId: row.rawId,
+  outgoing: Boolean(row.outgoing),
+  reactions: (row.reactions || []).map(({ emoji, count, active }) => ({ emoji, count, active: Boolean(active) })),
+  reactionsUnknown: Boolean(row.reactionsUnknown)
+});
+
 export class MaxWebClient {
   constructor(maxConfig, options = {}) {
     this.config = maxConfig;
@@ -124,6 +182,13 @@ export class MaxWebClient {
     });
 
     this.page = await this.browser.newPage();
+    // Before the first navigation, so it is in place for every load (reloads
+    // included) — see STATIC_ANIMOJI_SCRIPT.
+    if (this.config.staticAnimoji !== false) {
+      await this.page.evaluateOnNewDocument(STATIC_ANIMOJI_SCRIPT).catch((error) => {
+        logger.warn({ err: error?.message || String(error) }, 'Could not install the static-animoji script; reactions may be unreadable');
+      });
+    }
     await this.page.setViewport({ width: 1440, height: 980 });
     // MAX serves sticker assets (Lottie JSON) from the HTTP cache, so on repeat
     // displays no `response` fires and we cannot capture the animation. Disable
@@ -597,127 +662,272 @@ export class MaxWebClient {
   // fingerprint for later Telegram->MAX reply matching).
   scrapeMessageRows() {
     const selectors = this.selectors;
-    return this.page.$$eval(selectors.messageItem, (nodes, innerSelectors, docLinkFallbackSelector) => nodes.map((node, index) => {
-      // Detect reply quote: present only on reply bubbles as a direct child .link
-      const bubbleContent = node.querySelector('.bubbleContent') || node;
-      const replyLink = bubbleContent.querySelector(':scope > .link') || node.querySelector('.bubbleContent > .link');
-
-      let replyToAuthor = '';
-      let replyToSnippet = '';
-      let replyToHasMedia = false;
-      let replyToMediaUrl = '';
-      if (replyLink) {
-        const replyAuthorEl = replyLink.querySelector('.author');
-        replyToAuthor = replyAuthorEl ? replyAuthorEl.textContent.trim() : '';
-        // Find the quoted snippet: a .text inside the quote that is NOT inside .author
-        const markTexts = Array.from(replyLink.querySelectorAll('.text'));
-        const snippetEl = markTexts.find((el) => !replyAuthorEl || !replyAuthorEl.contains(el));
-        replyToSnippet = snippetEl ? snippetEl.textContent.trim() : '';
-        // A reply to media (photo/video/sticker) shows a thumbnail in the quote
-        // but no text snippet, so it cannot be matched by text — flag it so the
-        // bridge can fall back to matching the most recent media message.
-        const replyMediaEl = replyLink.querySelector('img, video');
-        replyToHasMedia = Boolean(replyMediaEl || replyLink.querySelector('canvas, [class*="sticker"], [class*="Sticker"]'));
-        // Capture the quoted thumbnail's URL so the bridge can match the reply to
-        // the original media by its CDN identity instead of guessing by recency.
-        replyToMediaUrl = replyMediaEl ? (replyMediaEl.currentSrc || replyMediaEl.src || '') : '';
-      }
-
-      // Extract the real message text: the .text that is a direct child of .bubbleContent,
-      // NOT the one inside .link (which is the quoted author's name or snippet).
-      let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
-      if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
-      const text = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
-
-      const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
-      const timeNode = node.querySelector(innerSelectors.messageTime);
-      const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
-      // Media/type detection must ignore anything inside the reply quote (.link):
-      // a reply to a photo/video/sticker embeds the quoted media's thumbnail,
-      // which would otherwise be misdetected as this message's own media and
-      // re-sent instead of forwarding the reply text.
-      const ownEl = (el) => (el && replyLink && replyLink.contains(el)) ? null : el;
-      const imgEl = ownEl(node.querySelector('img'));
-      const canvasEl = ownEl(node.querySelector('canvas'));
-      const videoEl = ownEl(node.querySelector('video'));
-      const sourceEl = ownEl(node.querySelector('source[type="video"], source[type="webm"]'));
-      const audioEl = ownEl(node.querySelector('audio'));
-      const voiceEl = ownEl(node.querySelector('[class*="voice"], [data-testid*="voice"], [aria-label*="voice"], [aria-label*="Voice"], [class*="audioMessage"], [class*="audio-player"], [class*="attachAudio"], [class*="wave"]'));
-      const roundVideoEl = ownEl(node.querySelector('[class*="roundVideo"], [class*="round-video"], [class*="videoNote"], [class*="video-note"], [data-testid*="video-note"], [data-testid*="round-video"], [class*="videoMessage"], [class*="videoCanvas"]'));
-      const durationEl = ownEl(node.querySelector('.duration, [class*="duration"]'));
-      const hasDuration = durationEl && /^\d{2}:\d{2}$/.test(durationEl.textContent.trim());
-      const imageUrl = imgEl?.src || '';
-      const audioUrl = audioEl?.src || '';
-      const videoUrl = videoEl?.src || sourceEl?.src || '';
-      const documentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
-        || ownEl(node.querySelector(docLinkFallbackSelector));
-      const documentEl = documentLink || ownEl(node.querySelector('[class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [class*="fileIcon"], [data-testid*="document"], [data-testid*="file"], button[aria-label*="качать"]'));
-      const documentUrl = documentLink?.href || '';
-      const hasDocumentElement = Boolean(documentEl);
-      // Try to extract original filename from document bubble
-      const fileNameEl = ownEl(node.querySelector('[class*="fileName"], [class*="file-name"], [class*="title"]'));
-      const documentFileName = fileNameEl?.textContent?.trim() || '';
-      const mediaUrl = imageUrl || audioUrl || videoUrl || documentUrl || '';
-      const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
-      const fallbackId = [author, time, text, mediaUrl].filter(Boolean).join('|');
-      const rawId = explicitId || fallbackId || `visible-${index}`;
-      const outgoing = Boolean(
-        node.closest('[data-outgoing="true"], .outgoing, .message-out')
-        || node.closest('[data-bubbles-variant="outgoing"]')
-        || node.parentElement?.getAttribute('data-bubbles-variant') === 'outgoing'
-      );
-
-      const stickerEl = ownEl(node.querySelector('[class*="sticker"], [class*="Sticker"], [data-testid*="sticker"], [class*="emoji-big"], [class*="animatedEmoji"]'));
-      // The weak voice signals ("wave"/"duration") also match some text
-      // bubbles, so they only mean "voice" when the bubble has no real text.
-      // roundVideoEl (videoMessage/videoCanvas/roundVideo) and audioUrl are
-      // specific enough to trust on their own — a video note may carry a
-      // duration/label in its text, and must still be detected as a video note.
-      const hasText = Boolean(text);
-      let type = 'text';
-      if (stickerEl) type = 'sticker';
-      else if (imageUrl) type = 'photo';
-      else if (roundVideoEl) type = 'video_note';
-      else if (audioUrl) type = 'voice';
-      else if ((voiceEl || hasDuration) && !hasText) type = 'voice';
-      else if (videoUrl) type = 'video';
-      else if (documentUrl || hasDocumentElement) type = 'document';
-      else if (canvasEl) {
-        const cw = canvasEl.width || 0;
-        const ch = canvasEl.height || 0;
-        if (cw > 40 && ch > 40) {
-          type = 'sticker';
-        }
-      }
-
-      // For stickers: if there's an img inside the sticker element, use it as mediaUrl
-      const stickerImgUrl = (type === 'sticker' && imgEl?.src && !imgEl.src.startsWith('data:')) ? imgEl.src : '';
-      const stickerIndex = (type === 'sticker' && !mediaUrl && !stickerImgUrl) ? index : -1;
-
-      return {
-        rawId,
-        text,
-        author,
-        time,
-        outgoing,
-        mediaUrl: stickerImgUrl || mediaUrl,
-        type,
-        stickerIndex,
-        hasVoiceElement: Boolean(voiceEl),
-        hasRoundVideoElement: Boolean(roundVideoEl),
-        hasDuration,
-        // Needed outside the page context to index document bubbles in DOM
-        // order the same way triggerDocumentDownload does (see readMessages).
-        hasDocumentElement,
-        documentFileName,
-        replyToAuthor,
-        replyToSnippet,
-        replyToHasMedia,
-        replyToMediaUrl,
-        replyLinkPresent: Boolean(replyLink),
-        _htmlSnippet: node.innerHTML.substring(0, 200)
+    return this.page.$$eval(selectors.messageItem, (nodes, innerSelectors, docLinkFallbackSelector, decor) => {
+      // --- Shared with findAndHoverMessage: keep the two in step. ---
+      const safeClosest = (el, sel) => {
+        try { return sel && el ? el.closest(sel) : null; } catch { return null; }
       };
-    }), selectors, DOCUMENT_LINK_FALLBACK_SELECTOR);
+      const safeAll = (root, sel) => {
+        try { return sel && root ? [...root.querySelectorAll(sel)] : []; } catch { return []; }
+      };
+      // Pictures of emoji — never a message's own media (see BUBBLE_DECOR).
+      const isDecor = (el) => Boolean(safeClosest(el, decor.graphics) || safeClosest(el, decor.bigEmoji)
+        || safeClosest(el, innerSelectors.messageReactions));
+      // What the static-animoji mode (STATIC_ANIMOJI_SCRIPT) turned from a
+      // canvas into an <img>: reaction chips and the stand-in of an animated
+      // big emoji. Left out of the id so a bubble keeps the id it always had;
+      // the other emoji pictures were always <img> and stay in it for the
+      // same reason.
+      const isAnimojiStandIn = (el) => {
+        if (safeClosest(el, innerSelectors.messageReactions)) return true;
+        const big = safeClosest(el, decor.bigEmoji);
+        const glyph = big && safeClosest(el, decor.graphics);
+        return Boolean(glyph) && glyph.parentElement !== big;
+      };
+      // --- End of the shared part. ---
+      const pictographic = /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u;
+      const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+      const emojiIn = (value) => (segmenter ? [...segmenter.segment(value || '')].map((part) => part.segment) : Array.from(value || ''))
+        .filter((grapheme) => pictographic.test(grapheme));
+      // Text as the reader sees it. MAX draws emoji as <img alt="😀"> (and
+      // animoji as a span carrying the emoji), which textContent leaves out:
+      // "Привет 😀" used to come through as "Привет".
+      const readable = (root) => {
+        let out = '';
+        const walk = (n) => {
+          if (n.nodeType === 3) {
+            out += n.nodeValue;
+            return;
+          }
+          if (n.nodeType !== 1) return;
+          const glyph = n.getAttribute('data-lexical-animoji-emoji') || n.getAttribute('data-lexical-emoji');
+          if (glyph) {
+            out += glyph;
+            return;
+          }
+          if (n.tagName === 'IMG') {
+            const alt = n.getAttribute('alt') || '';
+            if (alt.length <= 32 && pictographic.test(alt)) out += alt;
+            return;
+          }
+          for (const child of n.childNodes) walk(child);
+        };
+        if (root) walk(root);
+        return out;
+      };
+      const parseCount = (value) => {
+        const match = /(\d+(?:[.,]\d+)?)\s*([KkКкMmМм])?/u.exec(String(value || ''));
+        if (!match) return 1;
+        const scale = /[KkКк]/u.test(match[2] || '') ? 1000 : (/[MmМм]/u.test(match[2] || '') ? 1000000 : 1);
+        return Math.max(1, Math.round(Number.parseFloat(match[1].replace(',', '.')) * scale));
+      };
+      const isOrHasMessage = (el) => {
+        try {
+          return el.matches(innerSelectors.messageItem) || Boolean(el.querySelector(innerSelectors.messageItem));
+        } catch {
+          return false;
+        }
+      };
+      // A bubble's reaction chips. MAX puts them inside the bubble for media,
+      // and for text right AFTER the bubble's wrapper, as its next sibling.
+      // Walking up stops at the level of the message rows, so a neighbour's
+      // reactions are never taken for this bubble's.
+      const reactionChipsOf = (node, replyLink) => {
+        const containerSel = innerSelectors.messageReactions;
+        const chipSel = innerSelectors.messageReactionChip;
+        if (!containerSel || !chipSel) return [];
+        const containers = safeAll(node, containerSel);
+        let level = node.parentElement;
+        for (let depth = 0; level && depth < 3 && !containers.length; depth++, level = level.parentElement) {
+          let reachedNextMessage = false;
+          for (let sibling = level.nextElementSibling, seen = 0; sibling && seen < 3; sibling = sibling.nextElementSibling, seen++) {
+            if (isOrHasMessage(sibling)) {
+              reachedNextMessage = true;
+              break;
+            }
+            let isContainer = false;
+            try { isContainer = sibling.matches(containerSel); } catch { /* bad selector */ }
+            if (isContainer) containers.push(sibling);
+            else containers.push(...safeAll(sibling, containerSel));
+          }
+          if (reachedNextMessage) break;
+        }
+        const chips = new Set();
+        for (const container of containers) {
+          if (replyLink && replyLink.contains(container)) continue;
+          safeAll(container, chipSel).forEach((chip) => chips.add(chip));
+        }
+        return [...chips];
+      };
+      const chipInfo = (chip) => {
+        const labels = safeAll(chip, '[data-lexical-animoji-emoji], [data-lexical-emoji], img[alt]')
+          .map((el) => el.getAttribute('data-lexical-animoji-emoji') || el.getAttribute('data-lexical-emoji') || el.getAttribute('alt') || '');
+        const emoji = [...labels, chip.getAttribute('aria-label') || '', chip.textContent || ''].flatMap(emojiIn)[0] || null;
+        const counter = chip.querySelector('.counter')?.textContent ?? chip.textContent;
+        const active = /(^|\s)[\w-]*--active(\s|$)/.test(chip.getAttribute('class') || '')
+          || chip.getAttribute('aria-pressed') === 'true';
+        const rect = chip.getBoundingClientRect();
+        return { emoji, count: parseCount(counter), active, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+      };
+
+      return nodes.map((node, index) => {
+        // Detect reply quote: present only on reply bubbles as a direct child .link
+        const bubbleContent = node.querySelector('.bubbleContent') || node;
+        const replyLink = bubbleContent.querySelector(':scope > .link') || node.querySelector('.bubbleContent > .link');
+        const inQuote = (el) => Boolean(el && replyLink && replyLink.contains(el));
+
+        let replyToAuthor = '';
+        let replyToSnippet = '';
+        let replyToHasMedia = false;
+        let replyToMediaUrl = '';
+        if (replyLink) {
+          const replyAuthorEl = replyLink.querySelector('.author');
+          replyToAuthor = replyAuthorEl ? replyAuthorEl.textContent.trim() : '';
+          // Find the quoted snippet: a .text inside the quote that is NOT inside .author
+          const markTexts = Array.from(replyLink.querySelectorAll('.text'));
+          const snippetEl = markTexts.find((el) => !replyAuthorEl || !replyAuthorEl.contains(el));
+          replyToSnippet = snippetEl ? readable(snippetEl).trim() : '';
+          // A reply to media (photo/video/sticker) shows a thumbnail in the quote
+          // but no text snippet, so it cannot be matched by text — flag it so the
+          // bridge can fall back to matching the most recent media message.
+          // Emoji pictures in a quoted text are not media.
+          const replyMediaEl = safeAll(replyLink, 'img, video').find((el) => !isDecor(el)) || null;
+          replyToHasMedia = Boolean(replyMediaEl
+            || safeAll(replyLink, 'canvas, [class*="sticker"], [class*="Sticker"]').some((el) => !isDecor(el)));
+          // Capture the quoted thumbnail's URL so the bridge can match the reply to
+          // the original media by its CDN identity instead of guessing by recency.
+          replyToMediaUrl = replyMediaEl ? (replyMediaEl.currentSrc || replyMediaEl.src || '') : '';
+        }
+
+        // Extract the real message text: the .text that is a direct child of .bubbleContent,
+        // NOT the one inside .link (which is the quoted author's name or snippet).
+        let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
+        if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
+        // Part of the bubble's id, exactly as it has always been computed.
+        const fingerprintText = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
+        // What is delivered: with its emoji, and never the sender's name —
+        // which is all the fallback .text used to find on an uncaptioned photo
+        // in a group. An emoji-only message has no .text at all; its emoji
+        // are drawn big instead.
+        const textSource = textEl || safeAll(node, innerSelectors.messageText)
+          .find((el) => !inQuote(el) && !safeClosest(el, innerSelectors.messageAuthor)) || null;
+        const bigEmojiEl = safeAll(node, decor.bigEmoji).find((el) => !inQuote(el)) || null;
+        const text = readable(textSource).trim() || readable(bigEmojiEl).trim();
+
+        const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
+        const timeNode = node.querySelector(innerSelectors.messageTime);
+        const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
+        // Media/type detection must ignore anything inside the reply quote (.link):
+        // a reply to a photo/video/sticker embeds the quoted media's thumbnail,
+        // which would otherwise be misdetected as this message's own media and
+        // re-sent instead of forwarding the reply text. Emoji pictures are not
+        // media either: a text with an emoji used to become a "photo" of it.
+        const ownEl = (el) => (inQuote(el) ? null : el);
+        const contentEl = (sel) => safeAll(node, sel).find((el) => !inQuote(el) && !isDecor(el)) || null;
+        const imgEl = contentEl('img');
+        // An animated big emoji is a canvas when it cannot be read as an emoji
+        // (static-animoji mode off); it is then treated as a sticker, as before.
+        const canvasEl = contentEl('canvas') || (text ? null : ownEl(node.querySelector('canvas')));
+        const videoEl = contentEl('video');
+        const sourceEl = contentEl('source[type="video"], source[type="webm"]');
+        const audioEl = contentEl('audio');
+        const voiceEl = ownEl(node.querySelector('[class*="voice"], [data-testid*="voice"], [aria-label*="voice"], [aria-label*="Voice"], [class*="audioMessage"], [class*="audio-player"], [class*="attachAudio"], [class*="wave"]'));
+        const roundVideoEl = ownEl(node.querySelector('[class*="roundVideo"], [class*="round-video"], [class*="videoNote"], [class*="video-note"], [data-testid*="video-note"], [data-testid*="round-video"], [class*="videoMessage"], [class*="videoCanvas"]'));
+        const durationEl = ownEl(node.querySelector('.duration, [class*="duration"]'));
+        const hasDuration = durationEl && /^\d{2}:\d{2}$/.test(durationEl.textContent.trim());
+        const imageUrl = imgEl?.src || '';
+        const audioUrl = audioEl?.src || '';
+        const videoUrl = videoEl?.src || sourceEl?.src || '';
+        const documentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
+          || ownEl(node.querySelector(docLinkFallbackSelector));
+        const documentEl = documentLink || ownEl(node.querySelector('[class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [class*="fileIcon"], [data-testid*="document"], [data-testid*="file"], button[aria-label*="качать"]'));
+        const documentUrl = documentLink?.href || '';
+        const hasDocumentElement = Boolean(documentEl);
+        // Try to extract original filename from document bubble
+        const fileNameEl = ownEl(node.querySelector('[class*="fileName"], [class*="file-name"], [class*="title"]'));
+        const documentFileName = fileNameEl?.textContent?.trim() || '';
+        const mediaUrl = imageUrl || audioUrl || videoUrl || documentUrl || '';
+        // The id: author|time|text|media, built the way it always was, so a
+        // bubble read before an update is still recognised after it — its
+        // media part is the first <img> (emoji pictures included), <audio>,
+        // <video> or file link, minus the animoji stand-ins, which used to be
+        // canvases.
+        const legacySrc = (sel) => ownEl(node.querySelector(sel))?.src || '';
+        const fingerprintImg = ownEl(safeAll(node, 'img').find((el) => !isAnimojiStandIn(el)) || null);
+        const fingerprintMediaUrl = (fingerprintImg?.src || '') || legacySrc('audio')
+          || legacySrc('video') || legacySrc('source[type="video"], source[type="webm"]') || documentUrl || '';
+        const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
+        const fallbackId = [author, time, fingerprintText, fingerprintMediaUrl].filter(Boolean).join('|');
+        const rawId = explicitId || fallbackId || `visible-${index}`;
+        const outgoing = Boolean(
+          node.closest('[data-outgoing="true"], .outgoing, .message-out')
+          || node.closest('[data-bubbles-variant="outgoing"]')
+          || node.parentElement?.getAttribute('data-bubbles-variant') === 'outgoing'
+        );
+
+        // Reactions (emoji, how many, whether one of them is ours), for the
+        // bridge to mirror into Telegram. A chip whose emoji cannot be read
+        // (an animoji still drawn on a canvas) is only counted as unknown.
+        const chips = reactionChipsOf(node, replyLink).map(chipInfo);
+        const reactions = chips.filter((chip) => chip.emoji);
+        const reactionsUnknown = chips.length > reactions.length;
+
+        const stickerEl = ownEl(node.querySelector('[class*="sticker"], [class*="Sticker"], [data-testid*="sticker"], [class*="emoji-big"], [class*="animatedEmoji"]'));
+        // The weak voice signals ("wave"/"duration") also match some text
+        // bubbles, so they only mean "voice" when the bubble has no real text.
+        // roundVideoEl (videoMessage/videoCanvas/roundVideo) and audioUrl are
+        // specific enough to trust on their own — a video note may carry a
+        // duration/label in its text, and must still be detected as a video note.
+        const hasText = Boolean(text);
+        let type = 'text';
+        if (stickerEl) type = 'sticker';
+        else if (imageUrl) type = 'photo';
+        else if (roundVideoEl) type = 'video_note';
+        else if (audioUrl) type = 'voice';
+        else if ((voiceEl || hasDuration) && !hasText) type = 'voice';
+        else if (videoUrl) type = 'video';
+        else if (documentUrl || hasDocumentElement) type = 'document';
+        else if (canvasEl) {
+          const cw = canvasEl.width || 0;
+          const ch = canvasEl.height || 0;
+          if (cw > 40 && ch > 40) {
+            type = 'sticker';
+          }
+        }
+
+        // For stickers: if there's an img inside the sticker element, use it as mediaUrl
+        const stickerImgUrl = (type === 'sticker' && imgEl?.src && !imgEl.src.startsWith('data:')) ? imgEl.src : '';
+        const stickerIndex = (type === 'sticker' && !mediaUrl && !stickerImgUrl) ? index : -1;
+        const rect = node.getBoundingClientRect();
+
+        return {
+          rawId,
+          text,
+          author,
+          time,
+          outgoing,
+          mediaUrl: stickerImgUrl || mediaUrl,
+          type,
+          stickerIndex,
+          hasVoiceElement: Boolean(voiceEl),
+          hasRoundVideoElement: Boolean(roundVideoEl),
+          hasDuration,
+          // Needed outside the page context to index document bubbles in DOM
+          // order the same way triggerDocumentDownload does (see readMessages).
+          hasDocumentElement,
+          documentFileName,
+          replyToAuthor,
+          replyToSnippet,
+          replyToHasMedia,
+          replyToMediaUrl,
+          replyLinkPresent: Boolean(replyLink),
+          reactions,
+          reactionsUnknown,
+          box: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+          _htmlSnippet: node.innerHTML.substring(0, 200)
+        };
+      });
+    }, selectors, DOCUMENT_LINK_FALLBACK_SELECTOR, BUBBLE_DECOR);
   }
 
   // Telegram→MAX replies (v2): after sending our own text message into a MAX
@@ -796,6 +1006,8 @@ export class MaxWebClient {
       voiceIdCounts.set(base, n);
       if (n > 1) msg.rawId = `${base}#v${n}`;
     }
+    // Kept for readReactions, which the bridge calls right after this.
+    this.lastReactionScan = { chatId: this.activeChatId || chatId, at: Date.now(), rows: rawMessages.map(reactionRowOf) };
 
     const stickerIndices = rawMessages
       .filter((m) => m.stickerIndex >= 0)
@@ -1237,32 +1449,43 @@ export class MaxWebClient {
     const mediaTokenPrefix = 'media-token:';
     const mediaToken = fingerprint.startsWith(mediaTokenPrefix) ? fingerprint.slice(mediaTokenPrefix.length) : null;
     for (let attempt = 0; attempt <= maxScrollAttempts; attempt++) {
-      const box = await this.page.evaluate((sel, innerSelectors, target, tokenTarget, docLinkFallbackSelector) => {
+      const box = await this.page.evaluate((sel, innerSelectors, target, tokenTarget, docLinkFallbackSelector, decor) => {
         const extractToken = (url) => {
           const m = /[?&]r=([^&]+)/.exec(url || '');
           return m ? m[1] : null;
         };
+        // --- Shared with scrapeMessageRows: keep the two in step. ---
+        const safeClosest = (el, sel) => {
+          try { return sel && el ? el.closest(sel) : null; } catch { return null; }
+        };
+        const safeAll = (root, sel) => {
+          try { return sel && root ? [...root.querySelectorAll(sel)] : []; } catch { return []; }
+        };
+        const isDecor = (el) => Boolean(safeClosest(el, decor.graphics) || safeClosest(el, decor.bigEmoji)
+          || safeClosest(el, innerSelectors.messageReactions));
+        const isAnimojiStandIn = (el) => {
+          if (safeClosest(el, innerSelectors.messageReactions)) return true;
+          const big = safeClosest(el, decor.bigEmoji);
+          const glyph = big && safeClosest(el, decor.graphics);
+          return Boolean(glyph) && glyph.parentElement !== big;
+        };
+        // --- End of the shared part. ---
         const nodes = [...document.querySelectorAll(sel)];
         for (let i = nodes.length - 1; i >= 0; i--) {
           const node = nodes[i];
           const bubbleContent = node.querySelector('.bubbleContent') || node;
           const replyLink = bubbleContent.querySelector(':scope > .link') || node.querySelector('.bubbleContent > .link');
-          let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
-          if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
-          const text = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
-          const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
-          const timeNode = node.querySelector(innerSelectors.messageTime);
-          const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
-          const ownEl = (el) => (el && replyLink && replyLink.contains(el)) ? null : el;
-          const imgEl = ownEl(node.querySelector('img'));
-          const audioEl = ownEl(node.querySelector('audio'));
-          const videoEl = ownEl(node.querySelector('video'));
-          const sourceEl = ownEl(node.querySelector('source[type="video"], source[type="webm"]'));
+          const inQuote = (el) => Boolean(el && replyLink && replyLink.contains(el));
+          const ownEl = (el) => (inQuote(el) ? null : el);
           const documentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
             || ownEl(node.querySelector(docLinkFallbackSelector));
-          const mediaUrl = imgEl?.src || audioEl?.src || videoEl?.src || sourceEl?.src || documentLink?.href || '';
+          const documentUrl = documentLink?.href || '';
 
           if (tokenTarget) {
+            // The bubble's own media — never an emoji picture — by its CDN token.
+            const contentSrc = (s) => safeAll(node, s).find((el) => !inQuote(el) && !isDecor(el))?.src || '';
+            const mediaUrl = contentSrc('img') || contentSrc('audio') || contentSrc('video')
+              || contentSrc('source[type="video"], source[type="webm"]') || documentUrl;
             if (mediaUrl && extractToken(mediaUrl) === tokenTarget) {
               const r = node.getBoundingClientRect();
               return { x: r.x, y: r.y, w: r.width, h: r.height };
@@ -1270,6 +1493,17 @@ export class MaxWebClient {
             continue;
           }
 
+          // The same id scrapeMessageRows gives the bubble.
+          let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
+          if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
+          const text = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
+          const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
+          const timeNode = node.querySelector(innerSelectors.messageTime);
+          const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
+          const legacySrc = (s) => ownEl(node.querySelector(s))?.src || '';
+          const fingerprintImg = ownEl(safeAll(node, 'img').find((el) => !isAnimojiStandIn(el)) || null);
+          const mediaUrl = (fingerprintImg?.src || '') || legacySrc('audio')
+            || legacySrc('video') || legacySrc('source[type="video"], source[type="webm"]') || documentUrl || '';
           const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
           const fallbackId = [author, time, text, mediaUrl].filter(Boolean).join('|');
           const rawId = explicitId || fallbackId;
@@ -1279,7 +1513,7 @@ export class MaxWebClient {
           }
         }
         return null;
-      }, selectors.messageItem, selectors, fingerprint, mediaToken, DOCUMENT_LINK_FALLBACK_SELECTOR);
+      }, selectors.messageItem, selectors, fingerprint, mediaToken, DOCUMENT_LINK_FALLBACK_SELECTOR, BUBBLE_DECOR);
 
       if (box) {
         const cx = box.x + box.w / 2;
@@ -1344,6 +1578,237 @@ export class MaxWebClient {
     } finally {
       await disposeHandles(candidates);
     }
+  }
+
+  // Reactions of the bubbles on screen in the active chat, for the bridge to
+  // mirror into Telegram: [{ rawId, outgoing, reactions: [{ emoji, count,
+  // active }], reactionsUnknown }] (active = one of them is ours). Reuses what
+  // the last readMessages of this chat scraped moments ago, so a poll does not
+  // scrape twice. Bubbles whose id is not unique on screen are left out — they
+  // cannot be told apart. null when another chat is open.
+  async readReactions(chatId, { maxAgeMs = REACTION_SCAN_MAX_AGE_MS } = {}) {
+    if (!this.page || !chatId || this.activeChatId !== chatId) return null;
+    const cached = this.lastReactionScan;
+    const rows = cached && cached.chatId === chatId && Date.now() - cached.at <= maxAgeMs
+      ? cached.rows
+      : (await this.scrapeMessageRows()).map(reactionRowOf);
+    const counts = new Map();
+    for (const row of rows) counts.set(row.rawId, (counts.get(row.rawId) || 0) + 1);
+    return rows.filter((row) => !row.rawId.startsWith('visible-') && counts.get(row.rawId) === 1);
+  }
+
+  // Sets the owner's reaction on a MAX bubble to `emoji`, or takes it back
+  // (emoji null). MAX keeps one reaction of your own per message; choosing
+  // another replaces it. The ways, in order: a chip under the bubble already
+  // shows that emoji (clicking it toggles ours); otherwise the message menu —
+  // right click, or the "Message actions" button — whose top row lists the
+  // reactions, expanded when the emoji is not among the first ones.
+  // Resolves to { ok, changed, reason, available }; never throws for a
+  // missing button or emoji, only for a broken page.
+  async reactToMessage(chatId, fingerprint, emoji) {
+    await this.ensureActiveChat(chatId);
+    // A reaction, or several acceptable ones, best first; none = take back.
+    const candidates = (Array.isArray(emoji) ? emoji : [emoji]).map(normalizeEmojiInPage).filter(Boolean);
+    const wanted = candidates.length ? candidates : null;
+    try {
+      const found = await this.findAndHoverMessage(fingerprint);
+      if (!found) return { ok: false, reason: 'message-not-found' };
+      const box = await this.revealBubble(found);
+      const viewport = this.page.viewport() || { width: 1440, height: 980 };
+      const onScreen = (chip) => Boolean(chip) && chip.x > 0 && chip.y > 0 && chip.x < viewport.width && chip.y < viewport.height;
+      const chips = await this.reactionChipsAt(box);
+      const own = chips.find((chip) => chip.active);
+      if (!wanted) {
+        if (!own) return { ok: true, changed: false };
+        if (!onScreen(own)) return await this.pickReactionFromMenu(box, null);
+        await this.page.mouse.click(own.x, own.y);
+        return { ok: true, changed: true };
+      }
+      if (own && wanted.includes(normalizeEmojiInPage(own.emoji))) return { ok: true, changed: false, emoji: own.emoji };
+      for (const candidate of wanted) {
+        const existing = chips.find((chip) => normalizeEmojiInPage(chip.emoji) === candidate);
+        if (onScreen(existing)) {
+          await this.page.mouse.click(existing.x, existing.y);
+          return { ok: true, changed: true, emoji: existing.emoji };
+        }
+      }
+      return await this.pickReactionFromMenu(box, wanted);
+    } finally {
+      await this.closeMessageMenu();
+      await this.scrollMessageListToBottom();
+    }
+  }
+
+  // Brings the bubble at `box` (as findAndHoverMessage returned it) to the
+  // middle of the message list — its reaction chips sit below it — and
+  // hovers it again. Returns where it is now.
+  async revealBubble(box) {
+    const moved = await this.page.evaluate((sel, area) => {
+      const node = [...document.querySelectorAll(sel)].find((el) => {
+        const rect = el.getBoundingClientRect();
+        return Math.abs(rect.x - area.x) < 4 && Math.abs(rect.y - area.y) < 4 && Math.abs(rect.height - area.h) < 4;
+      });
+      if (!node) return null;
+      node.scrollIntoView({ block: 'center', inline: 'nearest' });
+      const rect = node.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+    }, this.selectors.messageItem, box).catch(() => null);
+    if (!moved) return box;
+    await this.page.mouse.move(moved.x + moved.w / 2, moved.y + Math.min(moved.h / 2, 24), { steps: 4 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return moved;
+  }
+
+  // The reaction chips of the bubble at `box`, with where to click them.
+  async reactionChipsAt(box) {
+    const rows = await this.scrapeMessageRows();
+    const row = rows.find((candidate) => candidate.box
+      && Math.abs(candidate.box.x - box.x) < 4 && Math.abs(candidate.box.y - box.y) < 4
+      && Math.abs(candidate.box.h - box.h) < 4);
+    return row?.reactions || [];
+  }
+
+  // Opens the bubble's message menu and picks the first of `wanted` its
+  // reaction row has (null: takes back the one marked as ours).
+  async pickReactionFromMenu(box, wanted) {
+    if (!await this.openMessageMenu(box)) {
+      logger.warn('reactToMessage: the message menu did not open');
+      await this.captureDiagnostics('reaction-no-menu', { throttleMs: 10 * 60 * 1000 }).catch(() => null);
+      return { ok: false, reason: 'menu-not-found' };
+    }
+    let picked = await this.clickReactionOption(wanted);
+    if (!picked.found && wanted && await this.clickFirstVisible(this.selectors.reactionExpand)) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      picked = await this.clickReactionOption(wanted);
+    }
+    if (picked.found) return { ok: true, changed: picked.clicked, emoji: picked.emoji };
+    if (!picked.available.length) {
+      await this.captureDiagnostics('reaction-no-options', { throttleMs: 10 * 60 * 1000 }).catch(() => null);
+      return { ok: false, reason: 'no-reactions-in-menu', available: [] };
+    }
+    return { ok: false, reason: 'emoji-not-available', available: picked.available };
+  }
+
+  // Right click on the bubble (MAX opens its message menu on contextmenu),
+  // else its "Message actions" button. True once the menu's reactions show.
+  async openMessageMenu(box) {
+    const cx = box.x + box.w / 2;
+    const cy = box.y + Math.min(box.h / 2, 24);
+    await this.page.mouse.click(cx, cy, { button: 'right' });
+    if (await this.waitForVisible(this.selectors.reactionOption, 1500)) return true;
+    await this.closeMessageMenu();
+    await this.page.mouse.move(cx, cy);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const clicked = await this.page.evaluate((sel, area) => {
+      try {
+        const top = area.y - 40;
+        const bottom = area.y + area.h + 40;
+        const button = [...document.querySelectorAll(sel)].find((el) => {
+          const rect = el.getBoundingClientRect();
+          const centerY = rect.y + rect.height / 2;
+          return rect.width > 0 && centerY >= top && centerY <= bottom;
+        });
+        if (!button) return false;
+        button.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }, this.selectors.messageActionsButton, box).catch(() => false);
+    return clicked && this.waitForVisible(this.selectors.reactionOption, 1500);
+  }
+
+  // Clicks the first of the reactions `wanted` the open menu has — unless it
+  // is already ours (clicking would take it back); with wanted null, clicks
+  // the one that is ours. In the page, so it works wherever MAX placed the
+  // menu. Resolves to { found, clicked, emoji, available }.
+  async clickReactionOption(wanted) {
+    return this.page.evaluate((sel, target) => {
+      const pictographic = /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u;
+      const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+      const emojiIn = (value) => (segmenter ? [...segmenter.segment(value || '')].map((part) => part.segment) : Array.from(value || ''))
+        .filter((grapheme) => pictographic.test(grapheme));
+      const normalize = (value) => String(value || '').replace(/[︎️]/gu, '').replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
+      let elements = [];
+      try {
+        elements = [...document.querySelectorAll(sel)];
+      } catch {
+        return { found: false, clicked: false, available: [] };
+      }
+      const options = elements.map((el) => {
+        const rect = el.getBoundingClientRect();
+        if (!rect.width || !rect.height) return null;
+        const labels = [...el.querySelectorAll('[data-lexical-animoji-emoji], [data-lexical-emoji], img[alt]')]
+          .map((node) => node.getAttribute('data-lexical-animoji-emoji') || node.getAttribute('data-lexical-emoji') || node.getAttribute('alt') || '');
+        const emoji = [...labels, el.getAttribute('aria-label') || '', el.getAttribute('title') || '', el.textContent || ''].flatMap(emojiIn)[0] || null;
+        const active = /(^|\s)[\w-]*--active(\s|$)/.test(el.getAttribute('class') || '') || el.getAttribute('aria-pressed') === 'true';
+        return { el, emoji, active };
+      }).filter(Boolean);
+      const available = [...new Set(options.map((option) => option.emoji).filter(Boolean))];
+      if (target === null) {
+        const ours = options.find((option) => option.active);
+        if (ours) ours.el.click();
+        return { found: options.length > 0, clicked: Boolean(ours), available };
+      }
+      const option = target.map((wanted) => options.find((candidate) => normalize(candidate.emoji) === wanted)).find(Boolean);
+      if (!option) return { found: false, clicked: false, available };
+      if (!option.active) option.el.click();
+      return { found: true, clicked: !option.active, emoji: option.emoji, available };
+    }, this.selectors.reactionOption, wanted).catch(() => ({ found: false, clicked: false, available: [] }));
+  }
+
+  async waitForVisible(selector, timeoutMs) {
+    if (!selector) return false;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const visible = await this.page.evaluate((sel) => {
+        try {
+          return [...document.querySelectorAll(sel)].some((el) => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          });
+        } catch {
+          return false;
+        }
+      }, selector).catch(() => false);
+      if (visible) return true;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return false;
+  }
+
+  async clickFirstVisible(selector) {
+    if (!selector) return false;
+    return this.page.evaluate((sel) => {
+      try {
+        const element = [...document.querySelectorAll(sel)].find((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+        if (!element) return false;
+        element.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }, selector).catch(() => false);
+  }
+
+  // Escape closes an open menu — but with no menu open, MAX takes it as
+  // "close this chat". So only when a menu is actually showing.
+  async closeMessageMenu() {
+    if (!this.page) return;
+    const open = await this.page.evaluate((sel) => {
+      try {
+        return [...document.querySelectorAll(sel)].some((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+      } catch {
+        return false;
+      }
+    }, this.selectors.messageMenu || '[role="menu"]').catch(() => false);
+    if (open) await this.page.keyboard.press('Escape').catch(() => {});
   }
 
   async sendText(chatId, text, replyToFingerprint = null) {
@@ -2164,7 +2629,17 @@ export class MaxWebClient {
   }
 }
 
-const withoutWhitespace = (value) => String(value ?? '').replace(/\s+/g, '');
+// For comparing a sent text with what the bubble shows: line breaks come back
+// as nothing (separate paragraphs), and an emoji may come back with or without
+// its U+FE0F variation selector.
+const withoutWhitespace = (value) => String(value ?? '').replace(/[\s\uFE0E\uFE0F]+/g, '');
+
+// Same normalisation as domain/reactions.js normalizeEmoji, for comparing with
+// what the page renders.
+const normalizeEmojiInPage = (emoji) => String(emoji ?? '')
+  .replace(/[\uFE0E\uFE0F]/gu, '')
+  .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '')
+  .trim();
 
 const normalizeMaxType = (type) => {
   if (Object.values(MessageType).includes(type)) return type;

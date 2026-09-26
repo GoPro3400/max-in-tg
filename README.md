@@ -76,7 +76,9 @@ MAX Relay
 | Голосовые сообщения | :warning: | MAX→TG: настоящее голосовое (клик play → перехват из сети → .ogg/.opus/.mp3). TG→MAX: уходит через меню «File», поэтому в MAX появляется прикреплённым аудиофайлом, а не голосовым пузырём |
 | Видеосообщения (кружки) | :warning: | MAX→TG: настоящий video note. TG→MAX: уходит через «Photo or video» и приходит обычным встроенным видео, не кружком |
 | Документы (PDF/DOCX/ZIP) | :white_check_mark: | Пересылка файлов из Max в Telegram |
-| Анимированные стикеры | :white_check_mark: | Lottie → `.tgs` (gzip-Lottie); фолбэк — кадры canvas → `.gif` (`sendAnimation`) / `.webm`. [Подробнее](docs/MEDIA_PIPELINE.md) |
+| Стикеры | :white_check_mark: | В обе стороны. MAX→TG — настоящим стикером Telegram: анимированный как VP9 `.webm` видео-стикер (из Lottie или кадров canvas), статичный как `.webp`; фолбэк — GIF/фото. TG→MAX: `.webp` → PNG, `.tgs`/`.webm` → анимированный GIF с прозрачностью. [Подробнее](docs/MEDIA_PIPELINE.md) |
+| Реакции | :white_check_mark: | В обе стороны. Реакция собеседника в MAX появляется в Telegram реакцией бота на это сообщение (ближайшая из доступных ботам, например 😂 → 🤣); твоя реакция в Telegram ставится в MAX от твоего имени, снятие — снимает. `SYNC_REACTIONS=false` — выключить. [Подробнее](docs/MEDIA_PIPELINE.md#3а-реакции-и-эмодзи) |
+| Эмодзи в тексте | :white_check_mark: | Эмодзи и анимодзи MAX доходят в Telegram текстом (раньше пропадали, а сообщение уходило «фотографией» эмодзи) |
 | Telegram Topics | :white_check_mark: | Авто-создание topics для новых чатов |
 | Intro-карточки | :white_check_mark: | Закреплённая карточка с именем и ID чата |
 | Delivery state | :white_check_mark: | Tracking pending/sent/failed |
@@ -87,9 +89,9 @@ MAX Relay
 | Docker deploy | :white_check_mark: | Production compose (hardened) |
 
 > :bulb: Медиа и стикеры: подробный разбор того, как устроена отправка фото/файлов
-> через меню вложений MAX и как анимированные стикеры (Lottie) превращаются в
-> Telegram `.tgs`/`.gif`/`.webm` — в [docs/MEDIA_PIPELINE.md](docs/MEDIA_PIPELINE.md).
-> Если кадры Lottie не удаётся снять, а сетевой Lottie недоступен — отправляется `[Стикер]`.
+> через меню вложений MAX и как стикеры превращаются в настоящие стикеры Telegram
+> (и обратно) — в [docs/MEDIA_PIPELINE.md](docs/MEDIA_PIPELINE.md).
+> Если стикер не удаётся ни снять, ни поймать из сети — отправляется `[Стикер]`.
 
 ---
 
@@ -396,8 +398,9 @@ max-in-tg/
 | Ограничение | Описание |
 |-------------|----------|
 | Max Web DOM | Селекторы зависят от DOM Max Web и могут сломаться при обновлении |
-| Утечка памяти Chromium | Рендерер вырастает до ~2 ГБ примерно за 3 часа, после чего фото из Telegram перестают уходить в MAX. Мост сам перезапускает браузер между циклами опроса — раз в 2 часа или сразу, как Chromium превысит 1300 МБ (`MAX_BROWSER_RECYCLE_MINUTES`, `MAX_BROWSER_MEMORY_LIMIT_MB`); Telegram-бот при этом не отключается, cron не нужен — [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
+| Память Chromium | Утечка, из-за которой рендерер за ~3 часа вырастал до ~2 ГБ, устранена. Для страховки мост между циклами опроса перезагружает вкладку MAX при 900 МБ и перезапускает Chromium при 1300 МБ или раз в 6 часов (`MAX_PAGE_RELOAD_MEMORY_MB`, `MAX_BROWSER_MEMORY_LIMIT_MB`, `MAX_BROWSER_RECYCLE_MINUTES`); Telegram-бот при этом не отключается, cron не нужен — [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
 | Стикеры | Захват из сети (Lottie/asset), иначе кадр с canvas; если не вышло ни то, ни другое — уходит текстом `[Стикер]` |
+| Реакции | Бот в Telegram может поставить только одну реакцию из списка Telegram — видна самая частая (или ближайшая замена). Реакции работают на сообщениях, которые видны в MAX Web; разметка реакций взята из кода MAX Web, при её изменении — `/diagnostics` и `MAX_SELECTORS_*` реакций |
 | At-least-once delivery | Возможны дубли при падении между send и SQLite write |
 | Идентификация чатов | Сейчас по title/index, одноимённые чаты могут путаться |
 | Один пользователь | Рассчитано на self-hosted для одного Max-аккаунта |

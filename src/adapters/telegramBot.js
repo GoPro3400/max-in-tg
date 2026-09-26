@@ -25,6 +25,7 @@ export class TelegramBotAdapter {
     this.onLoginRequested = null;
     this.onIdentityDiscoveredHandler = null;
     this.onRelayLostHandler = null;
+    this.onReactionHandler = null;
     // Set by startPairing() when no owner is configured (see /pair).
     this.pairingCode = null;
     // Wrong /pair attempts per Telegram user (see /pair).
@@ -36,6 +37,9 @@ export class TelegramBotAdapter {
     // Keeps outbound Telegram messages in the order they were sent (see the
     // 'message' handler).
     this.outboundQueue = Promise.resolve();
+    // Reactions mirrored into MAX, in the order they were made (see the
+    // 'message_reaction' handler).
+    this.reactionQueue = Promise.resolve();
     this.installHandlers();
   }
 
@@ -69,7 +73,9 @@ export class TelegramBotAdapter {
   start() {
     return new Promise((resolve, reject) => {
       let launched = false;
-      this.launchPromise = this.bot.launch({}, () => {
+      // allowed_updates must be spelled out: Telegram never sends
+      // message_reaction (the owner reacting to a message) unless asked to.
+      this.launchPromise = this.bot.launch({ allowedUpdates: ALLOWED_UPDATES }, () => {
         launched = true;
         logger.info({ username: this.bot.botInfo?.username }, 'Telegram bot polling started');
         this.publishCommandMenu();
@@ -170,6 +176,17 @@ export class TelegramBotAdapter {
   // Called when the bot is removed from the relay group.
   onRelayLost(handler) {
     this.onRelayLostHandler = handler;
+  }
+
+  // Called when the owner changes their reaction on a message.
+  onReaction(handler) {
+    this.onReactionHandler = handler;
+  }
+
+  // Sets the bot's reaction on a message (null clears it). Only emoji from
+  // Telegram's fixed list are accepted — see domain/reactions.js.
+  async setReaction(chatId, messageId, emoji) {
+    await this.bot.telegram.setMessageReaction(chatId, messageId, emoji ? [{ type: 'emoji', emoji }] : []);
   }
 
   // Zero-config ownership: with TELEGRAM_OWNER_ID unset the bot accepts a
@@ -807,6 +824,28 @@ export class TelegramBotAdapter {
       }
     });
 
+    this.bot.on('message_reaction', (ctx) => {
+      const update = ctx.messageReaction;
+      if (!update || !this.onReactionHandler) return undefined;
+      const emojis = (list) => (list || []).filter((reaction) => reaction.type === 'emoji').map((reaction) => reaction.emoji);
+      const reaction = {
+        telegramChatId: update.chat.id,
+        telegramMessageId: update.message_id,
+        emojis: emojis(update.new_reaction),
+        previousEmojis: emojis(update.old_reaction),
+        // Custom-emoji and paid reactions have no MAX counterpart.
+        otherReactions: (update.new_reaction || []).filter((reaction) => reaction.type !== 'emoji').length
+      };
+      // Mirroring drives the MAX page and can take seconds: it must not hold
+      // up Telegram polling, only keep its order.
+      this.reactionQueue = this.reactionQueue
+        .then(() => this.onReactionHandler(reaction))
+        .catch((error) => {
+          logger.error({ err: error, chatId: reaction.telegramChatId }, 'Failed to mirror a Telegram reaction into MAX');
+        });
+      return undefined;
+    });
+
     this.bot.on('message', (ctx) => {
       if (!this.onOutboundMessage || !ctx.message) return undefined;
       // Skip only real bot commands (already served by their own handlers).
@@ -960,6 +999,10 @@ const BOT_COMMANDS = new Set([
 // Wrong /pair codes one user may send before being locked out for a while.
 const MAX_PAIRING_ATTEMPTS = 5;
 const PAIRING_LOCKOUT_MS = 10 * 60 * 1000;
+
+// The update types the bot handles. Listing them is required to receive
+// message_reaction at all.
+const ALLOWED_UPDATES = ['message', 'my_chat_member', 'message_reaction'];
 
 // Telegram content the bridge cannot represent in MAX; the sender is told.
 const UNSUPPORTED_CONTENT = ['location', 'venue', 'contact', 'poll', 'dice', 'game', 'story'];

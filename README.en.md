@@ -83,10 +83,12 @@ MAX Relay
 | Voice messages | :white_check_mark: | :warning: | MAX→TG: a real voice message (click play → network intercept → .ogg/.opus/.mp3). TG→MAX: uploaded through MAX's "File" menu, so it lands as an attached audio file, not a playable voice bubble |
 | Video notes (circles) | :white_check_mark: | :warning: | MAX→TG: a real video note (roundVideo/videoCanvas detection). TG→MAX: uploaded through "Photo or video" — arrives as an ordinary inline video, not a round one |
 | Documents (PDF/DOCX/ZIP) | :white_check_mark: | :white_check_mark: | File forwarding |
-| Animated stickers | :white_check_mark: | — | Lottie → `.tgs` (gzipped Lottie); fallback — canvas frames → `.gif`/`.webm`. [Details](docs/MEDIA_PIPELINE.md) |
+| Stickers | :white_check_mark: | :white_check_mark: | MAX→TG as real Telegram stickers (animated: VP9 `.webm` video sticker; static: `.webp`; fallback GIF/photo). TG→MAX: `.webp` → PNG, `.tgs`/`.webm` → animated GIF with transparency. [Details](docs/MEDIA_PIPELINE.md) |
+| Reactions | :white_check_mark: | :white_check_mark: | MAX→TG: the contact's reaction shows as the bot's reaction on that message (nearest one bots may set: 😂 → 🤣). TG→MAX: your reaction is set in MAX as yours; removing it removes it. `SYNC_REACTIONS=false` turns it off. |
+| Emoji in text | :white_check_mark: | :white_check_mark: | MAX emoji and animoji arrive as text (they used to vanish, and the message went out as a "photo" of the emoji) |
 
 > :bulb: Media & stickers: how TG→MAX photo/file sending works through MAX's attach
-> menu, and how Lottie stickers become Telegram `.tgs`/`.gif`/`.webm` — see [docs/MEDIA_PIPELINE.md](docs/MEDIA_PIPELINE.md).
+> menu, and how stickers become real Telegram stickers (and back) — see [docs/MEDIA_PIPELINE.md](docs/MEDIA_PIPELINE.md).
 
 ### Infrastructure
 
@@ -383,13 +385,14 @@ topics for every current chat.
 |---|-----------|---------|
 | 1 | **Max Web DOM** | Project depends on DOM selectors. Max Web updates may break things. Use `/check` for diagnostics |
 | 2 | **Stickers** | Network intercept of the Lottie/sticker asset, then a canvas screenshot; if neither works the message arrives as the text `[Стикер]` |
-| 3 | **Chromium memory leak** | The renderer grows to ~2 GB in about 3 hours, after which photos from Telegram stop reaching MAX. The bridge relaunches the browser itself between poll cycles — every 2 hours, or as soon as Chromium exceeds 1300 MB (`MAX_BROWSER_RECYCLE_MINUTES`, `MAX_BROWSER_MEMORY_LIMIT_MB`); the Telegram bot stays online and no cron job is needed — [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
+| 3 | **Chromium memory** | The leak that grew the renderer to ~2 GB in ~3 hours is fixed. As a safety net the bridge reloads the MAX tab above 900 MB and relaunches Chromium above 1300 MB or every 6 hours, between poll cycles (`MAX_PAGE_RELOAD_MEMORY_MB`, `MAX_BROWSER_MEMORY_LIMIT_MB`, `MAX_BROWSER_RECYCLE_MINUTES`); the Telegram bot stays online and no cron job is needed — [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
 | 4 | **At-least-once** | Possible duplicates if process crashes between send and SQLite write |
 | 5 | **Chat identity** | By title/index — same-named chats may be confused |
 | 6 | **Single user** | Self-hosted for one Max account |
 | 7 | **No retry policy** | Failed deliveries are not automatically retried |
 | 8 | **Media reply matching accuracy** | Best-effort: photos match by dHash (most reliable), other types only when a CDN token for the original is available; messages forwarded before this update have no hash and won't be matched retroactively; if matching isn't confident, no quote is attached |
 | 9 | **Telegram→MAX replies** | Works for replies to text and media MAX originals, and to your own previously Telegram-sent text messages; replies to your own non-text messages (photos etc.) aren't resolved yet. Always best-effort: if the bot can't locate the target bubble in MAX Web, the message is sent without a quote rather than failing |
+| 10 | **Reactions** | A Telegram bot can set only one reaction, from Telegram's list — the most used one (or its nearest stand-in) is shown. Reactions work on messages that are on screen in MAX Web; the reaction markup is taken from MAX Web's own code — if it changes, see `/diagnostics` and the reaction `MAX_SELECTORS_*` |
 
 ---
 

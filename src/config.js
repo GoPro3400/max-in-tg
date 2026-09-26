@@ -60,6 +60,10 @@ export const config = {
     userDataDir: resolveFromRoot(process.env.MAX_USER_DATA_DIR || './data/chrome-profile'),
     headless: bool(process.env.MAX_HEADLESS, false),
     protocolTimeoutMs: int(process.env.MAX_PROTOCOL_TIMEOUT_MS, 180000),
+    // Keep MAX's animated emoji still, as the plain emoji picture it shows
+    // while loading — the only form in which a reaction says which emoji it
+    // is (see STATIC_ANIMOJI_SCRIPT in maxWebClient.js). Stickers stay animated.
+    staticAnimoji: bool(process.env.MAX_STATIC_ANIMOJI, true),
     selectors: {
       chatList: process.env.MAX_SELECTORS_CHAT_LIST || 'aside[aria-labelledby="aside-header-title"] .scrollListContent',
       chatItem: process.env.MAX_SELECTORS_CHAT_ITEM || 'aside[aria-labelledby="aside-header-title"] .item[data-index]',
@@ -99,7 +103,20 @@ export const config = {
       // "Message actions" /more menu). Clicking it puts the composer into
       // reply mode, shown by a banner with a close ("x") button that cancels it.
       messageReplyButton: process.env.MAX_SELECTORS_MESSAGE_REPLY_BUTTON || 'button[aria-label="Reply"]',
-      composerReplyActive: process.env.MAX_SELECTORS_COMPOSER_REPLY_ACTIVE || '[data-testid="composer"] button.close'
+      composerReplyActive: process.env.MAX_SELECTORS_COMPOSER_REPLY_ACTIVE || '[data-testid="composer"] button.close',
+      // Reactions, as MAX Web draws them: a bubble's chips (.reaction, ours
+      // marked .reaction--active, with a .counter) sit in a .reactions
+      // container inside the bubble or right after it. To react, the bridge
+      // clicks a chip, or opens the message menu (right click, else
+      // messageActionsButton) whose reaction row lists reactionOption
+      // buttons, expanded with reactionExpand. The emoji is read from each
+      // chip's <img alt> (see max.staticAnimoji).
+      messageReactions: process.env.MAX_SELECTORS_MESSAGE_REACTIONS || '.reactions',
+      messageReactionChip: process.env.MAX_SELECTORS_MESSAGE_REACTION_CHIP || '.reaction',
+      messageActionsButton: process.env.MAX_SELECTORS_MESSAGE_ACTIONS_BUTTON || 'button[aria-label="Message actions"], button[aria-label="Действия с сообщением"]',
+      messageMenu: process.env.MAX_SELECTORS_MESSAGE_MENU || '[role="menu"]',
+      reactionOption: process.env.MAX_SELECTORS_REACTION_OPTION || '[role="menu"] .reaction, .menuContainer .reaction',
+      reactionExpand: process.env.MAX_SELECTORS_REACTION_EXPAND || '[role="menu"] .extendBtn, .menuContainer .extendBtn'
     }
   },
   sqlitePath: resolveFromRoot(process.env.SQLITE_PATH || './data/max-in-tg.sqlite'),
@@ -127,5 +144,7 @@ export const config = {
   pageReloadMemoryMb: Math.max(0, int(process.env.MAX_PAGE_RELOAD_MEMORY_MB, 900)),
   browserMemoryLimitMb: Math.max(0, int(process.env.MAX_BROWSER_MEMORY_LIMIT_MB, 1300)),
   browserRecycleMinutes: Math.max(0, int(process.env.MAX_BROWSER_RECYCLE_MINUTES, 360)),
-  maxDeliveryAttempts: Math.max(1, int(process.env.MAX_DELIVERY_ATTEMPTS, 5))
+  maxDeliveryAttempts: Math.max(1, int(process.env.MAX_DELIVERY_ATTEMPTS, 5)),
+  // Mirror reactions between MAX and Telegram (see BridgeService).
+  reactionsEnabled: bool(process.env.SYNC_REACTIONS, true)
 };

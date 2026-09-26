@@ -120,6 +120,13 @@ export class AppDatabase {
         ON messages(direction, source_message_id);
     `);
 
+    // Reaction mirroring looks up our own messages by their MAX bubble on
+    // every poll (getTgToMaxByMaxFingerprintStmt).
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_chat_max_fingerprint
+        ON messages(chat_id, max_fingerprint, created_at DESC) WHERE max_fingerprint IS NOT NULL;
+    `);
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS message_deliveries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -222,9 +229,31 @@ export class AppDatabase {
       )
     `);
 
+    // Telegram message ids are only unique within one Telegram chat; after a
+    // move to another relay group the newest match is the relevant one.
     this.getMessageByTelegramMessageIdStmt = this.db.prepare(
-      'SELECT * FROM messages WHERE telegram_message_id = ? LIMIT 1'
+      'SELECT * FROM messages WHERE telegram_message_id = ? ORDER BY created_at DESC LIMIT 1'
     );
+    // Every message a Telegram message id may refer to — ids repeat across
+    // Telegram chats, so the caller picks the one in the right chat.
+    this.listByTelegramMessageIdStmt = this.db.prepare(
+      'SELECT * FROM messages WHERE telegram_message_id = ? ORDER BY created_at DESC LIMIT 20'
+    );
+    this.listTgToMaxBySourceIdStmt = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE direction = 'tg_to_max' AND source_message_id = ?
+      ORDER BY created_at DESC
+      LIMIT 20
+    `);
+    this.getMessageStmt = this.db.prepare('SELECT * FROM messages WHERE id = ?');
+    this.updateMessageMetadataStmt = this.db.prepare('UPDATE messages SET metadata = ? WHERE id = ?');
+    // Our own message in MAX, found by the fingerprint of its MAX bubble.
+    this.getTgToMaxByMaxFingerprintStmt = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE chat_id = ? AND direction = 'tg_to_max' AND max_fingerprint = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
 
     // Telegram→MAX replies (v2): finds a message the user typed in Telegram and
     // the bridge sent into MAX (direction=tg_to_max), by the Telegram message_id
@@ -449,6 +478,29 @@ export class AppDatabase {
       maxFingerprint: message.maxFingerprint ?? null
     });
     return result.changes > 0;
+  }
+
+  getMessage(id) {
+    const row = this.getMessageStmt.get(id);
+    return row ? rowToMessage(row) : null;
+  }
+
+  updateMessageMetadata(id, metadata) {
+    this.updateMessageMetadataStmt.run(JSON.stringify(metadata || {}), id);
+  }
+
+  listMessagesByTelegramMessageId(telegramMessageId) {
+    return this.listByTelegramMessageIdStmt.all(telegramMessageId).map(rowToMessage);
+  }
+
+  listTgToMaxMessagesBySourceId(telegramMessageId) {
+    return this.listTgToMaxBySourceIdStmt.all(String(telegramMessageId)).map(rowToMessage);
+  }
+
+  getTgToMaxMessageByMaxFingerprint(chatId, fingerprint) {
+    if (!chatId || !fingerprint) return null;
+    const row = this.getTgToMaxByMaxFingerprintStmt.get(chatId, fingerprint);
+    return row ? rowToMessage(row) : null;
   }
 
   // Returns the message whose Telegram message_id matches, or null if not found.

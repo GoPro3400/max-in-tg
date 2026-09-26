@@ -1,6 +1,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { MessageType, humanMessage } from '../domain/messages.js';
+import { MessageType, humanMessage, stableId } from '../domain/messages.js';
+import { reactionCandidates, toTelegramReaction } from '../domain/reactions.js';
 import { logger } from '../logger.js';
 import { listFilesByMtime } from '../utils/fileHelpers.js';
 import { AsyncLock } from './asyncLock.js';
@@ -89,7 +90,35 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const toMb = (bytes) => Math.round(bytes / (1024 * 1024));
 // Echo-guard comparison key. Whitespace is dropped: a multi-line message comes
 // back from the page without its line breaks.
-const echoKey = (text) => String(text ?? '').replace(/\s+/g, '');
+// Reaction problems are reported to the owner at most this often per kind.
+const REACTION_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
+
+// The reaction the bot shows in Telegram for a MAX message: the most used one
+// OTHER people put on it (MAX lists chips most used first; a chip marked as
+// ours counts one less) that a bot is allowed to set. null for none.
+export const mirroredReaction = (reactions = []) => {
+  for (const reaction of reactions) {
+    const others = (reaction.count || 1) - (reaction.active ? 1 : 0);
+    if (others < 1) continue;
+    const emoji = toTelegramReaction(reaction.emoji);
+    if (emoji) return emoji;
+  }
+  return null;
+};
+
+// How to find a message forwarded from MAX in the MAX page again: a text by
+// its fingerprint, media by its CDN token (its signed URL changes on every
+// page load — see resolveMaxReplyTarget), else the fingerprint as a last try.
+const maxFingerprintOf = (original) => {
+  const usable = (fingerprint) => (fingerprint && !fingerprint.startsWith('visible-') ? fingerprint : null);
+  if (original.type === MessageType.TEXT) return usable(original.sourceMessageId);
+  const token = original.mediaUrl ? extractMediaToken(original.mediaUrl) : null;
+  return token ? `media-token:${token}` : usable(original.sourceMessageId);
+};
+
+// Whitespace- and variation-selector-insensitive: MAX gives a multi-line
+// text back without its line breaks, and an emoji with or without U+FE0F.
+const echoKey = (text) => String(text ?? '').replace(/[\s\uFE0E\uFE0F]+/g, '');
 
 // The bot can no longer post in that chat at all (removed, banned, the group
 // deleted or turned into another chat) — not a temporary restriction.
@@ -203,6 +232,9 @@ export class BridgeService {
     // so Docker restarts the container).
     this.consecutiveLaunchFailures = 0;
     this.onFatal = null;
+    // Reaction problems already reported to the owner (reason → when), so a
+    // run of reactions does not turn into a run of warnings.
+    this.reactionNoticeAt = new Map();
   }
 
   async start() {
@@ -312,6 +344,7 @@ export class BridgeService {
     this.telegramBot.onLogin(() => this.requestLogin());
     this.telegramBot.onIdentityDiscovered((identity) => this.persistIdentity(identity));
     this.telegramBot.onRelayLost?.((chatId, reason) => this.handleRelayLost(chatId, reason));
+    this.telegramBot.onReaction?.((reaction) => this.handleTelegramReaction(reaction));
   }
 
   // Owner and relay group can be discovered at runtime instead of configured;
@@ -1001,6 +1034,7 @@ export class BridgeService {
           }
           // Otherwise leave it unseen so the next poll retries it.
         }
+        await this.syncReactionsFromMax(chat);
       }
       // If every reachable chat failed, this is a real problem (expired session,
       // broken DOM) rather than archived/unreachable chats — surface it so
@@ -1523,6 +1557,9 @@ export class BridgeService {
       // the subsequent insertMessage call (in pollMax) stores it in the DB.
       // This enables future reply-linking features via getMessageByTelegramMessageId.
       message.telegramMessageId = sent?.message_id ?? null;
+      // Which Telegram chat that id belongs to (ids repeat across chats, and
+      // the route can move later) — for mirroring reactions.
+      message.metadata = { ...message.metadata, telegramChatId: mapping.telegramChatId };
       this.db.updateDeliveryStatus(deliveryId, 'sent');
       logger.info({ messageId: message.id, type: message.type, chatId: message.chatId }, 'Forwarded Max message to Telegram');
       return true;
@@ -1811,6 +1848,145 @@ export class BridgeService {
     // long as its URL carries a token — no type allowlist needed.
     const token = original.mediaUrl ? extractMediaToken(original.mediaUrl) : null;
     return token ? `media-token:${token}` : null;
+  }
+
+  // ---- Reactions ----
+  //
+  // MAX → Telegram: what other people put on a message in MAX shows in
+  // Telegram as the bot's reaction on the matching message. A bot may set one
+  // reaction, from Telegram's fixed list, so it is the most used one Telegram
+  // accepts. The owner's own reaction in MAX (MAX marks it as ours) is left
+  // out: set from Telegram, it is already there as the owner's own.
+  // Telegram → MAX: the owner's reaction on a bridged message becomes their
+  // reaction in MAX (MAX keeps one per person); taking it back takes it back.
+
+  async syncReactionsFromMax(chat) {
+    if (!this.config.reactionsEnabled || this.telegramPaused()) return;
+    if (typeof this.maxClient.readReactions !== 'function' || typeof this.telegramBot.setReaction !== 'function') return;
+    let rows;
+    try {
+      rows = await this.maxClient.readReactions(chat.id);
+    } catch (error) {
+      logger.debug({ err: error, chatId: chat.id }, 'Could not read MAX reactions');
+      return;
+    }
+    if (!rows?.length) return;
+    const mapping = this.db.getChatMapping(chat.id);
+    for (const row of rows) {
+      // A chip whose emoji could not be read: better nothing than a guess.
+      if (row.reactionsUnknown) continue;
+      const target = this.telegramMessageForBubble(chat.id, row, mapping);
+      if (!target) continue;
+      const wanted = mirroredReaction(row.reactions);
+      if (wanted === (target.message.metadata?.mirroredReaction ?? null)) continue;
+      try {
+        await this.telegramBot.setReaction(target.telegramChatId, target.telegramMessageId, wanted);
+        logger.info({ chatId: chat.id, emoji: wanted }, 'Mirrored a MAX reaction into Telegram');
+      } catch (error) {
+        const retryAfter = telegramRetryAfter(error);
+        if (retryAfter) {
+          this.telegramPausedUntil = Math.max(this.telegramPausedUntil, Date.now() + retryAfter * 1000);
+          logger.warn({ retryAfter }, 'Telegram flood control while mirroring reactions — pausing');
+          return;
+        }
+        // The group may not allow that reaction, or the message is gone. It
+        // is still recorded, so it is not retried on every poll.
+        logger.warn({ err: error, chatId: chat.id, emoji: wanted }, 'Could not mirror a MAX reaction into Telegram');
+      }
+      this.db.updateMessageMetadata(target.message.id, { ...target.message.metadata, mirroredReaction: wanted });
+    }
+  }
+
+  // The Telegram message a MAX bubble was bridged as: one forwarded from MAX,
+  // or the owner's own one sent into MAX from Telegram.
+  telegramMessageForBubble(chatId, row, mapping) {
+    if (row.outgoing) {
+      const own = this.db.getTgToMaxMessageByMaxFingerprint(chatId, row.rawId);
+      const telegramMessageId = Number(own?.sourceMessageId) || null;
+      const telegramChatId = own?.metadata?.telegramChatId ?? null;
+      return telegramMessageId && telegramChatId ? { message: own, telegramChatId, telegramMessageId } : null;
+    }
+    const forwarded = this.db.getMessage(stableId('max', chatId, row.rawId));
+    if (!forwarded?.telegramMessageId) return null;
+    // Older records do not say which Telegram chat they went to; the route's
+    // chat is only trusted if the route has not changed since.
+    const telegramChatId = forwarded.metadata?.telegramChatId
+      ?? (mapping && mapping.updatedAt <= forwarded.createdAt ? mapping.telegramChatId : null);
+    return telegramChatId ? { message: forwarded, telegramChatId, telegramMessageId: forwarded.telegramMessageId } : null;
+  }
+
+  async handleTelegramReaction({ telegramChatId, telegramMessageId, emojis = [], previousEmojis = [], otherReactions = 0 }) {
+    if (!this.config.reactionsEnabled || typeof this.maxClient.reactToMessage !== 'function') return;
+    // Only custom or paid reactions: nothing MAX could show, and not a removal.
+    if (!emojis.length && otherReactions) return;
+    const target = this.maxBubbleForTelegramMessage(telegramChatId, telegramMessageId);
+    if (!target) {
+      logger.debug({ telegramChatId, telegramMessageId }, 'Reaction on a Telegram message that is not bridged — ignored');
+      return;
+    }
+    // MAX keeps one reaction per person: the one just added (Telegram
+    // Premium allows several), or what is left, or none.
+    const added = emojis.filter((emoji) => !previousEmojis.includes(emoji));
+    const emoji = emojis.length ? (added.at(-1) ?? emojis.at(-1)) : null;
+    if (this.loginInProgress || !this.maxClient.page) {
+      await this.reportReactionFailure(target, emoji, { reason: 'max-not-ready' });
+      return;
+    }
+    let result;
+    try {
+      // The emoji itself, else its nearest relative MAX offers (🤣 -> 😂).
+      const wanted = emoji ? reactionCandidates(emoji) : null;
+      result = await this.maxLock.run(() => this.maxClient.reactToMessage(target.chatId, target.fingerprint, wanted));
+    } catch (error) {
+      result = { ok: false, reason: error?.message || String(error) };
+    }
+    if (result?.ok) {
+      logger.info({ chatId: target.chatId, emoji: result.emoji || emoji, changed: result.changed }, 'Mirrored a Telegram reaction into MAX');
+      return;
+    }
+    logger.warn({ chatId: target.chatId, emoji, reason: result?.reason }, 'Could not mirror a Telegram reaction into MAX');
+    await this.reportReactionFailure(target, emoji, result || {});
+  }
+
+  // The MAX bubble a Telegram message stands for, checked to be in that
+  // Telegram chat (message ids repeat across chats).
+  maxBubbleForTelegramMessage(telegramChatId, telegramMessageId) {
+    for (const original of this.db.listMessagesByTelegramMessageId(telegramMessageId)) {
+      if (original.direction !== 'max_to_tg') continue;
+      const mapping = this.db.getChatMapping(original.chatId);
+      if ((original.metadata?.telegramChatId ?? mapping?.telegramChatId) !== telegramChatId) continue;
+      const fingerprint = maxFingerprintOf(original);
+      return fingerprint ? { chatId: original.chatId, fingerprint, telegramChatId, telegramThreadId: mapping?.telegramThreadId ?? null } : null;
+    }
+    for (const own of this.db.listTgToMaxMessagesBySourceId(telegramMessageId)) {
+      if (own.metadata?.telegramChatId !== telegramChatId) continue;
+      if (!own.maxFingerprint || own.maxFingerprint.startsWith('visible-')) return null;
+      return { chatId: own.chatId, fingerprint: own.maxFingerprint, telegramChatId, telegramThreadId: own.metadata?.telegramThreadId ?? null };
+    }
+    return null;
+  }
+
+  // Tells the owner, where they reacted, that it did not reach MAX — once per
+  // kind of problem every ten minutes.
+  async reportReactionFailure(target, emoji, { reason = 'unknown', available = [] }) {
+    const key = `${reason}:${emoji || ''}`;
+    const now = Date.now();
+    if (now - (this.reactionNoticeAt.get(key) || 0) < REACTION_NOTICE_INTERVAL_MS) return;
+    this.reactionNoticeAt.set(key, now);
+    let text;
+    if (reason === 'emoji-not-available') {
+      text = `⚠️ В MAX нет реакции ${emoji} на это сообщение.${available.length ? ` Можно: ${available.join(' ')}` : ''}`;
+    } else if (reason === 'message-not-found') {
+      text = '⚠️ Реакция не дошла до MAX: сообщение не нашлось на странице (слишком далеко в истории).';
+    } else if (reason === 'max-not-ready') {
+      text = '⚠️ Реакция не дошла до MAX: MAX ещё не подключён.';
+    } else {
+      text = `⚠️ Не получилось ${emoji ? `поставить реакцию ${emoji}` : 'убрать реакцию'} в MAX (${reason}). Подробности — /diagnostics.`;
+    }
+    await this.telegramBot.sendText(text, {
+      telegramChatId: target.telegramChatId,
+      telegramThreadId: target.telegramThreadId
+    }).catch((error) => logger.warn({ err: error }, 'Failed to report a reaction problem'));
   }
 
   resolveTelegramMapping(message) {

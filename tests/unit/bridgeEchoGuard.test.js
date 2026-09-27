@@ -55,6 +55,35 @@ describe('echo guard', () => {
     expect(telegramBot.sendMessage.mock.calls[0][0].id).toBe('real-1');
   });
 
+  it('once MAX shows our bubble as outgoing, the contact repeating our words right away is delivered', async () => {
+    // The usual case: MAX marks our bubble outgoing within a second, the
+    // poller never sees it — and the unconsumed record used to swallow the
+    // contact's identical reply ("Да", "Ок", "+") for the next 20 seconds.
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    bridge.lastChatRefreshAt = Date.now();
+    linkChat(db, 'chat-a', { unread: true });
+    maxClient.getLastOutgoingFingerprint.mockResolvedValue('fp-ours|12:00|Да');
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-1', { text: 'Да' }));
+    maxClient.readMessages.mockResolvedValue([maxMessage('contact-1', 'chat-a', { text: 'Да' })]);
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+    expect(telegramBot.sendMessage.mock.calls[0][0].id).toBe('contact-1');
+  });
+
+  it('recognises a multi-line echo whose line breaks were lost in the page', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    bridge.lastChatRefreshAt = Date.now();
+    linkChat(db, 'chat-a', { unread: true });
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-1', { text: 'первая строка\nвторая' }));
+    maxClient.readMessages.mockResolvedValue([maxMessage('echo-1', 'chat-a', { text: 'первая строкавторая' })]);
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+  });
+
   it('expires, so the same words minutes later are not swallowed', async () => {
     vi.useFakeTimers();
     const { bridge, db, maxClient, telegramBot } = makeBridge();

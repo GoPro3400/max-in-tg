@@ -51,9 +51,6 @@ export class AppDatabase {
         FOREIGN KEY(max_chat_id) REFERENCES chats(id) ON DELETE CASCADE
       );
 
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_mappings_telegram_thread
-        ON chat_mappings(telegram_chat_id, telegram_thread_id)
-        WHERE telegram_thread_id IS NOT NULL;
 
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -102,6 +99,18 @@ export class AppDatabase {
         ON messages(telegram_message_id);
     `);
 
+    // One topic belongs to one MAX chat — except for chats /merge redirected
+    // into another chat's topic, which share it. The original unique index
+    // allowed no sharing at all, so /merge either did nothing or failed with
+    // "UNIQUE constraint failed". Merged mappings are now left out of it (and
+    // out of the topic -> chat lookup, see getMappingByTelegramThreadStmt).
+    this.db.exec(`
+      DROP INDEX IF EXISTS idx_chat_mappings_telegram_thread;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_mappings_thread_owner
+        ON chat_mappings(telegram_chat_id, telegram_thread_id)
+        WHERE telegram_thread_id IS NOT NULL AND json_extract(metadata, '$.mergedInto') IS NULL;
+    `);
+
     // Covers getTgToMaxMessageBySourceIdStmt (WHERE direction='tg_to_max' AND
     // source_message_id=?), which otherwise full-table-scans an unbounded
     // table on every Telegram->MAX reply resolution inside the maxLock'd send
@@ -109,6 +118,13 @@ export class AppDatabase {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_messages_direction_source
         ON messages(direction, source_message_id);
+    `);
+
+    // Reaction mirroring looks up our own messages by their MAX bubble on
+    // every poll (getTgToMaxByMaxFingerprintStmt).
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_chat_max_fingerprint
+        ON messages(chat_id, max_fingerprint, created_at DESC) WHERE max_fingerprint IS NOT NULL;
     `);
 
     this.db.exec(`
@@ -150,6 +166,19 @@ export class AppDatabase {
         console.error('Failed to migrate legacy message_deliveries rows; legacy table kept:', error);
       }
     }
+
+    // Again after the rebuild: the renamed legacy table kept these index
+    // NAMES, so the CREATE INDEX IF NOT EXISTS above skipped them, and they
+    // were dropped together with the legacy table — the delivery table of a
+    // migrated database had no indexes at all, and every retry count scanned
+    // all of it. Idempotent, so it also repairs a database migrated earlier.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_deliveries_status
+        ON message_deliveries(status);
+
+      CREATE INDEX IF NOT EXISTS idx_deliveries_message
+        ON message_deliveries(message_id);
+    `);
   }
 
   prepare() {
@@ -174,7 +203,15 @@ export class AppDatabase {
       )
       ON CONFLICT(max_chat_id) DO UPDATE SET
         telegram_chat_id = excluded.telegram_chat_id,
-        telegram_thread_id = COALESCE(chat_mappings.telegram_thread_id, excluded.telegram_thread_id),
+        -- A new topic always wins (a /relay move, /merge, /unmerge, a topic
+        -- recreated after the old one was deleted). A missing one keeps the
+        -- current topic only within the same Telegram chat — moving to
+        -- another chat without a topic must not carry a foreign thread id.
+        telegram_thread_id = CASE
+          WHEN excluded.telegram_thread_id IS NOT NULL THEN excluded.telegram_thread_id
+          WHEN excluded.telegram_chat_id = chat_mappings.telegram_chat_id THEN chat_mappings.telegram_thread_id
+          ELSE NULL
+        END,
         title = excluded.title,
         enabled = excluded.enabled,
         updated_at = excluded.updated_at,
@@ -186,7 +223,12 @@ export class AppDatabase {
       WHERE telegram_chat_id = ?
         AND COALESCE(telegram_thread_id, 0) = COALESCE(?, 0)
         AND enabled = 1
+        AND json_extract(metadata, '$.mergedInto') IS NULL
+      ORDER BY updated_at DESC
       LIMIT 1
+    `);
+    this.clearMappingThreadStmt = this.db.prepare(`
+      UPDATE chat_mappings SET telegram_thread_id = NULL, metadata = ?, updated_at = ? WHERE max_chat_id = ?
     `);
     this.listMappingsStmt = this.db.prepare('SELECT * FROM chat_mappings WHERE enabled = 1 ORDER BY title ASC');
 
@@ -200,9 +242,34 @@ export class AppDatabase {
       )
     `);
 
+    // Telegram message ids are only unique within one Telegram chat; after a
+    // move to another relay group the newest match is the relevant one. On a
+    // tie the later row: a bubble recorded again under its current id (see
+    // BridgeService.adoptLegacyId) shares its Telegram message and creation
+    // time with its old record, and the current id is the one MAX shows.
     this.getMessageByTelegramMessageIdStmt = this.db.prepare(
-      'SELECT * FROM messages WHERE telegram_message_id = ? LIMIT 1'
+      'SELECT * FROM messages WHERE telegram_message_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
     );
+    // Every message a Telegram message id may refer to — ids repeat across
+    // Telegram chats, so the caller picks the one in the right chat.
+    this.listByTelegramMessageIdStmt = this.db.prepare(
+      'SELECT * FROM messages WHERE telegram_message_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 20'
+    );
+    this.listTgToMaxBySourceIdStmt = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE direction = 'tg_to_max' AND source_message_id = ?
+      ORDER BY created_at DESC
+      LIMIT 20
+    `);
+    this.getMessageStmt = this.db.prepare('SELECT * FROM messages WHERE id = ?');
+    this.updateMessageMetadataStmt = this.db.prepare('UPDATE messages SET metadata = ? WHERE id = ?');
+    // Our own message in MAX, found by the fingerprint of its MAX bubble.
+    this.getTgToMaxByMaxFingerprintStmt = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE chat_id = ? AND direction = 'tg_to_max' AND max_fingerprint = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
 
     // Telegram→MAX replies (v2): finds a message the user typed in Telegram and
     // the bridge sent into MAX (direction=tg_to_max), by the Telegram message_id
@@ -232,7 +299,8 @@ export class AppDatabase {
       WHERE chat_id = ?
         AND direction = 'max_to_tg'
         AND media_hash = ?
-        AND source_message_id LIKE ? ESCAPE '\\'
+        AND (source_message_id = ? OR source_message_id LIKE ? ESCAPE '\\')
+        AND created_at < ?
       LIMIT 1
     `);
 
@@ -244,11 +312,13 @@ export class AppDatabase {
     `);
 
     this.hasMessageStmt = this.db.prepare('SELECT 1 FROM messages WHERE id = ? LIMIT 1');
+    this.hasMessagesInChatStmt = this.db.prepare('SELECT 1 FROM messages WHERE chat_id = ? LIMIT 1');
     this.setSettingStmt = this.db.prepare(`
       INSERT INTO settings (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `);
     this.getSettingStmt = this.db.prepare('SELECT value FROM settings WHERE key = ?');
+    this.listSettingsStmt = this.db.prepare("SELECT key, value FROM settings WHERE key LIKE ? ESCAPE '\\'");
 
     this.createDeliveryStmt = this.db.prepare(`
       INSERT INTO message_deliveries (message_id, direction, status, attempts, created_at, updated_at)
@@ -290,6 +360,9 @@ export class AppDatabase {
       SELECT COUNT(*) AS n FROM message_deliveries
       WHERE message_id = ? AND direction = ? AND status = 'failed'
     `);
+    this.hasDeliveryStmt = this.db.prepare(`
+      SELECT 1 FROM message_deliveries WHERE message_id = ? AND direction = ? LIMIT 1
+    `);
 
     // Finds the most recent stored message in a MAX chat whose text matches the
     // quoted snippet (exact or prefix match) and that has a Telegram reply target.
@@ -299,7 +372,7 @@ export class AppDatabase {
         AND text IS NOT NULL AND text <> ''
         AND (text = ? OR text LIKE ? ESCAPE '\\')
         AND (telegram_message_id IS NOT NULL OR direction = 'tg_to_max')
-      ORDER BY created_at DESC
+      ORDER BY (text = ?) DESC, created_at DESC
       LIMIT 1
     `);
 
@@ -389,6 +462,16 @@ export class AppDatabase {
     return row ? rowToMapping(row) : null;
   }
 
+  // The topic was deleted in Telegram: forget it (the upsert cannot, since a
+  // missing topic keeps the current one) so the next message creates a new
+  // topic. The intro bookkeeping goes too — the new topic needs its own.
+  clearChatMappingThread(maxChatId) {
+    const mapping = this.getChatMapping(maxChatId);
+    if (!mapping) return;
+    const { topicIntroMessageId, topicIntroPinnedAt, topicIntroPinned, topicIntroPinError, ...metadata } = mapping.metadata || {};
+    this.clearMappingThreadStmt.run(JSON.stringify(metadata), Date.now(), maxChatId);
+  }
+
   getChatMappingByTelegramThread(telegramChatId, telegramThreadId = null) {
     const row = this.getMappingByTelegramThreadStmt.get(telegramChatId, telegramThreadId || null);
     return row ? rowToMapping(row) : null;
@@ -417,6 +500,29 @@ export class AppDatabase {
     return result.changes > 0;
   }
 
+  getMessage(id) {
+    const row = this.getMessageStmt.get(id);
+    return row ? rowToMessage(row) : null;
+  }
+
+  updateMessageMetadata(id, metadata) {
+    this.updateMessageMetadataStmt.run(JSON.stringify(metadata || {}), id);
+  }
+
+  listMessagesByTelegramMessageId(telegramMessageId) {
+    return this.listByTelegramMessageIdStmt.all(telegramMessageId).map(rowToMessage);
+  }
+
+  listTgToMaxMessagesBySourceId(telegramMessageId) {
+    return this.listTgToMaxBySourceIdStmt.all(String(telegramMessageId)).map(rowToMessage);
+  }
+
+  getTgToMaxMessageByMaxFingerprint(chatId, fingerprint) {
+    if (!chatId || !fingerprint) return null;
+    const row = this.getTgToMaxByMaxFingerprintStmt.get(chatId, fingerprint);
+    return row ? rowToMessage(row) : null;
+  }
+
   // Returns the message whose Telegram message_id matches, or null if not found.
   getMessageByTelegramMessageId(telegramMessageId) {
     const row = this.getMessageByTelegramMessageIdStmt.get(telegramMessageId);
@@ -435,13 +541,16 @@ export class AppDatabase {
   // its fingerprint (timestamp/caption), because MAX's signed CDN URLs — which
   // the fingerprint embeds — are regenerated on every page load and therefore
   // cannot identify it. See hasForwardedMediaCopyStmt for the full rationale.
-  hasForwardedMediaCopy(chatId, mediaHash, fingerprintPrefix) {
+  // `storedBefore` limits the match to rows stored before the current page was
+  // loaded: signed URLs only change across page loads, so a same-session twin
+  // is a genuinely new message, not a stale copy.
+  hasForwardedMediaCopy(chatId, mediaHash, fingerprintPrefix, storedBefore = Number.MAX_SAFE_INTEGER) {
     if (!chatId || !mediaHash) return false;
     const prefix = String(fingerprintPrefix ?? '');
     // Escape LIKE wildcards in the caption/timestamp so a message whose text
     // contains % or _ can't match unrelated rows.
     const escaped = prefix.replace(/[\\%_]/g, '\\$&');
-    return Boolean(this.hasForwardedMediaCopyStmt.get(chatId, mediaHash, escaped + '|%'));
+    return Boolean(this.hasForwardedMediaCopyStmt.get(chatId, mediaHash, prefix, escaped + '|%', storedBefore));
   }
 
   // Returns the most recent stored message in a MAX chat whose text matches the
@@ -453,7 +562,9 @@ export class AppDatabase {
     // otherwise match a different message and attach the reply to the wrong
     // original (the same class of bug already guarded in hasForwardedMediaCopy).
     const snippetPrefix = String(snippet ?? '').replace(/[\\%_]/g, '\\$&') + '%';
-    const row = this.findRepliedMessageStmt.get(chatId, snippet, snippetPrefix);
+    // An exact match wins over a newer message that merely starts the same
+    // way ("Да" vs "Да, конечно").
+    const row = this.findRepliedMessageStmt.get(chatId, snippet, snippetPrefix, snippet);
     return row ? rowToMessage(row) : null;
   }
 
@@ -488,6 +599,12 @@ export class AppDatabase {
     return Boolean(this.hasMessageStmt.get(id));
   }
 
+  // True once anything from this MAX chat has been stored (forwarded, primed
+  // or sent into it).
+  hasMessagesInChat(chatId) {
+    return this.hasMessagesInChatStmt.get(chatId) !== undefined;
+  }
+
   // True on a brand-new database — nothing has ever been forwarded or primed.
   // Used to tell a first run (where MAX's existing history must be swallowed,
   // not delivered) from a restart (where anything unseen is genuinely new).
@@ -511,6 +628,18 @@ export class AppDatabase {
     } catch {
       return fallback;
     }
+  }
+
+  // Every setting whose key starts with `prefix`: [{ key, value }].
+  listSettings(prefix) {
+    const pattern = `${String(prefix).replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    return this.listSettingsStmt.all(pattern).map((row) => {
+      try {
+        return { key: row.key, value: JSON.parse(row.value) };
+      } catch {
+        return { key: row.key, value: null };
+      }
+    });
   }
 
   close() {
@@ -570,6 +699,16 @@ export class AppDatabase {
 
   countFailedDeliveries(messageId, direction) {
     return this.countFailedDeliveriesStmt.get(messageId, direction).n;
+  }
+
+  // Whether delivering this message was ever tried, whatever came of it.
+  hasDelivery(messageId, direction) {
+    return Boolean(this.hasDeliveryStmt.get(messageId, direction));
+  }
+
+  // Runs fn in one transaction: all of its writes, or none.
+  transaction(fn) {
+    return this.db.transaction(fn)();
   }
 }
 

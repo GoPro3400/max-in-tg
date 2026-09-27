@@ -1,14 +1,33 @@
 import 'dotenv/config';
 import path from 'node:path';
 
-const bool = (value, fallback = false) => {
+// Values that could not be read as meant, for index.js to log at startup
+// (the logger is not available here). "TELEGRAM_USE_TOPICS=ture" used to
+// quietly mean false, and "POLL_INTERVAL_MS=1s" quietly meant 1 ms.
+export const configWarnings = [];
+
+const bool = (name, fallback = false) => {
+  const value = process.env[name];
   if (value == null || value === '') return fallback;
-  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  configWarnings.push(`${name}=${value} is neither true nor false — using ${fallback}`);
+  return fallback;
 };
 
-const int = (value, fallback) => {
+const int = (name, fallback) => {
+  const value = process.env[name];
+  if (value == null || String(value).trim() === '') return fallback;
   const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  if (!Number.isFinite(parsed)) {
+    configWarnings.push(`${name}=${value} is not a number — using ${fallback}`);
+    return fallback;
+  }
+  if (!/^\s*-?\d+\s*$/.test(String(value))) {
+    configWarnings.push(`${name}=${value} read as ${parsed} (whole numbers only, no units)`);
+  }
+  return parsed;
 };
 
 const required = (name) => {
@@ -51,15 +70,22 @@ export const config = {
     // telegramBot /pair and my_chat_member) and persisted in the settings
     // table, so a fresh install only needs TELEGRAM_BOT_TOKEN.
     ownerId: optionalPositiveInt('TELEGRAM_OWNER_ID'),
-    relayChatId: int(process.env.TELEGRAM_RELAY_CHAT_ID, 0) || null,
-    useTopics: bool(process.env.TELEGRAM_USE_TOPICS, true),
-    autoCreateTopics: bool(process.env.TELEGRAM_AUTO_CREATE_TOPICS, true)
+    relayChatId: int('TELEGRAM_RELAY_CHAT_ID', 0) || null,
+    useTopics: bool('TELEGRAM_USE_TOPICS', true),
+    autoCreateTopics: bool('TELEGRAM_AUTO_CREATE_TOPICS', true)
   },
   max: {
     webUrl: process.env.MAX_WEB_URL || 'https://web.max.ru/',
     userDataDir: resolveFromRoot(process.env.MAX_USER_DATA_DIR || './data/chrome-profile'),
-    headless: bool(process.env.MAX_HEADLESS, false),
-    protocolTimeoutMs: int(process.env.MAX_PROTOCOL_TIMEOUT_MS, 180000),
+    headless: bool('MAX_HEADLESS', false),
+    protocolTimeoutMs: int('MAX_PROTOCOL_TIMEOUT_MS', 180000),
+    // Keep MAX's animated emoji still, as the plain emoji picture it shows
+    // while loading — the only form in which a reaction says which emoji it
+    // is (see STATIC_ANIMOJI_SCRIPT in maxWebClient.js). Stickers stay animated.
+    staticAnimoji: bool('MAX_STATIC_ANIMOJI', true),
+    // DevTools port for scripts/devtools-repl.js (reachable only inside the
+    // container). 0: any free port, chosen by Puppeteer.
+    remoteDebuggingPort: Math.max(0, int('MAX_REMOTE_DEBUGGING_PORT', 9222)),
     selectors: {
       chatList: process.env.MAX_SELECTORS_CHAT_LIST || 'aside[aria-labelledby="aside-header-title"] .scrollListContent',
       chatItem: process.env.MAX_SELECTORS_CHAT_ITEM || 'aside[aria-labelledby="aside-header-title"] .item[data-index]',
@@ -71,10 +97,19 @@ export const config = {
       messageText: process.env.MAX_SELECTORS_MESSAGE_TEXT || '.text, [data-lexical-text]',
       messageAuthor: process.env.MAX_SELECTORS_MESSAGE_AUTHOR || '.author, .sender, .bubbleAuthor',
       messageTime: process.env.MAX_SELECTORS_MESSAGE_TIME || '.time[aria-label], time',
+      // Where MAX actually shows a bubble's time: the text of its meta line.
+      messageMetaTime: process.env.MAX_SELECTORS_MESSAGE_META_TIME || '.bubbleContent > .meta',
+      // The sender's name above a group bubble (its .name is read).
+      messageSender: process.env.MAX_SELECTORS_MESSAGE_SENDER || '.bubbleContent > .header',
       messageImage: process.env.MAX_SELECTORS_MESSAGE_IMAGE || 'img, canvas',
       messageAudio: process.env.MAX_SELECTORS_MESSAGE_AUDIO || 'audio, [class*="voice"], [data-testid*="voice"]',
       messageVideo: process.env.MAX_SELECTORS_MESSAGE_VIDEO || 'video, source[type="video"]',
       messageDocument: process.env.MAX_SELECTORS_MESSAGE_DOCUMENT || 'a[href][download],a[href*="/file"],a[href*="/download"]',
+      // A file in a bubble: a card with the name (.title) and size (.info);
+      // clicking it downloads the file. There is no link to it in the page.
+      messageFileCard: process.env.MAX_SELECTORS_MESSAGE_FILE_CARD || '.bubbleContent > .attaches > button.container',
+      // A link's preview card under the text — its picture is not a photo.
+      messageLinkPreview: process.env.MAX_SELECTORS_MESSAGE_LINK_PREVIEW || '.bubbleContent > .share',
       composer: process.env.MAX_SELECTORS_COMPOSER || '[data-testid="composer"] [contenteditable][role="textbox"], [data-lexical-editor="true"]',
       attachInput: process.env.MAX_SELECTORS_ATTACH_INPUT || 'input[type="file"]',
       // Attach flow: MAX's paperclip opens an actions menu; the file <input> is
@@ -85,7 +120,19 @@ export const config = {
       attachMenuMedia: process.env.MAX_SELECTORS_ATTACH_MENU_MEDIA || 'button[role="menuitem"][aria-label*="Photo"]',
       attachMenuFile: process.env.MAX_SELECTORS_ATTACH_MENU_FILE || 'button[role="menuitem"][aria-label*="File"]',
       sendButton: process.env.MAX_SELECTORS_SEND_BUTTON || '[data-testid="composer"] button[aria-label="Send message"], button[aria-label="Send message"]',
-      typing: process.env.MAX_SELECTORS_TYPING || '[data-testid="typing-indicator"]',
+      // "печатает…" in the open chat's header, and in a chat list item (MAX
+      // shows it there in place of the last message, for any chat).
+      typing: process.env.MAX_SELECTORS_TYPING || 'h2#main-header-title + .header .subtitle .typing, main .header .subtitle .typing',
+      chatTyping: process.env.MAX_SELECTORS_CHAT_TYPING || '.typing',
+      // /new: the search above the chat list, its results, the button that
+      // clears it, the tab of all chats (after a search by phone number MAX
+      // shows its contacts instead), and the title of a window MAX opens
+      // ("Не нашли номер …").
+      searchInput: process.env.MAX_SELECTORS_SEARCH_INPUT || 'aside[aria-labelledby="aside-header-title"] .search input.field, aside input[placeholder="Найти"], aside input[placeholder="Search"]',
+      searchResults: process.env.MAX_SELECTORS_SEARCH_RESULTS || 'aside .searchResultsList',
+      searchClear: process.env.MAX_SELECTORS_SEARCH_CLEAR || 'aside .search button[aria-label="Очистить"], aside .search button[aria-label="Clear"]',
+      chatsTab: process.env.MAX_SELECTORS_CHATS_TAB || 'nav [aria-labelledby*="-all-folder-title"], nav[aria-label="Папки и профиль"] .foldersViewport .item button',
+      modalTitle: process.env.MAX_SELECTORS_MODAL_TITLE || 'dialog[data-testid="modal"][open] #modalHeaderTitle',
       // Attachment staging: elements that appear in the composer preview area
       // after a file has been accepted by the file-chooser. If any of these are
       // present the attachment has been staged and the send button can be clicked.
@@ -99,26 +146,50 @@ export const config = {
       // "Message actions" /more menu). Clicking it puts the composer into
       // reply mode, shown by a banner with a close ("x") button that cancels it.
       messageReplyButton: process.env.MAX_SELECTORS_MESSAGE_REPLY_BUTTON || 'button[aria-label="Reply"]',
-      composerReplyActive: process.env.MAX_SELECTORS_COMPOSER_REPLY_ACTIVE || '[data-testid="composer"] button.close'
+      composerReplyActive: process.env.MAX_SELECTORS_COMPOSER_REPLY_ACTIVE || '[data-testid="composer"] button.close',
+      // Reactions, as MAX Web draws them: a bubble's chips (.reaction, ours
+      // marked .reaction--active, with a .counter) sit in a .reactions
+      // container inside the bubble or right after it. To react, the bridge
+      // clicks a chip, or opens the message menu (right click, else
+      // messageActionsButton) whose reaction row lists reactionOption
+      // buttons, expanded with reactionExpand. The emoji is read from each
+      // chip's <img alt> (see max.staticAnimoji).
+      messageReactions: process.env.MAX_SELECTORS_MESSAGE_REACTIONS || '.reactions',
+      messageReactionChip: process.env.MAX_SELECTORS_MESSAGE_REACTION_CHIP || '.reaction',
+      messageActionsButton: process.env.MAX_SELECTORS_MESSAGE_ACTIONS_BUTTON || 'button[aria-label="Message actions"], button[aria-label="Действия с сообщением"]',
+      messageMenu: process.env.MAX_SELECTORS_MESSAGE_MENU || '[role="menu"]',
+      reactionOption: process.env.MAX_SELECTORS_REACTION_OPTION || '[role="menu"] .reaction, .menuContainer .reaction',
+      reactionExpand: process.env.MAX_SELECTORS_REACTION_EXPAND || '[role="menu"] .extendBtn, .menuContainer .extendBtn'
     }
   },
   sqlitePath: resolveFromRoot(process.env.SQLITE_PATH || './data/max-in-tg.sqlite'),
   mediaDir: resolveFromRoot(process.env.MEDIA_DIR || './tmp/media'),
   diagnosticDir: resolveFromRoot(process.env.DIAGNOSTIC_DIR || './logs/diagnostics'),
-  diagnosticFilesLimit: int(process.env.DIAGNOSTIC_FILES_LIMIT, 4),
-  diagnosticRetentionFiles: int(process.env.DIAGNOSTIC_RETENTION_FILES, 80),
+  diagnosticFilesLimit: int('DIAGNOSTIC_FILES_LIMIT', 4),
+  diagnosticRetentionFiles: int('DIAGNOSTIC_RETENTION_FILES', 80),
   // Diagnostic HTML dumps are full captures of the live MAX page and therefore
   // contain private conversation text. Redacted by default; set to false only
   // for a deliberate, short-lived debugging session.
-  diagnosticRedactText: bool(process.env.DIAGNOSTIC_REDACT_TEXT, true),
-  startupPrimeExistingMessages: bool(process.env.STARTUP_PRIME_EXISTING_MESSAGES, true),
+  diagnosticRedactText: bool('DIAGNOSTIC_REDACT_TEXT', true),
+  startupPrimeExistingMessages: bool('STARTUP_PRIME_EXISTING_MESSAGES', true),
   // 0 (the default) = prime every chat seen at startup. A positive value caps
   // it, which on a first run means the chats beyond the cap deliver their
   // existing history to Telegram — see primeExistingMaxMessages.
-  startupPrimeChatsLimit: int(process.env.STARTUP_PRIME_CHATS_LIMIT, 0),
-  pollIntervalMs: int(process.env.POLL_INTERVAL_MS, 650),
-  historyLimit: int(process.env.HISTORY_LIMIT, 50),
-  maxChatsPerPoll: int(process.env.MAX_CHATS_PER_POLL, 4),
-  maxPollFailuresBeforeRestart: int(process.env.MAX_POLL_FAILURES_BEFORE_RESTART, 5),
-  maxDeliveryAttempts: Math.max(1, int(process.env.MAX_DELIVERY_ATTEMPTS, 5))
+  startupPrimeChatsLimit: int('STARTUP_PRIME_CHATS_LIMIT', 0),
+  pollIntervalMs: int('POLL_INTERVAL_MS', 650),
+  historyLimit: int('HISTORY_LIMIT', 50),
+  maxChatsPerPoll: int('MAX_CHATS_PER_POLL', 4),
+  maxPollFailuresBeforeRestart: int('MAX_POLL_FAILURES_BEFORE_RESTART', 5),
+  // Keeping Chromium's memory in check replaces the external cron restart (see
+  // BridgeService.maybeRecycleBrowser): the MAX page is reloaded above
+  // pageReloadMemoryMb, the browser relaunched above browserMemoryLimitMb or
+  // after browserRecycleMinutes. 0 disables that trigger.
+  pageReloadMemoryMb: Math.max(0, int('MAX_PAGE_RELOAD_MEMORY_MB', 900)),
+  browserMemoryLimitMb: Math.max(0, int('MAX_BROWSER_MEMORY_LIMIT_MB', 1300)),
+  browserRecycleMinutes: Math.max(0, int('MAX_BROWSER_RECYCLE_MINUTES', 360)),
+  maxDeliveryAttempts: Math.max(1, int('MAX_DELIVERY_ATTEMPTS', 5)),
+  // Mirror reactions between MAX and Telegram (see BridgeService).
+  reactionsEnabled: bool('SYNC_REACTIONS', true),
+  // Show "typing…" in Telegram while someone types in MAX (see relayTyping).
+  typingEnabled: bool('SYNC_TYPING', true)
 };

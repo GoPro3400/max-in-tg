@@ -2,7 +2,26 @@ node_modules
 data
 tmp
 logs
-.env
 .git
 .cache
-npm-debug.log*
+
+# `COPY . .` bakes everything else into the image layers. Keep secrets and
+# runtime state out, with the same patterns as .gitignore: a stray .env.local,
+# a backup of .env or a key file must not end up inside an image.
+.env*
+*.env
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+cookies.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+chrome-profile
+diagnostics
+*.bak
+*.orig
+*~

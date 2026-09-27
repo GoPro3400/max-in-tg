@@ -1,5 +1,8 @@
+import { randomBytes } from 'node:crypto';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { MessageType, humanMessage } from '../domain/messages.js';
+import { MessageType, humanMessage, stableId } from '../domain/messages.js';
+import { reactionCandidates, toTelegramReaction } from '../domain/reactions.js';
 import { logger } from '../logger.js';
 import { listFilesByMtime } from '../utils/fileHelpers.js';
 import { AsyncLock } from './asyncLock.js';
@@ -41,6 +44,11 @@ const MEDIA_HASH_MATCH_THRESHOLD = 12;
 // reply to a deleted message) from blocking forwarding forever.
 const REPLY_GRACE_SIGHTINGS = 5;
 
+// A file MAX did not hand over when its bubble was read is tried again on the
+// next reads — this many in all — before the owner is told it could not be
+// fetched.
+const FILE_CAPTURE_SIGHTINGS = 3;
+
 // MAX rotates the login QR about every two minutes (measured on the live login
 // screen). Poll a little faster than that so a rotated code reaches Telegram
 // while it is still valid, and so a completed scan is noticed promptly.
@@ -63,8 +71,185 @@ const ECHO_GUARD_WINDOW_MS = 20000;
 // While waiting to be signed in, remind the owner at most this often — the QR
 // photo itself is updated silently in place.
 const LOGIN_REMINDER_INTERVAL_MS = 30 * 60 * 1000;
+// Failed browser relaunches in a row after which the process gives up.
+const MAX_CONSECUTIVE_LAUNCH_FAILURES = 3;
+// Consecutive failed QR captures (each ~LOGIN_POLL_INTERVAL_MS apart) after
+// which the page is taken for dead — e.g. a crashed renderer, which leaves the
+// browser connected — and the browser is relaunched.
+const LOGIN_CAPTURE_FAILURES_BEFORE_RELAUNCH = 5;
+// Planned browser recycling (see maybeRecycleBrowser). The memory reading walks
+// /proc, so it is taken at most once a minute rather than every 650 ms poll.
+const BROWSER_MEMORY_CHECK_INTERVAL_MS = 60 * 1000;
+// A memory-triggered recycle never fires on a browser younger than this: if a
+// FRESH Chromium already sits above the limit (heavy account, limit set too
+// low), recycling would only loop every minute and never help.
+const BROWSER_RECYCLE_MIN_AGE_MS = 15 * 60 * 1000;
+// How long a relaunched MAX page gets to show its chat list while the recycle
+// still holds the lock. Telegram sends queued behind the lock then run against
+// a usable page rather than a half-painted one.
+const BROWSER_RECYCLE_READY_TIMEOUT_MS = 90 * 1000;
+// Still above the reload threshold this soon after a reload: relaunch instead.
+const RELOAD_ESCALATION_WINDOW_MS = 30 * 60 * 1000;
+const BROWSER_MEMORY_LOG_INTERVAL_MS = 30 * 60 * 1000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const toMb = (bytes) => Math.round(bytes / (1024 * 1024));
+// Echo-guard comparison key. Whitespace is dropped: a multi-line message comes
+// back from the page without its line breaks.
+// Reaction problems are reported to the owner at most this often per kind.
+const REACTION_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
+
+// "typing…" (see relayTyping): how often MAX's chat list is looked at, and how
+// often Telegram is told again for a chat — its action lasts 5 seconds, MAX's
+// own 8 after the last keystroke.
+const TYPING_SCAN_INTERVAL_MS = 1500;
+const TYPING_REPEAT_MS = 4000;
+
+const PLACEHOLDER_CHAT_TITLES = new Set(['Чат не найден', 'Chat not found']);
+
+// /new: how long a list of what MAX found stays usable, and how many of its
+// entries are offered.
+const NEW_CHAT_SESSION_MS = 10 * 60 * 1000;
+const NEW_CHAT_CHOICES = 8;
+const NEW_CHAT_USAGE = 'Как начать новый чат в MAX: /new <имя или номер телефона>, например\n'
+  + '/new Иван Петров\n/new +7 999 123-45-67\n'
+  + 'Бот покажет, что нашлось, и откроет чат только после выбора. Ничего никому не отправляется.';
+
+// How long after a chat's first read with the time in its ids (or after it
+// was renamed) the ids its bubbles had before still count (legacyWindowOpen).
+const LEGACY_ID_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+// The reaction the bot shows in Telegram for a MAX message: the most used one
+// OTHER people put on it (MAX lists chips most used first; a chip marked as
+// ours counts one less) that a bot is allowed to set. null for none.
+export const mirroredReaction = (reactions = []) => {
+  for (const reaction of reactions) {
+    const others = (reaction.count || 1) - (reaction.active ? 1 : 0);
+    if (others < 1) continue;
+    const emoji = toTelegramReaction(reaction.emoji);
+    if (emoji) return emoji;
+  }
+  return null;
+};
+
+// How to find a message forwarded from MAX in the MAX page again: a text by
+// its fingerprint, media by its CDN token (its signed URL changes on every
+// page load — see resolveMaxReplyTarget), else the fingerprint as a last try.
+const maxFingerprintOf = (original) => {
+  const usable = (fingerprint) => (fingerprint && !fingerprint.startsWith('visible-') ? fingerprint : null);
+  if (original.type === MessageType.TEXT) return usable(original.sourceMessageId);
+  const token = original.mediaUrl ? extractMediaToken(original.mediaUrl) : null;
+  return token ? `media-token:${token}` : usable(original.sourceMessageId);
+};
+
+const formatBytes = (bytes) => {
+  const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit ? 1 : 0).replace('.', ',')} ${units[unit]}`;
+};
+
+// A phone number as MAX's "Найти по номеру" wants it: +<country><number>.
+// "8 999 …", "7999…" and a ten-digit "999…" are Russian numbers. null when
+// the query is not a phone number (a name).
+export const phoneQuery = (query) => {
+  let compact = String(query || '').replace(/[\s()\-.]/g, '');
+  // 00 is how some dial the + (0044… is +44…).
+  if (compact.startsWith('00')) compact = `+${compact.slice(2)}`;
+  if (!/^\+?\d{10,15}$/.test(compact)) return null;
+  const digits = compact.replace(/^\+/, '');
+  if (!compact.startsWith('+')) {
+    if (digits.length === 11 && /^[78]/.test(digits)) return `+7${digits.slice(1)}`;
+    if (digits.length === 10 && digits.startsWith('9')) return `+7${digits}`;
+  }
+  return `+${digits}`;
+};
+
+// `text` in at most `max` characters, whole ones: an emoji (a surrogate
+// pair, or several joined) is never cut in half — half an emoji is not
+// valid text, and could cost the whole keyboard it is on.
+const shorten = (text, max) => {
+  const characters = [...new Intl.Segmenter('ru', { granularity: 'grapheme' }).segment(text)].map((part) => part.segment);
+  return characters.length > max ? `${characters.slice(0, max - 1).join('')}…` : text;
+};
+
+const formatPhone = (phone) => {
+  const russian = /^\+7(\d{3})(\d{3})(\d{2})(\d{2})$/.exec(phone || '');
+  return russian ? `+7 ${russian[1]} ${russian[2]}-${russian[3]}-${russian[4]}` : phone;
+};
+
+// A link to a topic of the relay group (a supergroup: its id is -100…).
+const topicLink = (mapping) => {
+  const chatId = String(mapping?.telegramChatId ?? '');
+  if (!mapping?.telegramThreadId || !/^-100\d+$/.test(chatId)) return null;
+  return `https://t.me/c/${chatId.slice(4)}/${mapping.telegramThreadId}`;
+};
+
+// Whether a record made at `timestamp` belongs to a bubble showing the time
+// `clock` ("14:05", "2:05 PM"): made in that minute, up to two after it (or
+// just before it, for a message we sent).
+const sameClockMinute = (clock, timestamp) => {
+  const match = /(\d{1,2}):(\d{2})(?:\s?([AaPp])[Mm])?/.exec(clock || '');
+  if (!match || !timestamp) return false;
+  let hours = Number(match[1]) % (match[3] ? 12 : 24);
+  if (match[3] && /[Pp]/.test(match[3])) hours += 12;
+  const bubble = hours * 60 + Number(match[2]);
+  const made = new Date(timestamp);
+  const diff = (made.getHours() * 60 + made.getMinutes() - bubble + 1440) % 1440;
+  return diff <= 2 || diff === 1439;
+};
+
+// What goes to Telegram in place of a file from MAX that is not delivered.
+const fileNotice = (message) => {
+  const name = message.originalFilename ? `«${message.originalFilename}»` : 'Файл';
+  const size = message.metadata?.fileSize ? ` (${formatBytes(message.metadata.fileSize)})` : '';
+  const why = message.metadata?.fileTooBig
+    ? 'больше 50 МБ, столько бот в Telegram отправить не может. Файл можно открыть в MAX.'
+    : message.metadata?.fileUnavailable
+      ? 'файл удалён или недоступен в MAX.'
+      : 'не удалось забрать из MAX. Файл можно открыть там.';
+  return `📎 ${name}${size} — ${why}${message.text ? `\n\n${message.text}` : ''}`;
+};
+
+// Whitespace- and variation-selector-insensitive: MAX gives a multi-line
+// text back without its line breaks, and an emoji with or without U+FE0F.
+const echoKey = (text) => String(text ?? '').replace(/[\s\uFE0E\uFE0F]+/g, '');
+
+// The bot can no longer post in that chat at all (removed, banned, the group
+// deleted or turned into another chat) — not a temporary restriction.
+const isChatGoneError = (reason) => /kicked|not a member|chat not found|group chat was (deleted|upgraded)|CHANNEL_PRIVATE/i
+  .test(String(reason || ''));
+
+// The number on MAX's unread badge for a chat ("3", "99+"), 1 for a badge
+// without a number, 0 without a badge.
+const unreadCount = (chat) => {
+  const digits = String(chat?.metadata?.unreadText || '').replace(/\D+/g, '');
+  const count = Number.parseInt(digits, 10);
+  if (Number.isFinite(count) && count > 0) return count;
+  return chat?.metadata?.unread ? 1 : 0;
+};
+
+// Seconds Telegram asked us to wait (429 Too Many Requests), or 0.
+export const telegramRetryAfter = (error) => {
+  const code = error?.code ?? error?.response?.error_code;
+  if (code !== 429) return 0;
+  const seconds = Number(error?.parameters?.retry_after ?? error?.response?.parameters?.retry_after);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 5;
+};
+
+// A MAX fingerprint is author|time|text|mediaUrl (empty parts dropped). The
+// media URL is signed and regenerated on every page load; everything before it
+// is what identifies the bubble across loads.
+export const fingerprintWithoutMediaUrl = (sourceMessageId, mediaUrl) => {
+  const fingerprint = String(sourceMessageId || '');
+  if (mediaUrl && fingerprint.endsWith(`|${mediaUrl}`)) return fingerprint.slice(0, -(mediaUrl.length + 1));
+  if (mediaUrl && fingerprint === mediaUrl) return '';
+  return fingerprint.replace(/\|(?:https?:|blob:)[^|]*$/, '');
+};
 
 export class BridgeService {
   constructor({ db, maxClient, telegramBot, mediaService, config }) {
@@ -102,15 +287,24 @@ export class BridgeService {
     // Tracks how many polls a brand-new MAX message has been seen but not yet
     // forwarded — used to give lazily-rendered reply quotes time to appear.
     this.pendingSeenCounts = new Map();
+    this.lastTypingScanAt = 0;
+    this.typingSentAt = new Map();
+    // /new: what MAX's search found, until the owner picks one (by id).
+    this.newChatSessions = new Map();
     // Muted MAX chats (/mute): excluded from polling entirely, and anything
     // that still reaches forwardMaxMessage from them is consumed without being
     // sent to Telegram. In-memory mirror of db.listMutedChatIds(); the
     // optional call keeps lightweight test fakes without the method working.
     this.mutedChatIds = new Set(this.db.listMutedChatIds ? this.db.listMutedChatIds() : []);
+    // The MAX client can open a chat MAX does not list (a new one) by its id.
+    for (const { key, value } of this.db.listSettings?.('max_chat:') || []) {
+      if (value) this.maxClient.rememberChatId?.(value, key.slice('max_chat:'.length));
+    }
     // True while the QR sign-in flow owns the MAX page: polling steps aside so
     // it does not spam failures against a logged-out page (and so the failure
     // counter does not trigger a pointless browser restart mid-login).
     this.loginInProgress = false;
+    this.loginFlow = null;
     // Distinct from `running`, which is also false during startup: this marks a
     // deliberate shutdown so long-running loops (the QR wait) bail out.
     this.stopping = false;
@@ -122,10 +316,37 @@ export class BridgeService {
     // Texts just delivered into MAX, per chat — see the echo guard in
     // forwardMaxMessage.
     this.recentSendsToMax = new Map();
+    // Planned browser recycling (maybeRecycleBrowser): when the current
+    // Chromium was launched, when its memory was last read (and the reading),
+    // how many recycles ran, and whether one is running right now.
+    this.browserStartedAt = 0;
+    // When the current MAX page was loaded (browser start or reload): MAX
+    // re-signs media URLs on every load (see the re-forward guard).
+    this.pageLoadedAt = 0;
+    this.lastBrowserMemoryCheckAt = 0;
+    this.lastBrowserMemoryLogAt = 0;
+    this.lastBrowserMemory = null;
+    this.pageReloads = 0;
+    this.browserRecycles = 0;
+    this.lastBrowserRecycle = null;
+    this.browserRecycling = false;
+    // Telegram flood control (429): no forwarding before this time.
+    this.telegramPausedUntil = 0;
+    // A transient createForumTopic failure: no new topic before this time.
+    this.topicCreationRetryAt = 0;
+    // Browser relaunches that failed in a row (see relaunchMaxClient), and
+    // what to call when the bridge cannot recover by itself (index.js exits
+    // so Docker restarts the container).
+    this.consecutiveLaunchFailures = 0;
+    this.onFatal = null;
+    // Reaction problems already reported to the owner (reason → when), so a
+    // run of reactions does not turn into a run of warnings.
+    this.reactionNoticeAt = new Map();
   }
 
   async start() {
     this.restoreIdentity();
+    this.duplicateIdsSince = this.firstRunOf('duplicate_ids_since');
     this.bindTelegramHandlers();
     // Telegram comes up FIRST now: on a fresh install it is the channel that
     // carries the pairing code and the MAX sign-in QR, so nothing about MAX can
@@ -137,7 +358,13 @@ export class BridgeService {
 
     logger.info('Starting Max Web client');
     await this.startMaxClient();
-    const signedIn = await this.ensureMaxLogin({ reason: 'startup' });
+    let signedIn = await this.ensureMaxLogin({ reason: 'startup' });
+    // false can also mean "a sign-in is already running": the owner sent
+    // /login while the browser was still launching. Giving up here would throw
+    // below and exit the process in the middle of that sign-in — wait for it.
+    if (!signedIn && this.loginFlow) {
+      signedIn = await this.loginFlow.catch(() => false);
+    }
     // ensureMaxLogin only returns false when it never recognised the page (it
     // has no timeout otherwise), so waiting for a chat list here would just
     // burn 120s and then kill the process — taking the Telegram bot down with
@@ -146,11 +373,12 @@ export class BridgeService {
       throw new Error('MAX Web did not reach a usable state (neither the chat list nor the sign-in screen)');
     }
     // Under the lock: the Telegram bot is already live, so /check could be
-    // driving the same page concurrently.
+    // driving the same page concurrently. Same for everything below that
+    // touches the page.
     await this.maxLock.run(() => this.maxClient.waitForReady());
     logger.info('Max Web client ready');
     logger.info('Refreshing MAX chats');
-    const startupChats = await this.refreshChats({ ensureMappings: false });
+    const startupChats = await this.maxLock.run(() => this.refreshChats({ ensureMappings: false }));
     this.startupChatIds = new Set(startupChats.map((chat) => chat.id));
     // Priming = "mark what MAX already shows as seen, without delivering it".
     // It belongs to a FIRST run only:
@@ -159,13 +387,16 @@ export class BridgeService {
     //     hundreds of old messages the moment polling starts;
     //   * any later start — the database already knows the history, and
     //     anything unseen genuinely arrived while the bridge was down, so
-    //     priming it would silently swallow real messages (this container is
-    //     restarted every 2h by cron, so that window recurs on a schedule).
+    //     priming it would silently swallow real messages (restarts and
+    //     browser recycles recur on a schedule, so that window would too).
     if (!this.config.startupPrimeExistingMessages) {
       logger.info('Skipping startup MAX message priming by configuration');
     } else if (this.db.isEmptyOfMessages()) {
       logger.info({ chats: startupChats.length }, 'First run: priming existing MAX history so it is not delivered as new');
-      await this.primeExistingMaxMessages(startupChats);
+      // Priming opens every chat in turn and can take minutes. Without the
+      // lock a Telegram send (the bot is already live) verified chat X, then
+      // priming clicked chat Y before the text was typed — into Y.
+      await this.maxLock.run(() => this.primeExistingMaxMessages(startupChats));
     } else {
       logger.info('Not a first run: skipping priming so messages that arrived while the bridge was down are still delivered');
     }
@@ -183,9 +414,9 @@ export class BridgeService {
     this.stopping = true;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.telegramBot.stop(signal);
-    // Drain in-flight browser work before tearing the browser down: during the
-    // scheduled 2h restart a TG→MAX send can be mid-flight, and closing the
-    // page under it records the delivery as failed even though MAX actually
+    // Drain in-flight browser work before tearing the browser down: during a
+    // container restart a TG→MAX send can be mid-flight, and closing the page
+    // under it records the delivery as failed even though MAX actually
     // received the message. Polling and new sends are already off (running
     // is false, the bot is stopped), so the queue only shrinks. If a task is
     // wedged, give up after 8s and close anyway — index.js force-exits at 10s.
@@ -218,8 +449,12 @@ export class BridgeService {
     this.telegramBot.onUnmerge((sourceName) => this.unmergeChat(sourceName));
     this.telegramBot.onMute((chatName) => this.muteChat(chatName));
     this.telegramBot.onUnmute((chatName) => this.unmuteChat(chatName));
+    this.telegramBot.onNewChat?.((query) => this.startNewChat(query));
+    this.telegramBot.onNewChatChoice?.((sessionId, choice) => this.chooseNewChat(sessionId, choice));
     this.telegramBot.onLogin(() => this.requestLogin());
     this.telegramBot.onIdentityDiscovered((identity) => this.persistIdentity(identity));
+    this.telegramBot.onRelayLost?.((chatId, reason) => this.handleRelayLost(chatId, reason));
+    this.telegramBot.onReaction?.((reaction) => this.handleTelegramReaction(reaction));
   }
 
   // Owner and relay group can be discovered at runtime instead of configured;
@@ -248,6 +483,24 @@ export class BridgeService {
     if (relayChatId) this.db.setSetting('telegram_relay_chat_id', String(relayChatId));
   }
 
+  // The bot was removed from the relay group (or the group is gone). Keeping
+  // relayChatId pointed at it dropped every MAX message after 5 failed tries,
+  // with the "given up" notices aimed at that same dead group. Fall back to
+  // the owner's private chat, where routes are rebuilt on the next message.
+  async handleRelayLost(chatId, reason = '') {
+    if (!chatId || this.config.telegram.relayChatId !== chatId) return false;
+    this.config.telegram.relayChatId = null;
+    this.db.setSetting('telegram_relay_chat_id', '');
+    this.topicCreationBlockedReason = null;
+    logger.warn({ chatId, reason }, 'Relay group is no longer usable — falling back to the owner private chat');
+    await this.notifyOwner([
+      '⚠️ Группа-релей больше недоступна: меня из неё убрали, или её удалили.',
+      'Пока сообщения из MAX приходят сюда, в личку.',
+      'Чтобы вернуть группу: добавь меня в группу с Темами админом или отправь /relay в нужной группе.'
+    ].join('\n'));
+    return true;
+  }
+
   // Launches the browser and opens MAX Web. Deliberately does NOT wait for the
   // chat list: a logged-out profile never shows one, and blocking here is what
   // used to turn a fresh install into a silent restart loop. Callers follow up
@@ -255,10 +508,37 @@ export class BridgeService {
   async startMaxClient() {
     try {
       await this.maxClient.start();
+      this.browserStartedAt = Date.now();
+      this.pageLoadedAt = this.browserStartedAt;
+      this.lastBrowserMemoryCheckAt = 0;
     } catch (error) {
       await this.maxClient.captureDiagnostics('startup-failed').catch(() => null);
       throw error;
     }
+  }
+
+  // Tears the browser down and launches a fresh one on the same profile (the
+  // MAX session survives, it lives in the profile). The caller must hold
+  // maxLock: both halves drive the page.
+  async relaunchMaxClient() {
+    await this.maxClient.stop().catch(() => null);
+    try {
+      await this.startMaxClient();
+      this.consecutiveLaunchFailures = 0;
+    } catch (error) {
+      // A browser that cannot be launched at all (e.g. the X display is gone)
+      // is not fixed by trying again every poll forever — the process stays
+      // up, the healthcheck green, and nothing is delivered. After a few
+      // attempts, let the supervisor restart the whole container.
+      this.consecutiveLaunchFailures += 1;
+      if (this.consecutiveLaunchFailures >= MAX_CONSECUTIVE_LAUNCH_FAILURES) {
+        logger.fatal({ err: error, attempts: this.consecutiveLaunchFailures }, 'MAX browser cannot be launched — giving up so the container is restarted');
+        this.onFatal?.(error);
+      }
+      throw error;
+    }
+    // The new page has no chat list yet: re-read it on the next poll.
+    this.lastChatRefreshAt = 0;
   }
 
   // Blocks until a Telegram owner is known. With TELEGRAM_OWNER_ID unset (the
@@ -298,10 +578,15 @@ export class BridgeService {
     // under the other.
     if (this.loginInProgress) return false;
     this.loginInProgress = true;
+    // Kept so a caller that must not give up (start()) can wait for a flow
+    // someone else started — e.g. /login sent while the browser was launching.
+    const flow = this.runLoginFlow(reason);
+    this.loginFlow = flow;
     try {
-      return await this.runLoginFlow(reason);
+      return await flow;
     } finally {
       this.loginInProgress = false;
+      this.loginFlow = null;
     }
   }
 
@@ -330,6 +615,7 @@ export class BridgeService {
     let lastHash = null;
     let delivered = 0;
     let lastReminderAt = 0;
+    let failedCaptures = 0;
 
     const intro = [
       '🔐 Нужен вход в MAX.',
@@ -365,14 +651,35 @@ export class BridgeService {
       // code is delivered again instead of waiting for the next rotation.
       if (this.resendQr) {
         this.resendQr = false;
+        // If the old message is still there, it shows a code that is about
+        // to go stale — a credential nobody should scan any more.
+        if (qrMessageId) await this.telegramBot.deleteOwnerMessage(qrMessageId).catch(() => null);
         qrMessageId = null;
+        lastHash = null;
+      }
+
+      // The wait is open-ended and polling stands down meanwhile, so nothing
+      // else would notice a browser that died under it: every capture would
+      // fail forever and the owner's last code would stay dead. (This used to
+      // be papered over by the external cron restarting the container.)
+      // Relaunch it here and carry on with a fresh page and a fresh code.
+      if (!this.stopping && (this.maxClient.isAlive?.() === false || failedCaptures >= LOGIN_CAPTURE_FAILURES_BEFORE_RELAUNCH)) {
+        logger.warn({ failedCaptures }, 'MAX browser is gone during the sign-in wait — relaunching it');
+        await this.maxLock.run(() => this.relaunchMaxClient()).catch((error) => {
+          logger.error({ err: error }, 'Relaunching the MAX browser during sign-in failed; will retry');
+        });
+        failedCaptures = 0;
         lastHash = null;
       }
 
       // knownHash lets the capture skip its screenshot + re-encode when the
       // code has not rotated, which is most passes of this open-ended wait.
-      const qr = await this.maxLock.run(() => this.maxClient.captureLoginQr({ knownHash: lastHash })).catch((error) => {
-        logger.warn({ err: error?.message || String(error) }, 'QR capture failed; retrying');
+      const qr = await this.maxLock.run(() => this.maxClient.captureLoginQr({ knownHash: lastHash })).then((result) => {
+        failedCaptures = 0;
+        return result;
+      }, (error) => {
+        failedCaptures += 1;
+        logger.warn({ err: error?.message || String(error), failedCaptures }, 'QR capture failed; retrying');
         return null;
       });
 
@@ -433,24 +740,39 @@ export class BridgeService {
   // ours. Only text: media identity already survives via the perceptual-hash
   // re-forward guard, and matching media by caption would be far too loose.
   rememberSentToMax(chatId, text) {
-    const trimmed = (text || '').trim();
-    if (!chatId || !trimmed) return;
+    const key = echoKey(text);
+    if (!chatId || !key) return;
     const pending = this.recentSendsToMax.get(chatId) || [];
-    pending.push({ text: trimmed, at: Date.now() });
+    pending.push({ text: key, at: Date.now() });
     this.recentSendsToMax.set(chatId, pending);
+  }
+
+  // Drops the record of a send once MAX itself shows that bubble as OUR
+  // outgoing message: the poller already skips outgoing bubbles, so the record
+  // can then only ever match — and swallow — the contact's own identical reply
+  // ("Да", "Ок", "+"), which normally arrives within the guard window.
+  forgetSentToMax(chatId, text) {
+    const key = echoKey(text);
+    const pending = this.recentSendsToMax.get(chatId);
+    if (!pending || !key) return;
+    const index = pending.findIndex((entry) => entry.text === key);
+    if (index >= 0) pending.splice(index, 1);
+    if (!pending.length) this.recentSendsToMax.delete(chatId);
   }
 
   // True when this incoming MAX message is one of ours coming back. Matching
   // entries are removed, and stale ones expire, so this can swallow at most
-  // one message per send and only within seconds of it.
+  // one message per send and only within seconds of it. Only text is guarded:
+  // what we record is text we typed, and a photo from the contact that merely
+  // carries the same caption is a real message.
   consumeRecentSend(message) {
     const pending = this.recentSendsToMax.get(message.chatId);
     if (!pending || !pending.length) return false;
 
     const now = Date.now();
     const fresh = pending.filter((entry) => now - entry.at <= ECHO_GUARD_WINDOW_MS);
-    const text = (message.text || '').trim();
-    const index = text ? fresh.findIndex((entry) => entry.text === text) : -1;
+    const key = message.type === MessageType.TEXT ? echoKey(message.text) : '';
+    const index = key ? fresh.findIndex((entry) => entry.text === key) : -1;
     if (index >= 0) fresh.splice(index, 1);
 
     if (fresh.length) this.recentSendsToMax.set(message.chatId, fresh);
@@ -491,16 +813,174 @@ export class BridgeService {
   schedulePoll(delay = this.config.pollIntervalMs) {
     if (!this.running) return;
     this.pollTimer = setTimeout(() => {
-      this.pollMax().then(() => {
-        this.consecutivePollFailures = 0;
-      }).catch((error) => {
-        this.consecutivePollFailures += 1;
-        logger.error({ err: error, failures: this.consecutivePollFailures }, 'Max polling failed');
-        this.handlePollFailure(error).catch((failureError) => {
-          logger.error({ err: failureError }, 'Poll failure recovery failed');
-        });
-      }).finally(() => this.schedulePoll());
+      this.runPollCycle().finally(() => this.schedulePoll());
     }, delay);
+  }
+
+  async runPollCycle() {
+    // Between two polls nothing is scraping the page, so this is where a
+    // planned browser recycle happens (it also takes maxLock, so an in-flight
+    // Telegram send finishes first). Its failure is not a poll failure.
+    await this.maybeRecycleBrowser().catch((error) => {
+      logger.error({ err: error }, 'Planned MAX browser recycle failed');
+    });
+    if (!this.running) return;
+    try {
+      await this.pollMax();
+      this.consecutivePollFailures = 0;
+    } catch (error) {
+      this.consecutivePollFailures += 1;
+      logger.error({ err: error, failures: this.consecutivePollFailures }, 'Max polling failed');
+      this.handlePollFailure(error).catch((failureError) => {
+        logger.error({ err: failureError }, 'Poll failure recovery failed');
+      });
+    }
+  }
+
+  // Replaces the external cron that used to `docker compose restart` the whole
+  // container every 2 hours. Most of the old growth came from this client's
+  // own leaks (undisposed element handles, an unbounded DevTools network
+  // buffer — fixed in MaxWebClient); what remains is kept in check here, in
+  // two tiers, from the poll loop so it never cuts into a send, a poll or a
+  // QR sign-in, and without taking the Telegram bot offline:
+  //   * reload — the MAX page is reloaded (~10 s) when the Chromium process
+  //     tree holds more than pageReloadMemoryMb;
+  //   * relaunch — the browser is restarted when it is older than
+  //     browserRecycleMinutes, holds more than browserMemoryLimitMb, or is
+  //     still above the reload threshold soon after a reload (the growth is
+  //     then outside the page).
+  async maybeRecycleBrowser(now = Date.now()) {
+    const due = await this.browserRecycleDue(now);
+    if (!due) return false;
+    return this.recycleBrowser(due);
+  }
+
+  async browserRecycleDue(now = Date.now()) {
+    if (!this.running || this.stopping || this.loginInProgress || this.browserRecycling) return null;
+    if (!this.browserStartedAt || !this.maxClient.page) return null;
+
+    const ageMs = now - this.browserStartedAt;
+    // A browser that went away — crashed renderer, killed or disconnected
+    // Chromium — is replaced right away. Before, nothing noticed it until
+    // maxPollFailuresBeforeRestart polls in a row had failed.
+    if (typeof this.maxClient.isAlive === 'function' && this.maxClient.isAlive() === false) {
+      return { tier: 'relaunch', reason: 'browser-gone', ageMs, memory: this.lastBrowserMemory };
+    }
+    const maxAgeMs = Math.max(0, this.config.browserRecycleMinutes || 0) * 60 * 1000;
+    if (maxAgeMs > 0 && ageMs >= maxAgeMs) {
+      return { tier: 'relaunch', reason: 'age', ageMs, memory: this.lastBrowserMemory };
+    }
+
+    const hardBytes = Math.max(0, this.config.browserMemoryLimitMb || 0) * 1024 * 1024;
+    const softBytes = Math.max(0, this.config.pageReloadMemoryMb || 0) * 1024 * 1024;
+    if ((!hardBytes && !softBytes) || typeof this.maxClient.getBrowserMemoryUsage !== 'function') return null;
+    if (now - this.lastBrowserMemoryCheckAt < BROWSER_MEMORY_CHECK_INTERVAL_MS) return null;
+    this.lastBrowserMemoryCheckAt = now;
+
+    const usage = await this.maxClient.getBrowserMemoryUsage().catch(() => null);
+    if (!usage) return null;
+    this.lastBrowserMemory = { ...usage, at: now };
+    this.logBrowserMemory(now);
+
+    const pageAgeMs = now - (this.pageLoadedAt || this.browserStartedAt);
+    const overHard = hardBytes > 0 && usage.bytes >= hardBytes;
+    const overSoft = softBytes > 0 && usage.bytes >= softBytes;
+    if (!overHard && !overSoft) return null;
+    if (pageAgeMs < BROWSER_RECYCLE_MIN_AGE_MS) {
+      logger.warn(
+        { memoryMb: toMb(usage.bytes), pageAgeMin: Math.round(pageAgeMs / 60000) },
+        'Chromium is already above its memory threshold shortly after (re)loading — waiting before acting (is the limit too low?)'
+      );
+      return null;
+    }
+    if (overHard) return { tier: 'relaunch', reason: 'memory', ageMs, memory: this.lastBrowserMemory };
+    // A reload that did not bring memory under the threshold for long means
+    // the growth is outside the page (GPU, browser process): relaunch.
+    const lastReload = this.lastBrowserRecycle?.tier === 'reload' ? this.lastBrowserRecycle.at : 0;
+    if (lastReload && now - lastReload < RELOAD_ESCALATION_WINDOW_MS) {
+      return { tier: 'relaunch', reason: 'memory-after-reload', ageMs, memory: this.lastBrowserMemory };
+    }
+    return { tier: 'reload', reason: 'memory', ageMs, memory: this.lastBrowserMemory };
+  }
+
+  // One compact line every half hour, so the steady state can be read from
+  // the logs (and a regression of the leak fixes noticed) without /status.
+  logBrowserMemory(now = Date.now()) {
+    if (now - this.lastBrowserMemoryLogAt < BROWSER_MEMORY_LOG_INTERVAL_MS) return;
+    this.lastBrowserMemoryLogAt = now;
+    const memory = this.lastBrowserMemory;
+    logger.info({
+      chromiumMb: toMb(memory.bytes),
+      rendererMb: memory.byType ? toMb(memory.byType.renderer) : undefined,
+      gpuMb: memory.byType ? toMb(memory.byType.gpu) : undefined,
+      domNodes: memory.page?.domNodes,
+      jsHeapMb: memory.page ? toMb(memory.page.jsHeapBytes) : undefined,
+      browserAgeMin: Math.round((now - this.browserStartedAt) / 60000),
+      pageAgeMin: Math.round((now - (this.pageLoadedAt || this.browserStartedAt)) / 60000),
+      reloads: this.pageReloads,
+      relaunches: this.browserRecycles
+    }, 'MAX browser memory');
+  }
+
+  async recycleBrowser({ tier = 'relaunch', reason = 'manual', ageMs = 0, memory = null } = {}) {
+    if (!this.running || this.loginInProgress || this.browserRecycling) return false;
+    this.browserRecycling = true;
+    let done = false;
+    let ready = false;
+    let appliedTier = tier;
+    try {
+      // One lock section from teardown until the page shows its chat list
+      // again: a Telegram send queued meanwhile then runs against a usable
+      // page, and nothing can drive the page while it is being replaced.
+      await this.maxLock.run(async () => {
+        // Re-checked under the lock: stop() or a sign-in may have begun while
+        // this waited behind an in-flight send.
+        if (!this.running || this.loginInProgress) return;
+        logger.info(
+          { tier, reason, ageMin: Math.round(ageMs / 60000), memoryMb: memory ? toMb(memory.bytes) : null },
+          tier === 'reload' ? 'Reloading the MAX page to release renderer memory'
+            : (reason === 'browser-gone' ? 'Relaunching the MAX browser: it crashed or lost its connection' : 'Relaunching the MAX browser to release Chromium memory')
+        );
+        if (tier === 'reload' && typeof this.maxClient.reloadPage === 'function') {
+          try {
+            await this.maxClient.reloadPage();
+            this.pageLoadedAt = Date.now();
+            this.lastChatRefreshAt = 0;
+          } catch (error) {
+            logger.warn({ err: error }, 'Reloading the MAX page failed — relaunching the browser instead');
+            appliedTier = 'relaunch';
+            await this.relaunchMaxClient();
+          }
+        } else {
+          appliedTier = 'relaunch';
+          await this.relaunchMaxClient();
+        }
+        done = true;
+        ready = await this.maxClient.waitForReady(BROWSER_RECYCLE_READY_TIMEOUT_MS).then(() => true, (error) => {
+          logger.warn({ err: error }, 'MAX Web did not show the chat list after a planned browser recycle');
+          return false;
+        });
+      });
+    } catch (error) {
+      this.lastBrowserRecycle = { at: Date.now(), tier: appliedTier, reason, ok: false, error: error?.message || String(error) };
+      throw error;
+    } finally {
+      this.browserRecycling = false;
+    }
+    if (!done) return false;
+
+    if (appliedTier === 'reload') this.pageReloads += 1;
+    else this.browserRecycles += 1;
+    this.consecutivePollFailures = 0;
+    this.zeroReachableStreak = 0;
+    this.lastBrowserRecycle = { at: Date.now(), tier: appliedTier, reason, ok: ready };
+    logger.info({ tier: appliedTier, reason, ready, reloads: this.pageReloads, relaunches: this.browserRecycles }, 'MAX browser recycled');
+    if (!ready && this.running) {
+      // As after a failure restart: the page may have come back signed out,
+      // in which case the QR flow takes over (it no-ops on a live session).
+      await this.ensureMaxLogin({ reason: 'after-recycle' });
+    }
+    return true;
   }
 
   async handlePollFailure(error) {
@@ -540,8 +1020,7 @@ export class BridgeService {
       if (this.consecutivePollFailures < this.config.maxPollFailuresBeforeRestart) return;
 
       logger.warn('Restarting Max browser after repeated polling failures');
-      await this.maxClient.stop().catch(() => null);
-      await this.startMaxClient();
+      await this.relaunchMaxClient();
       this.consecutivePollFailures = 0;
       restarted = true;
     });
@@ -575,15 +1054,35 @@ export class BridgeService {
       const chats = this.pickChatsForPoll();
       let failedChats = 0;
       let unreachableChats = 0;
+      await this.relayTyping();
       for (const chat of chats) {
+        // Telegram asked us to back off: nothing read now could be forwarded,
+        // and everything stays unseen until the window has passed.
+        if (this.telegramPaused()) break;
+        // Between chats too: reading one takes a few seconds.
+        await this.relayTyping();
         let messages;
+        let renamed = false;
+        let fullAdoption = false;
         try {
+          // Opened before it is read: its id in MAX shows then, so a renamed
+          // chat is recognised before anything of it is fetched or delivered.
+          if (this.maxClient.activeChatId !== chat.id) await this.maxClient.selectChat(chat.id);
+          renamed = await this.noteMaxChatId(chat);
+          // Its first read since ids carry the time, or since it was renamed:
+          // see legacyAdoptionEnd.
+          fullAdoption = renamed || !this.chatOnTimedIds(chat.id);
           messages = await this.maxClient.readMessages(chat.id, {
             // Dedup strictly by the exact message id. We must NOT collapse a
             // disambiguated "#vN" id onto its base id: two distinct media
             // messages sent close together (e.g. two video notes) share the
             // same base rawId, and collapsing would drop all but the first.
-            isKnown: (id) => this.db.hasMessage(id)
+            // A bubble about to be adopted under an id it had before is known
+            // too (no sticker or file capture for it).
+            // (Never one of the unread: those are new, see legacyAdoptionEnd.)
+            isKnown: (id, sourceMessageId, legacyId, fromEnd) => this.db.hasMessage(id)
+              || Boolean(fullAdoption && (fromEnd === undefined || fromEnd >= unreadCount(chat))
+                && this.legacyRecordOf({ chatId: chat.id, sourceMessageId, metadata: { legacyId } }))
           });
         } catch (error) {
           // A single chat failing to read (e.g. virtual-scroll chat not yet in
@@ -617,12 +1116,31 @@ export class BridgeService {
         // A successful read means the chat is reachable again (e.g. it scrolled
         // back into the virtualized list) — stop excluding it from round-robin.
         this.chronicallyUnreachableChatIds.delete(chat.id);
-        for (const message of messages) {
+        const adoptUpTo = this.legacyAdoptionEnd(chat, messages, fullAdoption);
+        const backlog = this.historyBacklog(chat, messages);
+        let readThrough = true;
+        for (const [index, message] of messages.entries()) {
           // Dedup by exact id only — see the isKnown note above. Collapsing a
           // "#vN" id onto its base id would drop a genuine second media message
           // that shares the same base rawId.
           if (this.db.hasMessage(message.id)) {
             this.pendingSeenCounts.delete(message.id);
+            continue;
+          }
+          if (index <= adoptUpTo) {
+            if (this.adoptLegacyId(message)) continue;
+            // Media there may be on record under an id it had before, with a
+            // since re-signed URL (see the re-forward guard).
+            message.legacyMatchable = true;
+          }
+          // Stop at the first message that cannot go out while Telegram's
+          // flood control lasts, so the rest of the chat keeps its order.
+          if (this.telegramPaused()) {
+            readThrough = false;
+            break;
+          }
+          if (backlog.has(message.id) || this.isOldDuplicate(message)) {
+            this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
             continue;
           }
           // Grace for lazily-rendered reply quotes. The .link container and the
@@ -636,7 +1154,8 @@ export class BridgeService {
           const isReply = Boolean(message.metadata?.replyLinkPresent || message.metadata?.replyToAuthor);
           const replyResolved = Boolean(message.metadata?.replyToSnippet || message.metadata?.replyToMediaUrl);
           const seen = (this.pendingSeenCounts.get(message.id) || 0) + 1;
-          if (isReply && !replyResolved && seen < REPLY_GRACE_SIGHTINGS) {
+          const retryFile = Boolean(message.metadata?.fileCaptureFailed) && seen < FILE_CAPTURE_SIGHTINGS;
+          if ((isReply && !replyResolved && seen < REPLY_GRACE_SIGHTINGS) || retryFile) {
             this.pendingSeenCounts.set(message.id, seen);
             continue;
           }
@@ -664,6 +1183,8 @@ export class BridgeService {
           }
           // Otherwise leave it unseen so the next poll retries it.
         }
+        if (fullAdoption && readThrough && messages.length) this.db.setSetting(`timed_ids:${chat.id}`, String(Date.now()));
+        await this.syncReactionsFromMax(chat);
       }
       // If every reachable chat failed, this is a real problem (expired session,
       // broken DOM) rather than archived/unreachable chats — surface it so
@@ -702,6 +1223,404 @@ export class BridgeService {
         await this.ensureMaxLogin({ reason: 'session-expired' });
       }
     }
+  }
+
+  // /new <имя или номер>: what MAX's search finds, for the owner to pick
+  // from (a chat opens only on their choice, and nothing is sent to anyone).
+  // { text, choices: [{ label, data }] }.
+  async startNewChat(rawQuery) {
+    const query = String(rawQuery || '').replace(/\s+/g, ' ').trim();
+    if (!query) return { text: NEW_CHAT_USAGE };
+    if (await this.maxSessionState() !== 'ready') return { text: '⏳ MAX не подключён — сначала /login.' };
+    const phone = phoneQuery(query);
+    let found;
+    try {
+      found = await this.maxLock.run(() => this.maxClient.searchChats(phone || query));
+    } catch (error) {
+      logger.warn({ err: error?.message }, '/new: MAX search failed');
+      return { text: `⚠️ Поиск в MAX не удался: ${error.message}` };
+    }
+    // For a number, only MAX's own "Найти по номеру" is that number's owner.
+    const candidates = found.filter((candidate) => (phone ? candidate.kind === 'phone' : candidate.kind !== 'phone'))
+      .slice(0, NEW_CHAT_CHOICES);
+    if (!candidates.length) {
+      return {
+        text: phone
+          ? `MAX не предлагает искать по номеру ${formatPhone(phone)} — нужен полный номер с кодом страны, например +7 999 123-45-67.`
+          : `В MAX ничего не нашлось по «${query}».`
+      };
+    }
+    const id = randomBytes(6).toString('base64url');
+    this.pruneNewChatSessions();
+    this.newChatSessions.set(id, { query: phone || query, phone, candidates, createdAt: Date.now() });
+    const label = (candidate) => {
+      if (candidate.kind === 'phone') return `📞 ${formatPhone(phone)} — найти в MAX`;
+      const hasTopic = candidate.kind === 'chat' && this.db.getChatMapping(candidate.title);
+      const text = candidate.kind === 'chat'
+        ? `💬 ${candidate.title}${hasTopic ? ' (тема уже есть)' : ''}`
+        : `👤 ${candidate.title}${candidate.hint ? ` · ${candidate.hint}` : ''}`;
+      return shorten(text, 60);
+    };
+    return {
+      text: phone
+        ? `Найти в MAX человека с номером ${formatPhone(phone)} и начать с ним чат? (Ничего не отправляется.)`
+        : `Что нашлось в MAX по «${query}» — выбери, с кем начать чат (ничего не отправляется):`,
+      choices: [
+        ...candidates.map((candidate, index) => ({ label: label(candidate), data: `new:${id}:${index}` })),
+        { label: 'Отмена', data: `new:${id}:x` }
+      ]
+    };
+  }
+
+  // The owner's pick from startNewChat: opens that chat in MAX (checking it
+  // is the one picked) and gives it a topic. Returns what to tell them.
+  async chooseNewChat(sessionId, choice) {
+    const session = this.newChatSessions.get(sessionId);
+    // Pressed twice (the buttons go with the first press, but a second one
+    // may be on its way already): the first press answers. null — nothing to say.
+    if (session?.used) return null;
+    if (!session || Date.now() - session.createdAt > NEW_CHAT_SESSION_MS) {
+      this.newChatSessions.delete(sessionId);
+      return 'Этот поиск устарел — пришли /new ещё раз.';
+    }
+    session.used = true;
+    if (choice === 'x') return 'Отменено — ничего не создано.';
+    const candidate = session.candidates[Number(choice)];
+    if (!candidate) return 'Нет такого варианта — пришли /new ещё раз.';
+    if (await this.maxSessionState() !== 'ready') return '⏳ MAX не подключён — сначала /login.';
+
+    let opened;
+    let conflict = null;
+    let messages = [];
+    try {
+      opened = await this.maxLock.run(async () => {
+        const result = await this.maxClient.openSearchResult(session.query, candidate);
+        const chat = { id: result.title, title: result.title };
+        conflict = this.newChatConflict(chat, result.maxId, candidate);
+        if (conflict) {
+          // It stays open in MAX, but it is not the chat of that name here:
+          // nothing is read from it or typed into it as that chat.
+          this.maxClient.forgetActiveChat?.();
+          return result;
+        }
+        // (A chat of that name renamed away in MAX is another one.)
+        const known = this.db.listChats().find((item) => item.id === chat.id);
+        if (!known || known.metadata?.renamedTo) {
+          this.db.upsertChat({ id: chat.id, title: chat.title, lastSeenAt: Date.now(), metadata: { unread: false, startedWithNew: true } });
+        }
+        // Its id in MAX, while it is the chat open: a renamed chat is
+        // recognised, and one MAX does not list yet (no messages) is opened
+        // by its id until it does.
+        await this.noteMaxChatId(chat);
+        this.maxClient.rememberChatId?.(chat.id, result.maxId, { listed: result.listed });
+        // What it already shows (nothing is fetched for it): see below.
+        messages = await this.maxClient.readMessages(result.title, { isKnown: () => true }).catch(() => []);
+        return result;
+      });
+    } catch (error) {
+      logger.warn({ err: error?.message, kind: candidate.kind }, '/new: could not open the chat in MAX');
+      return `⚠️ ${error.message}`;
+    }
+    if (conflict) {
+      logger.warn({ kind: candidate.kind }, '/new: the chat that opened is named like another chat of the bridge');
+      return conflict;
+    }
+
+    const chat = { id: opened.title, title: opened.title };
+    // A chat new to the bridge: what it shows is history — recorded (or
+    // known again by the ids it had before), not delivered — but for its
+    // unread messages, which polling brings. A chat the bridge has already
+    // may have messages still on their way: polling sees to those.
+    if (!this.db.hasMessagesInChat(chat.id)) {
+      const unknown = messages.filter((message) => !this.db.hasMessage(message.id));
+      const fresh = unreadCount(this.db.listChats().find((item) => item.id === chat.id));
+      for (const message of unknown.slice(0, Math.max(0, unknown.length - fresh))) {
+        // Waiting for its reply quote or file, or delivering it was tried.
+        if (this.pendingSeenCounts.has(message.id) || this.db.hasDelivery(message.id, 'max_to_tg')) continue;
+        if (this.adoptLegacyId(message)) continue;
+        this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
+      }
+      if (!this.chatOnTimedIds(chat.id)) this.db.setSetting(`timed_ids:${chat.id}`, String(Date.now()));
+    }
+
+    const before = this.db.getChatMapping(chat.id);
+    const mapping = await this.ensureMapping(chat, { createTopics: true });
+    if (!mapping) {
+      return `⚠️ Чат «${chat.title}» открыт в MAX, но тему в Telegram создать не удалось`
+        + `${this.topicCreationBlockedReason ? `: ${this.topicCreationBlockedReason}` : ''}. Проверь /status.`;
+    }
+    const link = topicLink(mapping);
+    const reused = before && before.telegramChatId === mapping.telegramChatId && before.telegramThreadId === mapping.telegramThreadId;
+    logger.info({ byPhone: Boolean(session.phone), reused: Boolean(reused), kind: candidate.kind }, 'Started a MAX chat from Telegram (/new)');
+    if (!this.requiresTelegramTopic()) {
+      // Without topics the owner's messages go to the selected chat.
+      this.db.selectChat(chat.id);
+      return `✅ Чат с «${chat.title}» открыт в MAX и выбран — твои сообщения пойдут туда (сменить: /select).`;
+    }
+    if (reused) return `💬 С «${chat.title}» тема уже есть${link ? `: ${link}` : ''} — пиши туда.`;
+    if (session.phone) {
+      await this.telegramBot.sendText(`📞 ${formatPhone(session.phone)} — этот чат начат по номеру телефона.`, mapping).catch(() => null);
+    }
+    return `✅ Чат с «${chat.title}» готов${link ? `: ${link}` : ''}. Пиши в эту тему — сообщения уйдут в MAX.`;
+  }
+
+  // Why the chat /new opened cannot have a route here, or null. Chats are
+  // known by their names: two chats of MAX with one name would share a
+  // topic, and the owner's replies would go to either.
+  newChatConflict(chat, maxId, candidate) {
+    const own = `max_chat:${maxId}`;
+    const namesake = (this.db.listSettings?.('max_chat:') || []).some(({ key, value }) => value === chat.id && key !== own);
+    if (namesake) {
+      return `⚠️ В MAX есть и другой чат с именем «${chat.title}» — мост различает чаты по имени, и переписка двух чатов смешалась бы в одной теме. `
+        + 'Переименуй один из них в MAX (например, контакт) и повтори /new.';
+    }
+    // Found beyond the owner's chats (in MAX's global search, or by number)
+    // under the name of a chat the bridge has, not known to be this one: it
+    // may be that chat, or someone else of that name.
+    const mapping = this.db.getChatMapping(chat.id);
+    const known = mapping || this.db.listChats().some((item) => item.id === chat.id && !item.metadata?.renamedTo);
+    if (candidate.kind !== 'chat' && known && this.db.getSetting(own, '') !== chat.id) {
+      const link = topicLink(mapping);
+      return `⚠️ У моста уже есть чат «${chat.title}»${link ? ` (${link})` : ''}, и не видно, тот ли это человек. `
+        + 'Если тот — пиши в его тему. Если другой — переименуй контакт в MAX и повтори /new.';
+    }
+    return null;
+  }
+
+  pruneNewChatSessions(now = Date.now()) {
+    for (const [id, session] of this.newChatSessions) {
+      if (now - session.createdAt > NEW_CHAT_SESSION_MS) this.newChatSessions.delete(id);
+    }
+    // Never more than a handful waiting: the oldest go first.
+    while (this.newChatSessions.size >= 20) this.newChatSessions.delete(this.newChatSessions.keys().next().value);
+  }
+
+  // Someone typing in MAX shows as "typing…" (or "recording a voice
+  // message"…) in that chat's topic. Read from MAX's chat list, so no chat is
+  // opened for it; only chats that already have a Telegram route.
+  async relayTyping(now = Date.now()) {
+    if (!this.config.typingEnabled || typeof this.maxClient.typingChats !== 'function'
+        || typeof this.telegramBot.sendChatAction !== 'function') return;
+    if (now - this.lastTypingScanAt < TYPING_SCAN_INTERVAL_MS || this.telegramPaused(now)) return;
+    this.lastTypingScanAt = now;
+    const typing = await this.maxClient.typingChats().catch(() => []);
+    for (const { chatId, action } of typing) {
+      if (this.mutedChatIds.has(chatId) || now - (this.typingSentAt.get(chatId) || 0) < TYPING_REPEAT_MS) continue;
+      const mapping = this.db.getChatMapping(chatId);
+      if (!mapping) continue;
+      this.typingSentAt.set(chatId, now);
+      // Not awaited: the browser lock is held, and it is only a hint.
+      this.telegramBot.sendChatAction(mapping, action).catch((error) => {
+        logger.debug({ err: error?.message, chatId }, 'Failed to show typing in Telegram');
+      });
+    }
+  }
+
+  // Message ids used to lack the time (MAX shows it where the old selector did
+  // not look), so a text repeating any earlier message of the chat ("Ок") was
+  // taken for it and dropped. Now that ids carry the time, a bubble recorded
+  // under its old id is recorded under the new one as well — keeping its
+  // Telegram link — instead of being delivered again. But an old id is shared
+  // by every repeat of a text, so it only counts where the bubble cannot be
+  // new (see legacyAdoptionEnd).
+  //
+  // timed_ids:<chat> holds when the chat was first read with the time in ids
+  // (or after it was renamed). "1" was written by a build that did not keep
+  // the moment, and counts as long ago.
+  chatOnTimedIds(chatId) {
+    return Boolean(this.db.getSetting(`timed_ids:${chatId}`, ''));
+  }
+
+  // For a week after that first read, history scrolling into view may still
+  // be bubbles recorded under an old id; after that the old ids decide nothing.
+  legacyWindowOpen(chatId, now = Date.now()) {
+    const since = Number(this.db.getSetting(`timed_ids:${chatId}`, '')) || 0;
+    return now - since < LEGACY_ID_WINDOW_MS;
+  }
+
+  // Index of the last bubble up to which ids a bubble had before are trusted,
+  // or -1. On a first read (after the update, or of a renamed chat) that is
+  // the last bubble known by any id; later, the newest bubble known by its
+  // own id, and only while legacyWindowOpen. Never one of the newest
+  // `unread` bubbles: MAX counts those as not seen yet, so they are new,
+  // whatever old id they share ("Ок").
+  legacyAdoptionEnd(chat, messages, fullAdoption) {
+    if (!fullAdoption && !this.legacyWindowOpen(chat.id)) return -1;
+    let end = -1;
+    messages.forEach((message, index) => {
+      if (this.db.hasMessage(message.id) || (fullAdoption && this.legacyRecordOf(message))) end = index;
+    });
+    return Math.min(end, messages.length - 1 - unreadCount(chat));
+  }
+
+  // The record of this bubble under an id it had before: its old id (without
+  // the time), or exactly its id under the chat's previous name (see
+  // noteMaxChatId) — never an old id there: the old chat's history is long,
+  // and an old id is shared by every repeat of a text.
+  legacyRecordOf(message) {
+    const legacyRawId = message.metadata?.legacyId;
+    const previousChatId = this.db.getSetting(`renamed_from:${message.chatId}`, '') || null;
+    const candidates = [
+      legacyRawId && [message.chatId, legacyRawId],
+      previousChatId && message.sourceMessageId && [previousChatId, message.sourceMessageId]
+    ].filter(Boolean);
+    for (const [chatId, rawId] of candidates) {
+      const record = this.db.getMessage(stableId('max', chatId, rawId));
+      if (record) return record;
+    }
+    return null;
+  }
+
+  // MAX gives every chat a numeric id (the page's address shows it), while
+  // chats here are known by their titles — so a renamed contact or group
+  // looked like a new chat: a new topic, and the old one left behind. A title
+  // that turns up with the id of a chat known under another title is that
+  // chat renamed: it carries on in the old topic, which takes the new name,
+  // and its messages keep their Telegram links. True when it was renamed.
+  async noteMaxChatId(chat) {
+    const maxId = this.maxClient.activeChatId === chat.id ? this.maxClient.activeMaxChatId : null;
+    if (!maxId) return false;
+    // What MAX shows for a chat it has not loaded is not a new name.
+    if (PLACEHOLDER_CHAT_TITLES.has(chat.title)) return false;
+    const key = `max_chat:${maxId}`;
+    const known = this.db.getSetting(key, '');
+    if (known === chat.id) return false;
+    if (known) {
+      try {
+        await this.carryOnRenamedChat(known, chat);
+      } catch (error) {
+        // Not taken as done: the next read tries again.
+        logger.error({ err: error, from: known, to: chat.id }, 'Failed to carry a renamed MAX chat on in its topic');
+        return false;
+      }
+    }
+    this.db.setSetting(key, chat.id);
+    this.maxClient.rememberChatId?.(chat.id, maxId);
+    return Boolean(known);
+  }
+
+  async carryOnRenamedChat(oldChatId, chat) {
+    const oldMapping = this.db.getChatMapping(oldChatId);
+    const ownMapping = this.db.getChatMapping(chat.id);
+    const sameTopic = Boolean(oldMapping && ownMapping && ownMapping.telegramChatId === oldMapping.telegramChatId
+      && ownMapping.telegramThreadId === oldMapping.telegramThreadId);
+    // A chat /merge-d into another chat's topic stays merged there (that
+    // topic is the other chat's, and keeps its name).
+    const mergedInto = oldMapping?.metadata?.mergedInto && oldMapping.metadata.mergedInto !== chat.id
+      ? oldMapping.metadata.mergedInto
+      : undefined;
+    const oldChat = this.db.listChats().find((item) => item.id === oldChatId);
+    const muted = this.mutedChatIds.has(oldChatId);
+    logger.info({ from: oldChatId, to: chat.id, hasRoute: Boolean(oldMapping), merged: Boolean(mergedInto) }, 'MAX chat renamed');
+
+    this.db.transaction(() => {
+      // Its messages are looked up under the old name too (legacyRecordOf),
+      // and the next read adopts them.
+      this.db.setSetting(`renamed_from:${chat.id}`, oldChatId);
+      this.db.setSetting(`timed_ids:${chat.id}`, '');
+      if (muted) this.db.setChatMuted(chat.id, true);
+      // The old name is no longer in MAX's list: not polled any more.
+      if (oldChat) this.db.upsertChat({ ...oldChat, metadata: { ...oldChat.metadata, unread: false, renamedTo: chat.id } });
+      if (!oldMapping) return;
+      // The old name's route is retired first: one topic has one owner.
+      this.db.upsertChatMapping({
+        ...oldMapping,
+        enabled: false,
+        metadata: { ...oldMapping.metadata, mergedInto: chat.id, renamedTo: chat.id, renamedAt: Date.now() }
+      });
+      this.db.upsertChatMapping({
+        maxChatId: chat.id,
+        telegramChatId: oldMapping.telegramChatId,
+        telegramThreadId: oldMapping.telegramThreadId,
+        title: chat.title,
+        enabled: true,
+        metadata: {
+          ...oldMapping.metadata,
+          mergedInto,
+          renamedFrom: oldChatId,
+          // A topic already made for the new name, now left unused.
+          abandonedThreadId: !sameTopic && ownMapping?.telegramThreadId ? ownMapping.telegramThreadId : undefined,
+          renamedTo: undefined,
+          renamedAt: undefined
+        }
+      });
+    });
+    if (muted) this.mutedChatIds.add(chat.id);
+    this.maxClient.rememberChatId?.(oldChatId, null);
+    if (!oldMapping) return true;
+
+    if (!mergedInto) {
+      const title = this.mutedChatIds.has(chat.id) ? `🔇 ${chat.title}` : chat.title;
+      try {
+        await this.telegramBot.renameTopic(oldMapping.telegramThreadId, title);
+      } catch (error) {
+        logger.warn({ err: error?.message, threadId: oldMapping.telegramThreadId }, 'Failed to rename the topic of a renamed chat');
+      }
+    }
+    const route = { telegramChatId: oldMapping.telegramChatId, telegramThreadId: oldMapping.telegramThreadId };
+    await this.telegramBot.sendText(`✏️ В MAX чат «${oldChatId}» теперь называется «${chat.title}» — переписка продолжается здесь.`, route)
+      .catch((error) => logger.warn({ err: error?.message }, 'Failed to announce a renamed chat'));
+    if (!sameTopic && ownMapping?.telegramThreadId) {
+      await this.telegramBot.sendText(
+        `✏️ Это тот же чат MAX, что «${oldChatId}» (его переименовали) — переписка продолжается в его прежней теме, эта больше не нужна.`,
+        { telegramChatId: ownMapping.telegramChatId, telegramThreadId: ownMapping.telegramThreadId }
+      ).catch(() => null);
+    }
+    return true;
+  }
+
+  adoptLegacyId(message) {
+    // Still waiting for its reply quote or file, or delivering it was tried
+    // (it failed, or was cut short): it is new, whatever its old id says.
+    if (this.pendingSeenCounts.has(message.id) || this.db.hasDelivery(message.id, 'max_to_tg')) return false;
+    const legacy = this.legacyRecordOf(message);
+    if (!legacy) return false;
+    // The same message, delivered (or primed) back then.
+    this.db.insertMessage({
+      ...message,
+      createdAt: legacy.createdAt,
+      telegramMessageId: legacy.telegramMessageId,
+      mediaHash: legacy.mediaHash,
+      metadata: { ...legacy.metadata, ...message.metadata, adoptedFrom: legacy.id }
+    });
+    return true;
+  }
+
+  // When this installation first ran a version with `key`'s behaviour —
+  // remembered in the settings, so it stays the same across restarts.
+  firstRunOf(key) {
+    const stored = Number(this.db.getSetting(key, '')) || 0;
+    if (stored) return stored;
+    const now = Date.now();
+    this.db.setSetting(key, String(now));
+    return now;
+  }
+
+  // A second identical bubble (same sender, minute and text) used to be taken
+  // for the first and dropped; it now has its own id ("#dN", see
+  // scrapeMessageRows). Those whose first copy was delivered before that
+  // change are old news — they must not all arrive at once after the update.
+  isOldDuplicate(message) {
+    if (!this.duplicateIdsSince) return false;
+    const match = /#d\d+$/.exec(message.sourceMessageId || '');
+    if (!match) return false;
+    const first = this.db.getMessage(stableId('max', message.chatId, message.sourceMessageId.slice(0, match.index)));
+    return Boolean(first && first.createdAt < this.duplicateIdsSince);
+  }
+
+  // Old history MAX shows in a chat the database knows nothing about, on a
+  // bridge that has run before: the chat is new, or it was renamed in MAX
+  // (chat ids are titles, so every bubble gets a new id), or it was scrolled
+  // out of view when the first run primed history. All of it looked new and
+  // was forwarded at once — dozens of old messages, for a renamed contact
+  // into a freshly created duplicate topic. Only the newest are new to the
+  // owner: as many as MAX's unread badge counts, and at least one.
+  historyBacklog(chat, messages) {
+    if (!this.config.startupPrimeExistingMessages) return new Set();
+    if (this.db.hasMessagesInChat(chat.id)) return new Set();
+    const unknown = messages.filter((message) => !this.db.hasMessage(message.id));
+    const fresh = Math.max(1, unreadCount(chat));
+    return new Set(unknown.slice(0, Math.max(0, unknown.length - fresh)).map((message) => message.id));
   }
 
   async primeExistingMaxMessages(chats = []) {
@@ -819,7 +1738,8 @@ export class BridgeService {
     // Muted chats are a hard exclusion — unlike chronically-unreachable ones
     // they do not even keep a spot in the unread bucket: MAX's ad feeds are
     // "unread" almost permanently and would otherwise burn a poll slot.
-    const pollable = chats.filter((chat) => !this.mutedChatIds.has(chat.id));
+    // (A chat renamed in MAX lives on under its new name.)
+    const pollable = chats.filter((chat) => !this.mutedChatIds.has(chat.id) && !chat.metadata?.renamedTo);
     if (!pollable.length) return [];
     const unreadAll = pollable.filter((chat) => chat.metadata?.unread);
     // Chats that keep failing to open still deserve an occasional retry (MAX may
@@ -863,16 +1783,23 @@ export class BridgeService {
       // with the same chat, so whether the chat is already picked never
       // changes the skip decision (see Fix 9 in the reply-feature review).
       if (this.chronicallyUnreachableChatIds.has(chat.id)) continue;
-      if (this.mutedChatIds.has(chat.id)) continue;
+      if (this.mutedChatIds.has(chat.id) || chat.metadata?.renamedTo) continue;
       picked.set(chat.id, chat);
     }
 
     return [...picked.values()];
   }
 
-  async ensureMapping(chat) {
+  // `createTopics` is false only for automatic routing with
+  // TELEGRAM_AUTO_CREATE_TOPICS=false; /sync and /select always may create.
+  async ensureMapping(chat, { createTopics = true } = {}) {
     const existing = this.db.getChatMapping(chat.id);
-    if (existing && (!this.requiresTelegramTopic() || existing.telegramThreadId)) {
+    // A route only counts when it points at the CURRENT destination: after
+    // /relay moved the bridge (or the relay group was lost), old routes still
+    // pointed at the previous group, where the owner's replies are no longer
+    // accepted — so the conversation silently became one-way.
+    const current = existing && existing.telegramChatId === this.telegramBot.targetChatId();
+    if (current && (!this.requiresTelegramTopic() || existing.telegramThreadId)) {
       this.db.upsertChatMapping({ ...existing, title: chat.title });
       const mapping = this.db.getChatMapping(chat.id);
       await this.ensureTopicIntro(chat, mapping);
@@ -881,12 +1808,22 @@ export class BridgeService {
 
     let telegramThreadId = null;
     if (this.requiresTelegramTopic()) {
-      if (this.topicCreationBlockedReason) return null;
+      if (!createTopics || this.topicCreationBlockedReason) return null;
+      if (Date.now() < this.topicCreationRetryAt) return null;
       try {
         telegramThreadId = await this.telegramBot.createTopic(chat.title);
       } catch (error) {
-        logger.error({ err: error, chatId: chat.id, title: chat.title }, 'Failed to create Telegram topic');
-        this.topicCreationBlockedReason = error?.message || String(error);
+        const reason = error?.message || String(error);
+        logger.error({ err: reason, chatId: chat.id, title: chat.title }, 'Failed to create Telegram topic');
+        if (/rights|not enough|permission|CHAT_ADMIN_REQUIRED|not a forum|TOPICS?_DISABLED/i.test(reason)) {
+          // Only a missing right is worth latching until /sync: the owner has
+          // to change group settings first, and retrying just spams errors.
+          this.topicCreationBlockedReason = reason;
+        } else {
+          // A 429 or a network blip used to latch too, blocking every new
+          // chat's route until someone happened to run /sync.
+          this.topicCreationRetryAt = Date.now() + (telegramRetryAfter(error) || 30) * 1000;
+        }
         return null;
       }
     }
@@ -1003,9 +1940,8 @@ export class BridgeService {
     // is applied, and the owner gets their own message quoted back at them
     // (observed live: sent at 13:00:03, echoed at 13:00:09).
     //
-    // Message identity cannot help here — MAX renders no author and no
-    // timestamp we can read, so a message fingerprint is effectively just its
-    // text, in a different id namespace from the Telegram side. So match on
+    // Message identity cannot help here — a bubble's id (its time and text)
+    // lives in a different namespace from the Telegram message's. So match on
     // what we know we just sent, and consume the record on the first hit: a
     // genuine identical reply arriving later is still delivered.
     if (this.consumeRecentSend(message)) {
@@ -1028,7 +1964,7 @@ export class BridgeService {
       id: message.chatId,
       title: message.chatId
     };
-    const mapping = await this.ensureMapping(chat);
+    const mapping = await this.ensureMapping(chat, { createTopics: this.config.telegram.autoCreateTopics !== false });
     if (!mapping) {
       if (!this.missingRouteWarningChatIds.has(message.chatId)) {
         this.missingRouteWarningChatIds.add(message.chatId);
@@ -1041,6 +1977,10 @@ export class BridgeService {
 
     try {
       const outgoing = { ...message };
+      // Group chats: who wrote it, shown above the message. Not when it is the
+      // chat's own name (a channel's posts, or a contact in a private chat).
+      const sender = message.metadata?.sender;
+      if (sender && sender !== chat.title) outgoing.sender = sender;
 
       // Resolve reply target: if this MAX message is a reply, find the original
       // stored message and set replyToMessageId so Telegram renders the outgoing
@@ -1096,26 +2036,23 @@ export class BridgeService {
         );
       }
 
+      // A file that could not be brought over — too big for Telegram,
+      // deleted in MAX, or not downloaded on several tries: say what it was.
+      if (message.type === MessageType.DOCUMENT && !message.mediaUrl && !message.mediaPath) {
+        outgoing.type = MessageType.TEXT;
+        outgoing.text = fileNotice(message);
+      }
+
       // The file whose bytes identify this bubble for the re-forward guard —
       // set to the pre-conversion source below, since conversion output is not
       // guaranteed to be reproducible byte-for-byte.
       let sourceForHash = null;
 
-      // Animated stickers are sent as an autoplaying GIF. Telegram accepts a
-      // .tgs upload without error but renders MAX's Lottie as a plain document
-      // ("Unknown Track"), so the native-sticker path is intentionally not used.
       if (message.type === MessageType.STICKER && message.metadata?.animated && message.mediaPath) {
-        // GIF fallback: mediaPath is a directory of captured PNG frames. Telegram
-        // autoplays the GIF (no transparency). If encoding fails, degrade to the
-        // first frame as a photo rather than dropping the sticker.
-        try {
-          outgoing.mediaPath = await this.mediaService.framesDirToGif(message.mediaPath, message.metadata.fps);
-        } catch (encodeError) {
-          logger.warn({ err: encodeError, messageId: message.id }, 'Animated sticker encode failed; sending first frame as photo');
-          outgoing.mediaPath = path.join(message.mediaPath, 'frame-000.png');
-          outgoing.type = MessageType.PHOTO;
-          outgoing.metadata = { ...message.metadata, animated: false };
-        }
+        // mediaPath is a directory of PNG frames; it is encoded when sent (see
+        // sendToTelegram). Its first frame is the identity for the re-forward
+        // guard — independent of which encoder ends up being used.
+        sourceForHash = path.join(message.mediaPath, 'frame-000.png');
       } else if (message.mediaUrl) {
         outgoing.mediaPath = await this.mediaService.downloadUrl(message.mediaUrl, `max-${message.type}`);
         // Hash the ORIGINAL download, not the converted output: re-encoding is
@@ -1143,8 +2080,25 @@ export class BridgeService {
       // timestamp/caption), this is that same bubble again — record it as
       // delivered without sending a duplicate to Telegram.
       if (message.mediaHash) {
-        const fingerprintPrefix = String(message.sourceMessageId || '').split('|')[0];
-        if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix)) {
+        // Everything in the fingerprint except the signed media URL. It used
+        // to be only the first field — often just the sender's name — so the
+        // same sticker or picture sent again later by the same person was
+        // swallowed as "already delivered". Only rows from before the current
+        // page load count: signed URLs change only across page loads.
+        const fingerprintPrefix = fingerprintWithoutMediaUrl(message.sourceMessageId, message.mediaUrl);
+        // Where ids a bubble had before still count (see legacyAdoptionEnd),
+        // the media may be on record under its old id's prefix (without the
+        // time — for a group member's photo just their name, so nowhere
+        // else), or under the chat's previous name.
+        const legacyPrefix = message.legacyMatchable && message.metadata?.legacyId
+          ? fingerprintWithoutMediaUrl(message.metadata.legacyId, message.mediaUrl)
+          : '';
+        const previousChatId = message.legacyMatchable ? this.db.getSetting(`renamed_from:${message.chatId}`, '') : '';
+        const storedBefore = this.pageLoadedAt || undefined;
+        if (this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, fingerprintPrefix, storedBefore)
+            || (legacyPrefix && legacyPrefix !== fingerprintPrefix
+              && this.db.hasForwardedMediaCopy(message.chatId, message.mediaHash, legacyPrefix, storedBefore))
+            || (previousChatId && this.db.hasForwardedMediaCopy(previousChatId, message.mediaHash, fingerprintPrefix, storedBefore))) {
           this.db.updateDeliveryStatus(deliveryId, 'sent');
           logger.info(
             { messageId: message.id, chatId: message.chatId, mediaHash: message.mediaHash },
@@ -1154,18 +2108,143 @@ export class BridgeService {
         }
       }
 
-      const sent = await this.telegramBot.sendMessage(outgoing, mapping);
+      const sent = await this.sendToTelegram(message, outgoing, mapping);
       // Persist the Telegram message_id on the original message object so that
       // the subsequent insertMessage call (in pollMax) stores it in the DB.
       // This enables future reply-linking features via getMessageByTelegramMessageId.
       message.telegramMessageId = sent?.message_id ?? null;
+      // Which Telegram chat that id belongs to (ids repeat across chats, and
+      // the route can move later) — for mirroring reactions.
+      message.metadata = { ...message.metadata, telegramChatId: mapping.telegramChatId };
       this.db.updateDeliveryStatus(deliveryId, 'sent');
       logger.info({ messageId: message.id, type: message.type, chatId: message.chatId }, 'Forwarded Max message to Telegram');
       return true;
     } catch (error) {
+      if (error?.code === 'EFILETOOBIG') {
+        // Over Telegram's 50 MB for bots: it would fail on every retry. Say
+        // what it was instead, once. (If even that fails, it is handled below
+        // like any other failure.)
+        try {
+          const notice = await this.telegramBot.sendMessage({
+            ...message,
+            type: MessageType.TEXT,
+            text: `📎 ${message.originalFilename ? `«${message.originalFilename}» ` : ''}— файл больше 50 МБ, столько бот в Telegram отправить не может. Его можно открыть в MAX.${message.text ? `\n\n${message.text}` : ''}`,
+            mediaPath: null
+          }, mapping);
+          message.telegramMessageId = notice?.message_id ?? null;
+          this.db.updateDeliveryStatus(deliveryId, 'sent', 'too big for Telegram: sent a notice');
+          logger.warn({ messageId: message.id, chatId: message.chatId, bytes: error.bytes }, 'MAX file is over the Telegram bot limit — sent a notice instead');
+          return true;
+        } catch (noticeError) {
+          error = noticeError;
+        }
+      }
+      const retryAfter = telegramRetryAfter(error);
+      if (retryAfter) {
+        // Flood control is not a failure of THIS message. Counted as one, the
+        // 5 attempts burned out within seconds while Telegram was asking for
+        // 30+ (a whole relay group shares ~20 messages a minute), and the
+        // burst was dropped for good. Pause forwarding for the window
+        // instead; the message stays unseen and is retried, in order.
+        this.telegramPausedUntil = Math.max(this.telegramPausedUntil, Date.now() + retryAfter * 1000);
+        this.db.updateDeliveryStatus(deliveryId, 'pending', `rate limited: retry after ${retryAfter}s`);
+        logger.warn({ messageId: message.id, chatId: message.chatId, retryAfter }, 'Telegram flood control — pausing forwarding');
+        return false;
+      }
+      const reason = error?.message || String(error);
+      if (mapping.telegramThreadId && /thread not found|TOPIC_DELETED/i.test(reason)) {
+        // The topic was deleted in Telegram. Every later message used to fail
+        // 5 times and be dropped, and /sync could not help (the route still
+        // "had" a topic). Forget it; the next attempt creates a fresh one.
+        this.db.clearChatMappingThread(message.chatId);
+        this.db.updateDeliveryStatus(deliveryId, 'pending', 'topic deleted, recreating');
+        logger.warn({ chatId: message.chatId, threadId: mapping.telegramThreadId }, 'Telegram topic was deleted — a new one will be created');
+        return false;
+      }
+      if (mapping.telegramChatId === this.config.telegram.relayChatId && isChatGoneError(reason)) {
+        // Kicked from (or no longer able to post in) the relay group: fall
+        // back to the owner's private chat instead of dropping everything.
+        this.db.updateDeliveryStatus(deliveryId, 'pending', reason);
+        await this.handleRelayLost(mapping.telegramChatId, reason);
+        return false;
+      }
       this.db.updateDeliveryStatus(deliveryId, 'failed', error.message);
       logger.error({ err: error, messageId: message.id, chatId: message.chatId }, 'Failed to forward Max message to Telegram');
       return false;
+    }
+  }
+
+  telegramPaused(now = Date.now()) {
+    return now < this.telegramPausedUntil;
+  }
+
+  // Stickers go out as real Telegram stickers — a WEBP, or a VP9 WEBM video
+  // sticker for animated ones — so they look like stickers: transparent, no
+  // bubble, no "GIF" badge. Before, animated ones were GIFs, which Telegram
+  // turns into looping videos with a black background, and static ones plain
+  // photos. If Telegram does not take the sticker, the old way is the fallback:
+  // an animated GIF (or its first frame), or a photo.
+  async sendToTelegram(message, outgoing, mapping) {
+    if (message.type === MessageType.STICKER && typeof this.telegramBot.sendStickerFile === 'function') {
+      const stickerFile = await this.telegramStickerFile(message, outgoing).catch((error) => {
+        logger.warn({ err: error?.message || String(error), messageId: message.id }, 'Could not encode a Telegram sticker; falling back');
+        return null;
+      });
+      if (stickerFile) {
+        const sent = await this.telegramBot.sendStickerFile(stickerFile, mapping, outgoing.replyToMessageId);
+        if (sent) {
+          if (message.metadata?.animated && message.mediaPath) {
+            await fsp.rm(message.mediaPath, { recursive: true, force: true }).catch(() => {});
+          }
+          return sent;
+        }
+      }
+    }
+    if (message.type === MessageType.STICKER && message.metadata?.animated && message.mediaPath) {
+      // Telegram autoplays the GIF. If encoding fails, degrade to the first
+      // frame as a photo rather than dropping the sticker.
+      try {
+        outgoing.mediaPath = await this.mediaService.framesDirToGif(message.mediaPath, message.metadata.fps);
+      } catch (encodeError) {
+        logger.warn({ err: encodeError, messageId: message.id }, 'Animated sticker encode failed; sending first frame as photo');
+        outgoing.mediaPath = path.join(message.mediaPath, 'frame-000.png');
+        outgoing.type = MessageType.PHOTO;
+        outgoing.metadata = { ...message.metadata, animated: false };
+      }
+    }
+    return this.telegramBot.sendMessage(outgoing, mapping);
+  }
+
+  async telegramStickerFile(message, outgoing) {
+    if (message.metadata?.animated && message.mediaPath) {
+      return this.mediaService.framesDirToWebmSticker(message.mediaPath, message.metadata.fps);
+    }
+    if (outgoing.mediaPath && typeof this.mediaService.toWebpSticker === 'function') {
+      return this.mediaService.toWebpSticker(outgoing.mediaPath);
+    }
+    return null;
+  }
+
+  // What MAX gets for a Telegram sticker: a PNG for a static one, an animated
+  // GIF for a .tgs (rendered with lottie-web in the MAX browser) or a .webm
+  // video sticker — transparency kept in both. null when it cannot be made;
+  // the caller then sends the sticker's emoji instead.
+  async prepareStickerForMax(message) {
+    const input = message.mediaPath;
+    const ext = path.extname(input || '').toLowerCase();
+    try {
+      if (ext === '.tgs') {
+        if (typeof this.maxClient.renderLottieToFrames !== 'function') return null;
+        const { frames, fps } = await this.maxClient.renderLottieToFrames(await fsp.readFile(input));
+        if (frames.length < 2) return null;
+        const framesDir = this.maxClient.saveFrameBuffers(`tg-${message.id}`, frames);
+        return await this.mediaService.framesDirToGif(framesDir, fps);
+      }
+      if (ext === '.webm') return await this.mediaService.videoStickerToGif(input);
+      return await this.mediaService.ensureMaxCompatible(input, MessageType.STICKER);
+    } catch (error) {
+      logger.warn({ err: error?.message || String(error), messageId: message.id }, 'Could not convert a Telegram sticker for MAX');
+      return null;
     }
   }
 
@@ -1174,15 +2253,12 @@ export class BridgeService {
     // carries the sign-in QR), so a message can land while MAX is still
     // starting or waiting to be scanned. Sending it would throw deep in
     // Puppeteer and burn the message as a failed delivery with no retry path,
-    // so say plainly that it was not sent and let the user resend.
-    if (this.loginInProgress || !this.maxClient.page) {
-      await this.telegramBot.sendText(
-        '⏳ MAX ещё не подключён — сообщение НЕ отправлено. Пришли его снова, когда придёт «✅ MAX подключён».',
-        {
-          telegramChatId: message.metadata.telegramChatId,
-          telegramThreadId: message.metadata.telegramThreadId
-        }
-      ).catch(() => null);
+    // so say plainly that it was not sent and let the user resend. A planned
+    // browser recycle is different: it holds maxLock until the new page is
+    // usable, so the send below simply waits for it instead of being refused.
+    if (this.loginInProgress || (!this.maxClient.page && !this.browserRecycling)) {
+      await this.notifyNotSent(message, '⏳ MAX ещё не подключён — сообщение НЕ отправлено. Нажми «Повторить», когда придёт «✅ MAX подключён».')
+        .catch(() => null);
       return;
     }
 
@@ -1202,6 +2278,7 @@ export class BridgeService {
     if (this.db.hasMessage(enriched.id)) return;
 
     const deliveryId = this.db.createDelivery(enriched.id, 'tg_to_max');
+    let captionError = null;
 
     try {
       await this.maxLock.run(async () => {
@@ -1219,31 +2296,83 @@ export class BridgeService {
           // was still the last row when a slow render raced the fixed sleep
           // (see Fix 2 in the reply-feature review).
           enriched.maxFingerprint = await this.maxClient.getLastOutgoingFingerprint(mapping.maxChatId, enriched.text).catch(() => null);
+          // A fingerprint means MAX already renders the bubble as outgoing,
+          // which the poller skips by itself: the echo record is no longer
+          // needed and would only swallow an identical reply from the contact.
+          if (enriched.maxFingerprint) this.forgetSentToMax(mapping.maxChatId, enriched.text);
+        } else if (enriched.type === MessageType.STICKER) {
+          const filePath = await this.prepareStickerForMax(enriched);
+          if (filePath) {
+            await this.maxClient.sendFile(mapping.maxChatId, filePath);
+            enriched.mediaPath = filePath;
+          } else {
+            // Nothing MAX could show: the emoji the sticker stands for.
+            const text = enriched.metadata?.stickerEmoji || '[стикер]';
+            await this.maxClient.sendText(mapping.maxChatId, text);
+            this.rememberSentToMax(mapping.maxChatId, text);
+          }
         } else {
           const filePath = await this.mediaService.ensureMaxCompatible(enriched.mediaPath, enriched.type);
-          await this.maxClient.sendFile(mapping.maxChatId, filePath, enriched.text || '');
+          await this.maxClient.sendFile(mapping.maxChatId, filePath);
           enriched.mediaPath = filePath;
+          // So a reply or a reaction to this file in Telegram can find it in MAX.
+          if (typeof this.maxClient.getLastOutgoingMediaFingerprint === 'function') {
+            enriched.maxFingerprint = await this.maxClient.getLastOutgoingMediaFingerprint(mapping.maxChatId).catch(() => null);
+          }
           // Hash the media we just sent into MAX so a reply to it can be matched.
           enriched.mediaHash = await this.computeMediaHash(filePath, enriched.type);
+          // The attach flow has no caption field the bridge fills in, and the
+          // caption used to be dropped without a trace. It follows as its own
+          // message instead. The file is already in MAX by now, so a failure
+          // here must not mark the delivery failed (the owner would resend the
+          // file) — it is reported separately below.
+          if (enriched.text?.trim()) {
+            try {
+              await this.maxClient.sendText(mapping.maxChatId, enriched.text);
+              this.rememberSentToMax(mapping.maxChatId, enriched.text);
+              const captionFingerprint = await this.maxClient.getLastOutgoingFingerprint(mapping.maxChatId, enriched.text).catch(() => null);
+              if (captionFingerprint) this.forgetSentToMax(mapping.maxChatId, enriched.text);
+            } catch (error) {
+              captionError = error;
+            }
+          }
         }
       });
 
       this.db.insertMessage(enriched);
       this.db.updateDeliveryStatus(deliveryId, 'sent');
       logger.info({ messageId: enriched.id, type: enriched.type, chatId: mapping.maxChatId }, 'Forwarded Telegram message to Max');
+      if (captionError) {
+        logger.warn({ err: captionError, messageId: enriched.id, chatId: mapping.maxChatId }, 'File sent to MAX but its caption was not');
+        await this.telegramBot.sendText(
+          `⚠️ Файл ушёл в MAX, а подпись к нему — нет: ${captionError.message}`,
+          {
+            telegramChatId: message.metadata.telegramChatId,
+            telegramThreadId: message.metadata.telegramThreadId
+          }
+        ).catch(() => null);
+      }
     } catch (error) {
       this.db.updateDeliveryStatus(deliveryId, 'failed', error.message);
       logger.error({ err: error, messageId: enriched.id, chatId: mapping.maxChatId }, 'Failed to forward Telegram message to Max');
-      await this.telegramBot.sendText(
-        `⚠️ Failed to send to MAX: ${error.message}`,
-        {
-          telegramChatId: message.metadata.telegramChatId,
-          telegramThreadId: message.metadata.telegramThreadId
-        }
-      ).catch((notifyError) => {
+      await this.notifyNotSent(message, `⚠️ Не ушло в MAX: ${error.message}`).catch((notifyError) => {
         logger.warn({ err: notifyError }, 'Failed to notify Telegram user about forwarding failure');
       });
     }
+  }
+
+  // Tells the owner a message of theirs did not reach MAX: as a reply to it,
+  // with a "Повторить" button that sends it again (TelegramBotAdapter).
+  async notifyNotSent(message, text) {
+    const route = {
+      telegramChatId: message.metadata.telegramChatId,
+      telegramThreadId: message.metadata.telegramThreadId
+    };
+    const replyTo = Number(message.sourceMessageId) || null;
+    if (replyTo && typeof this.telegramBot.sendRetryNotice === 'function') {
+      return this.telegramBot.sendRetryNotice(text, route, replyTo);
+    }
+    return this.telegramBot.sendText(text, route);
   }
 
   // Telegram→MAX replies: if this Telegram message replies to one the bridge
@@ -1262,8 +2391,9 @@ export class BridgeService {
   //   3. Replies to the user's own previously-sent MAX messages (typed in
   //      Telegram and sent into Max, direction === 'tg_to_max'): quote by the
   //      MAX-side fingerprint captured right after sending and stored as
-  //      max_fingerprint (see handleTelegramMessage / getLastOutgoingFingerprint).
-  //      Text only — a MAX-side fingerprint is not captured for media sends.
+  //      max_fingerprint (see handleTelegramMessage): the bubble's id for a
+  //      text (getLastOutgoingFingerprint), its `media-token:` for a file
+  //      (getLastOutgoingMediaFingerprint).
   // Every branch is guarded against the unstable 'visible-N' index-based
   // fallback id (unmatchable — see maxWebClient.js scrapeMessageRows), and
   // returns null (send as a plain message, no quote) when not resolvable —
@@ -1275,17 +2405,20 @@ export class BridgeService {
 
     const original = this.db.getMessageByTelegramMessageId(replyToTelegramMessageId);
     if (!original || original.direction !== 'max_to_tg') {
-      // Not something the bridge forwarded FROM Max. Check the other case
-      // (v2): replying to one of the user's own earlier messages that was
-      // typed in Telegram and sent into Max — text only, since we only
-      // capture a MAX-side fingerprint for those (see handleTelegramMessage).
+      // Not something the bridge forwarded FROM Max. Check the other case:
+      // replying to one of the user's own earlier messages that was sent
+      // into Max from Telegram (text or file, see handleTelegramMessage).
       const ownSent = this.db.getTgToMaxMessageBySourceId(replyToTelegramMessageId);
-      if (ownSent && ownSent.type === MessageType.TEXT && ownSent.maxFingerprint
+      if (ownSent && ownSent.chatId === message.chatId && ownSent.maxFingerprint
           && !ownSent.maxFingerprint.startsWith('visible-')) {
         return ownSent.maxFingerprint;
       }
       return null;
     }
+    // A message from another MAX chat (a merged topic, or /select pointing
+    // elsewhere) cannot be quoted here — and looking for it scrolled this
+    // chat's history for seconds, with the page locked.
+    if (original.chatId !== message.chatId) return null;
     if (original.type === MessageType.TEXT) {
       if (!original.sourceMessageId || original.sourceMessageId.startsWith('visible-')) return null;
       return original.sourceMessageId;
@@ -1303,30 +2436,196 @@ export class BridgeService {
     return token ? `media-token:${token}` : null;
   }
 
+  // ---- Reactions ----
+  //
+  // MAX → Telegram: what other people put on a message in MAX shows in
+  // Telegram as the bot's reaction on the matching message. A bot may set one
+  // reaction, from Telegram's fixed list, so it is the most used one Telegram
+  // accepts. The owner's own reaction in MAX (MAX marks it as ours) is left
+  // out: set from Telegram, it is already there as the owner's own.
+  // Telegram → MAX: the owner's reaction on a bridged message becomes their
+  // reaction in MAX (MAX keeps one per person); taking it back takes it back.
+
+  async syncReactionsFromMax(chat) {
+    if (!this.config.reactionsEnabled || this.telegramPaused()) return;
+    if (typeof this.maxClient.readReactions !== 'function' || typeof this.telegramBot.setReaction !== 'function') return;
+    let rows;
+    try {
+      rows = await this.maxClient.readReactions(chat.id);
+    } catch (error) {
+      logger.debug({ err: error, chatId: chat.id }, 'Could not read MAX reactions');
+      return;
+    }
+    if (!rows?.length) return;
+    const mapping = this.db.getChatMapping(chat.id);
+    for (const row of rows) {
+      // A chip whose emoji could not be read: better nothing than a guess.
+      if (row.reactionsUnknown) continue;
+      const target = this.telegramMessageForBubble(chat.id, row, mapping);
+      if (!target) continue;
+      const wanted = mirroredReaction(row.reactions);
+      if (wanted === (target.message.metadata?.mirroredReaction ?? null)) continue;
+      try {
+        await this.telegramBot.setReaction(target.telegramChatId, target.telegramMessageId, wanted);
+        logger.info({ chatId: chat.id, emoji: wanted }, 'Mirrored a MAX reaction into Telegram');
+      } catch (error) {
+        const retryAfter = telegramRetryAfter(error);
+        if (retryAfter) {
+          this.telegramPausedUntil = Math.max(this.telegramPausedUntil, Date.now() + retryAfter * 1000);
+          logger.warn({ retryAfter }, 'Telegram flood control while mirroring reactions — pausing');
+          return;
+        }
+        // The group may not allow that reaction, or the message is gone. It
+        // is still recorded, so it is not retried on every poll.
+        logger.warn({ err: error, chatId: chat.id, emoji: wanted }, 'Could not mirror a MAX reaction into Telegram');
+      }
+      this.db.updateMessageMetadata(target.message.id, { ...target.message.metadata, mirroredReaction: wanted });
+    }
+  }
+
+  // The Telegram message a MAX bubble was bridged as: one forwarded from MAX,
+  // or the owner's own one sent into MAX from Telegram.
+  telegramMessageForBubble(chatId, row, mapping) {
+    if (row.outgoing) {
+      // A file we sent is known by its media token (see getLastOutgoingMediaFingerprint).
+      const own = this.db.getTgToMaxMessageByMaxFingerprint(chatId, row.rawId)
+        || this.legacyRecordForRow(chatId, row, (legacyId) => this.db.getTgToMaxMessageByMaxFingerprint(chatId, legacyId))
+        || (row.mediaToken ? this.db.getTgToMaxMessageByMaxFingerprint(chatId, `media-token:${row.mediaToken}`) : null);
+      const telegramMessageId = Number(own?.sourceMessageId) || null;
+      const telegramChatId = own?.metadata?.telegramChatId ?? null;
+      return telegramMessageId && telegramChatId ? { message: own, telegramChatId, telegramMessageId } : null;
+    }
+    const forwarded = this.db.getMessage(stableId('max', chatId, row.rawId))
+      || this.legacyRecordForRow(chatId, row, (legacyId) => this.db.getMessage(stableId('max', chatId, legacyId)));
+    if (!forwarded?.telegramMessageId) return null;
+    // Older records do not say which Telegram chat they went to; the route's
+    // chat is only trusted if the route has not changed since.
+    const telegramChatId = forwarded.metadata?.telegramChatId
+      ?? (mapping && mapping.updatedAt <= forwarded.createdAt ? mapping.telegramChatId : null);
+    return telegramChatId ? { message: forwarded, telegramChatId, telegramMessageId: forwarded.telegramMessageId } : null;
+  }
+
+  // A record under the id a bubble had before (without its time): only while
+  // old ids count, and only one made in the bubble's minute — an old id is
+  // shared by every repeat of a text ("Ок" typed in MAX today is not the
+  // "Ок" sent from Telegram last week).
+  legacyRecordForRow(chatId, row, find) {
+    if (!row.legacyRawId || !this.legacyWindowOpen(chatId)) return null;
+    const record = find(row.legacyRawId);
+    return record && sameClockMinute(row.time, record.createdAt) ? record : null;
+  }
+
+  async handleTelegramReaction({ telegramChatId, telegramMessageId, emojis = [], previousEmojis = [], otherReactions = 0 }) {
+    if (!this.config.reactionsEnabled || typeof this.maxClient.reactToMessage !== 'function') return;
+    // Only custom or paid reactions: nothing MAX could show, and not a removal.
+    if (!emojis.length && otherReactions) return;
+    const target = this.maxBubbleForTelegramMessage(telegramChatId, telegramMessageId);
+    if (!target) {
+      logger.debug({ telegramChatId, telegramMessageId }, 'Reaction on a Telegram message that is not bridged — ignored');
+      return;
+    }
+    // MAX keeps one reaction per person: the one just added (Telegram
+    // Premium allows several), or what is left, or none.
+    const added = emojis.filter((emoji) => !previousEmojis.includes(emoji));
+    const emoji = emojis.length ? (added.at(-1) ?? emojis.at(-1)) : null;
+    if (this.loginInProgress || !this.maxClient.page) {
+      await this.reportReactionFailure(target, emoji, { reason: 'max-not-ready' });
+      return;
+    }
+    let result;
+    try {
+      // The emoji itself, else its nearest relative MAX offers (🤣 -> 😂).
+      const wanted = emoji ? reactionCandidates(emoji) : null;
+      result = await this.maxLock.run(() => this.maxClient.reactToMessage(target.chatId, target.fingerprint, wanted));
+    } catch (error) {
+      result = { ok: false, reason: error?.message || String(error) };
+    }
+    if (result?.ok) {
+      logger.info({ chatId: target.chatId, emoji: result.emoji || emoji, changed: result.changed }, 'Mirrored a Telegram reaction into MAX');
+      return;
+    }
+    logger.warn({ chatId: target.chatId, emoji, reason: result?.reason }, 'Could not mirror a Telegram reaction into MAX');
+    await this.reportReactionFailure(target, emoji, result || {});
+  }
+
+  // The MAX bubble a Telegram message stands for, checked to be in that
+  // Telegram chat (message ids repeat across chats).
+  maxBubbleForTelegramMessage(telegramChatId, telegramMessageId) {
+    for (const original of this.db.listMessagesByTelegramMessageId(telegramMessageId)) {
+      if (original.direction !== 'max_to_tg') continue;
+      const mapping = this.db.getChatMapping(original.chatId);
+      if ((original.metadata?.telegramChatId ?? mapping?.telegramChatId) !== telegramChatId) continue;
+      const fingerprint = maxFingerprintOf(original);
+      return fingerprint ? { chatId: original.chatId, fingerprint, telegramChatId, telegramThreadId: mapping?.telegramThreadId ?? null } : null;
+    }
+    for (const own of this.db.listTgToMaxMessagesBySourceId(telegramMessageId)) {
+      if (own.metadata?.telegramChatId !== telegramChatId) continue;
+      if (!own.maxFingerprint || own.maxFingerprint.startsWith('visible-')) return null;
+      return { chatId: own.chatId, fingerprint: own.maxFingerprint, telegramChatId, telegramThreadId: own.metadata?.telegramThreadId ?? null };
+    }
+    return null;
+  }
+
+  // Tells the owner, where they reacted, that it did not reach MAX — once per
+  // kind of problem every ten minutes.
+  async reportReactionFailure(target, emoji, { reason = 'unknown', available = [] }) {
+    const key = `${reason}:${emoji || ''}`;
+    const now = Date.now();
+    if (now - (this.reactionNoticeAt.get(key) || 0) < REACTION_NOTICE_INTERVAL_MS) return;
+    this.reactionNoticeAt.set(key, now);
+    let text;
+    if (reason === 'emoji-not-available') {
+      text = `⚠️ В MAX нет реакции ${emoji} на это сообщение.${available.length ? ` Можно: ${available.join(' ')}` : ''}`;
+    } else if (reason === 'message-not-found') {
+      text = '⚠️ Реакция не дошла до MAX: сообщение не нашлось на странице (слишком далеко в истории).';
+    } else if (reason === 'max-not-ready') {
+      text = '⚠️ Реакция не дошла до MAX: MAX ещё не подключён.';
+    } else {
+      text = `⚠️ Не получилось ${emoji ? `поставить реакцию ${emoji}` : 'убрать реакцию'} в MAX (${reason}). Подробности — /diagnostics.`;
+    }
+    await this.telegramBot.sendText(text, {
+      telegramChatId: target.telegramChatId,
+      telegramThreadId: target.telegramThreadId
+    }).catch((error) => logger.warn({ err: error }, 'Failed to report a reaction problem'));
+  }
+
   resolveTelegramMapping(message) {
     const telegramChatId = message.metadata.telegramChatId;
     const telegramThreadId = message.metadata.telegramThreadId || null;
-    if (this.config.telegram.relayChatId && this.config.telegram.useTopics && !telegramThreadId) {
-      return null;
-    }
-    const mapping = this.db.getChatMappingByTelegramThread(telegramChatId, telegramThreadId);
-    if (mapping) return mapping;
-
-    if (!this.config.telegram.relayChatId) {
-      const selected = this.db.getSelectedChat();
-      return selected ? {
-        maxChatId: selected.id,
-        telegramChatId: this.telegramBot.targetChatId(),
-        telegramThreadId: null,
-        title: selected.title
-      } : null;
+    if (this.config.telegram.relayChatId && this.config.telegram.useTopics) {
+      if (!telegramThreadId) return null;
+      return this.db.getChatMappingByTelegramThread(telegramChatId, telegramThreadId);
     }
 
-    return null;
+    // No topics: every MAX chat is delivered into the same Telegram chat with
+    // no thread, so every mapping shares (chat, no thread) and a lookup by
+    // thread would return whichever chat happened to be inserted first. What
+    // the owner means is, in order: the chat of the message they replied to,
+    // else the chat picked with /select.
+    const repliedTo = this.fallbackReplyTarget(message);
+    const target = repliedTo || this.db.getSelectedChat();
+    return target ? {
+      maxChatId: target.id,
+      telegramChatId: this.telegramBot.targetChatId(),
+      telegramThreadId: null,
+      title: target.title
+    } : null;
+  }
+
+  // The MAX chat a Telegram reply points back to: the chat a forwarded MAX
+  // message came from, or the one an earlier Telegram message was sent into.
+  fallbackReplyTarget(message) {
+    const replyToTelegramMessageId = message.metadata?.replyToTelegramMessageId;
+    if (!replyToTelegramMessageId) return null;
+    const original = this.db.getMessageByTelegramMessageId(replyToTelegramMessageId)
+      || this.db.getTgToMaxMessageBySourceId(replyToTelegramMessageId);
+    if (!original?.chatId) return null;
+    return this.db.listChats().find((chat) => chat.id === original.chatId) || null;
   }
 
   async syncTopics() {
     this.topicCreationBlockedReason = null;
+    this.topicCreationRetryAt = 0;
     const chats = await this.maxLock.run(() => this.refreshChats({ ensureMappings: true }));
     const mappings = this.db.listChatMappings();
     const validMappings = mappings.filter((mapping) => mapping.telegramThreadId);
@@ -1365,8 +2664,12 @@ export class BridgeService {
     if (!chats.length) return 'No Max chats found.';
 
     const mappings = new Map(this.db.listChatMappings().map((mapping) => [mapping.maxChatId, mapping]));
+    // /select <number> refers to THIS list. It used to index the database's
+    // own order, so "/select 3" could pick a different chat than line 3.
+    this.lastChatListing = chats.map((chat) => chat.id);
+    const selectedId = this.db.getSelectedChat()?.id;
     return chats.map((chat, index) => {
-      const marker = chat.selected ? '*' : ' ';
+      const marker = chat.id === selectedId ? '*' : ' ';
       const mapped = mappings.has(chat.id) ? 'topic' : 'not linked';
       const unread = chat.metadata?.unread ? ' unread' : '';
       const muted = this.mutedChatIds.has(chat.id) ? ' 🔇 muted' : '';
@@ -1374,11 +2677,27 @@ export class BridgeService {
     }).join('\n');
   }
 
+  // `arg`: a number from the last /chats list, or the chat's name (whole, or
+  // a part that matches only one chat).
   async selectChat(arg) {
+    const query = String(arg ?? '').trim();
     const chats = this.db.listChats();
-    const index = Number.parseInt(arg, 10) - 1;
-    const chat = Number.isInteger(index) && index >= 0 ? chats[index] : chats.find((item) => item.id === arg);
-    if (!chat) return `Chat not found: ${arg}`;
+    let chat = null;
+    if (/^\d+$/.test(query)) {
+      const ids = this.lastChatListing?.length ? this.lastChatListing : chats.map((item) => item.id);
+      const id = ids[Number(query) - 1];
+      chat = chats.find((item) => item.id === id) || null;
+    } else if (query) {
+      const lower = query.toLocaleLowerCase('ru');
+      const titleOf = (item) => String(item.title || item.id).toLocaleLowerCase('ru');
+      chat = chats.find((item) => item.id === query || titleOf(item) === lower) || null;
+      if (!chat) {
+        const partial = chats.filter((item) => titleOf(item).includes(lower));
+        if (partial.length > 1) return `Под «${query}» подходит несколько чатов: ${partial.slice(0, 5).map((item) => item.title).join(', ')}. Уточни или выбери номер из /chats.`;
+        chat = partial[0] || null;
+      }
+    }
+    if (!chat) return `Chat not found: ${query}`;
 
     await this.maxLock.run(() => this.maxClient.selectChat(chat.id));
     this.db.selectChat(chat.id);
@@ -1387,7 +2706,10 @@ export class BridgeService {
   }
 
   async formatHistory(telegramChatId, telegramThreadId) {
-    const mapping = telegramChatId && !(this.config.telegram.relayChatId && this.config.telegram.useTopics && !telegramThreadId)
+    // Only a topic identifies a chat; without topics every mapping shares the
+    // same (chat, no thread) and a lookup would pick an arbitrary one.
+    const topicsInUse = Boolean(this.config.telegram.relayChatId && this.config.telegram.useTopics);
+    const mapping = telegramChatId && topicsInUse && telegramThreadId
       ? this.db.getChatMappingByTelegramThread(telegramChatId, telegramThreadId)
       : null;
     const selected = mapping
@@ -1397,7 +2719,9 @@ export class BridgeService {
     if (!selected) return 'No linked or selected MAX chat.';
     const messages = this.db.recentMessages(selected.id, this.config.historyLimit);
     if (!messages.length) return `No stored history for ${selected.title}.`;
-    return messages.map(humanMessage).join('\n').slice(0, 3900);
+    // Telegram caps a message at 4096 characters; keep the NEWEST lines, which
+    // are the ones /history is asked for.
+    return messages.map(humanMessage).join('\n').slice(-3900);
   }
 
   formatDeliveries() {
@@ -1554,7 +2878,8 @@ export class BridgeService {
           });
           for (const message of messages) {
             if (!this.db.hasMessage(message.id)) {
-              this.db.insertMessage(message);
+              // One recorded under its old id keeps its Telegram link.
+              if (!this.adoptLegacyId(message)) this.db.insertMessage(message);
               primed += 1;
             }
           }
@@ -1588,8 +2913,34 @@ export class BridgeService {
       `Chats per poll: ${this.config.maxChatsPerPoll}`,
       `Auto topics: ${this.shouldAutoCreateTopics() ? 'yes' : 'no'}`,
       this.topicCreationBlockedReason ? `Topic creation blocked: ${this.topicCreationBlockedReason}` : null,
-      `Poll failures: ${this.consecutivePollFailures}`
+      `Poll failures: ${this.consecutivePollFailures}`,
+      this.telegramPaused()
+        ? `Telegram flood control: forwarding paused for ${Math.ceil((this.telegramPausedUntil - Date.now()) / 1000)} s`
+        : null,
+      ...this.formatBrowserStatusLines()
     ].filter(Boolean).join('\n');
+  }
+
+  // The planned-recycle state, so the owner can see from Telegram that the
+  // browser is being kept in check (this used to be an invisible host cron).
+  formatBrowserStatusLines(now = Date.now()) {
+    if (!this.browserStartedAt) return [];
+    const minutesAgo = (at) => `${Math.max(0, Math.round((now - at) / 60000))} min`;
+    const memory = this.lastBrowserMemory;
+    const limits = [
+      this.config.pageReloadMemoryMb ? `reload at ${this.config.pageReloadMemoryMb}` : null,
+      this.config.browserMemoryLimitMb ? `relaunch at ${this.config.browserMemoryLimitMb}` : null
+    ].filter(Boolean).join(', ');
+    const recycleMinutes = this.config.browserRecycleMinutes || 0;
+    const last = this.lastBrowserRecycle;
+    return [
+      `Browser uptime: ${minutesAgo(this.browserStartedAt)}${recycleMinutes ? ` (relaunch every ${recycleMinutes} min)` : ''}`,
+      this.pageLoadedAt && this.pageLoadedAt !== this.browserStartedAt ? `Page reloaded: ${minutesAgo(this.pageLoadedAt)} ago` : null,
+      memory
+        ? `Browser memory: ${toMb(memory.bytes)} MB${memory.page?.domNodes ? `, ${memory.page.domNodes} DOM nodes` : ''}${limits ? ` (${limits} MB)` : ''}`
+        : null,
+      `Browser recycles: ${this.browserRecycles}, page reloads: ${this.pageReloads}${last ? ` (last: ${last.tier || 'relaunch'} for ${last.reason}, ${minutesAgo(last.at)} ago${last.ok ? '' : ', FAILED'})` : ''}`
+    ].filter(Boolean);
   }
 
   async runHealthCheck() {

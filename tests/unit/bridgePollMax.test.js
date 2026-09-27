@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   makeBridge,
+  makeTestConfig,
   linkChat,
   maxMessage
 } from '../helpers/bridgeHarness.js';
@@ -181,5 +182,102 @@ describe('pollMax', () => {
     expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
     expect(telegramBot.sendMessage.mock.calls[0][0].id).toBe('g1');
     expect(db.hasMessage('g1')).toBe(true);
+  });
+});
+
+describe('pollMax under Telegram flood control (429)', () => {
+  // A whole relay group shares ~20 messages a minute. Counted as ordinary
+  // failures, the retry budget (5 attempts, one per poll) burned out within
+  // seconds while Telegram was asking for 30+, and the burst was dropped for
+  // good — with the "given up" notice itself rejected by the same 429.
+  function floodError(retryAfter = 30) {
+    return Object.assign(new Error(`429: Too Many Requests: retry after ${retryAfter}`), {
+      code: 429,
+      parameters: { retry_after: retryAfter }
+    });
+  }
+
+  it('pauses forwarding instead of burning the retry budget, then delivers in order', async () => {
+    vi.useFakeTimers();
+    try {
+      const { bridge, db, maxClient, telegramBot } = primedBridge();
+      linkChat(db, 'chat-a', { unread: true });
+      maxClient.readMessages.mockResolvedValue([maxMessage('m1', 'chat-a'), maxMessage('m2', 'chat-a')]);
+      telegramBot.sendMessage.mockRejectedValueOnce(floodError(30));
+
+      for (let i = 0; i < 10; i++) {
+        bridge.lastChatRefreshAt = Date.now();
+        await bridge.pollMax();
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+
+      // One attempt, then silence for the window: m2 was never tried ahead
+      // of m1, nothing was given up, no failure counted.
+      expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+      expect(db.countFailedDeliveries('m1', 'max_to_tg')).toBe(0);
+      expect(db.hasMessage('m1')).toBe(false);
+      expect(telegramBot.sendText).not.toHaveBeenCalled();
+      expect(await bridge.formatStatus()).toContain('forwarding paused');
+
+      await vi.advanceTimersByTimeAsync(21000);
+      bridge.lastChatRefreshAt = Date.now();
+      await bridge.pollMax();
+
+      expect(telegramBot.sendMessage.mock.calls.slice(1).map(([message]) => message.id)).toEqual(['m1', 'm2']);
+      expect(db.hasMessage('m1')).toBe(true);
+      expect(db.hasMessage('m2')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('pollMax on a chat with no stored history', () => {
+  // A renamed MAX chat (ids are titles), a new chat, or one that was scrolled
+  // out of view during first-run priming: everything MAX shows in it is new to
+  // the database, and all of it used to be forwarded at once.
+  function historyBridge() {
+    const parts = makeBridge({ config: makeTestConfig({ startupPrimeExistingMessages: true }) });
+    parts.bridge.lastChatRefreshAt = Date.now();
+    linkChat(parts.db, 'known', { unread: false });
+    parts.db.insertMessage(maxMessage('known-1', 'known')); // not a first run
+    return parts;
+  }
+
+  it('forwards only as many of the newest messages as the unread badge shows, and stores the rest as seen', async () => {
+    const { bridge, db, maxClient, telegramBot } = historyBridge();
+    linkChat(db, 'Anna 🌸', { unread: true, telegramThreadId: 81 });
+    db.upsertChat({ id: 'Anna 🌸', title: 'Anna 🌸', lastSeenAt: Date.now() + 1000, metadata: { unread: true, unreadText: '2' } });
+    const history = Array.from({ length: 40 }, (_, i) => maxMessage(`old-${i}`, 'Anna 🌸'));
+    maxClient.readMessages.mockImplementation(async (chatId) => (chatId === 'Anna 🌸' ? history : []));
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage.mock.calls.map(([message]) => message.id)).toEqual(['old-38', 'old-39']);
+    expect(db.hasMessage('old-0')).toBe(true); // seen, not delivered
+    expect(db.hasMessage('old-37')).toBe(true);
+  });
+
+  it('forwards at least the newest one when there is no badge', async () => {
+    const { bridge, db, maxClient, telegramBot } = historyBridge();
+    linkChat(db, 'Oleg', { unread: false, telegramThreadId: 82 });
+    maxClient.readMessages.mockImplementation(async (chatId) => (
+      chatId === 'Oleg' ? [maxMessage('o1', 'Oleg'), maxMessage('o2', 'Oleg')] : []
+    ));
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage.mock.calls.map(([message]) => message.id)).toEqual(['o2']);
+  });
+
+  it('a chat with stored history forwards every unseen message as before', async () => {
+    const { bridge, db, maxClient, telegramBot } = historyBridge();
+    maxClient.readMessages.mockImplementation(async (chatId) => (
+      chatId === 'known' ? [maxMessage('known-1', 'known'), maxMessage('k2', 'known'), maxMessage('k3', 'known')] : []
+    ));
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage.mock.calls.map(([message]) => message.id)).toEqual(['k2', 'k3']);
   });
 });

@@ -5,7 +5,7 @@
 <p>
   <a href="https://github.com/GoPro3400/max-in-tg/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GoPro3400/max-in-tg/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-3DA639?style=for-the-badge" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/Node.js-20-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js 20" />
+  <img src="https://img.shields.io/badge/Node.js-22-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js 22" />
   <img src="https://img.shields.io/badge/Telegram-Bot_API-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram Bot API" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
 </p>
@@ -78,15 +78,20 @@ MAX Relay
 | Type | Max → Telegram | Telegram → Max | Notes |
 |------|:--------------:|:--------------:|-------|
 | Text | :white_check_mark: | :white_check_mark: | |
-| Replies (quote) | :warning: | :warning: | MAX→TG: replies to text and media messages arrive as a quoted reply in Telegram (media matched by perceptual image hash and/or CDN token, best-effort). TG→MAX: replying to a **text or media** original that was forwarded from MAX sends a genuine MAX reply — the bot locates the matching bubble in MAX Web (by author/time/text fingerprint, or by CDN token for media) and clicks "Reply". Replying to your own previously Telegram-sent **text** message also works, using a fingerprint captured right after that message was sent into MAX. All of this is best-effort — if the original bubble can't be found or the Reply UI doesn't engage, the message is still sent, just without a quote. Replies to your own non-text messages (photos etc.) aren't resolved yet. |
+| Replies (quote) | :warning: | :warning: | MAX→TG: replies to text and media messages arrive as a quoted reply in Telegram (media matched by perceptual image hash and/or CDN token, best-effort). TG→MAX: replying to a **text or media** original that was forwarded from MAX sends a genuine MAX reply — the bot locates the matching bubble in MAX Web (by author/time/text fingerprint, or by CDN token for media) and clicks "Reply". Replying to your own previously Telegram-sent **text** message also works, using a fingerprint captured right after that message was sent into MAX. Replying to your own photo or file sent from Telegram finds it in MAX too (by its CDN token). All of this is best-effort — if the original bubble can't be found or the Reply UI doesn't engage, the message is still sent, just without a quote. |
 | Photos / files | :white_check_mark: | :white_check_mark: | TG→MAX via MAX's attach menu ("Photo or video" / "File") + delivery verification. [Details](docs/MEDIA_PIPELINE.md) |
 | Voice messages | :white_check_mark: | :warning: | MAX→TG: a real voice message (click play → network intercept → .ogg/.opus/.mp3). TG→MAX: uploaded through MAX's "File" menu, so it lands as an attached audio file, not a playable voice bubble |
 | Video notes (circles) | :white_check_mark: | :warning: | MAX→TG: a real video note (roundVideo/videoCanvas detection). TG→MAX: uploaded through "Photo or video" — arrives as an ordinary inline video, not a round one |
-| Documents (PDF/DOCX/ZIP) | :white_check_mark: | :white_check_mark: | File forwarding |
-| Animated stickers | :white_check_mark: | — | Lottie → `.tgs` (gzipped Lottie); fallback — canvas frames → `.gif`/`.webm`. [Details](docs/MEDIA_PIPELINE.md) |
+| Documents (PDF/DOCX/ZIP) | :white_check_mark: | :white_check_mark: | File forwarding, with the file's name. From MAX, a file over 50 MB (Telegram's limit for bots) is not downloaded — a notice with its name and size arrives instead; one deleted in MAX gets a notice too |
+| Stickers | :white_check_mark: | :white_check_mark: | MAX→TG as real Telegram stickers (animated: VP9 `.webm` video sticker; static: `.webp`; fallback GIF/photo). TG→MAX: `.webp` → PNG, `.tgs`/`.webm` → animated GIF with transparency. [Details](docs/MEDIA_PIPELINE.md) |
+| Reactions | :white_check_mark: | :white_check_mark: | MAX→TG: the contact's reaction shows as the bot's reaction on that message (nearest one bots may set: 😂 → 🤣). TG→MAX: your reaction is set in MAX as yours; removing it removes it. `SYNC_REACTIONS=false` turns it off. |
+| Emoji in text | :white_check_mark: | :white_check_mark: | MAX emoji and animoji arrive as text (they used to vanish, and the message went out as a "photo" of the emoji) |
+| Typing | :white_check_mark: | — | While the contact types in MAX (or records a voice message, picks a sticker…), their topic shows the bot "typing…". `SYNC_TYPING=false` turns it off |
+| Group chats | :white_check_mark: | :white_check_mark: | The author's name in bold above each group message |
+| New chat | — | :white_check_mark: | `/new Ivan Petrov` or `/new +7 999 123-45-67`: find it in MAX, pick it with a button, get a topic |
 
 > :bulb: Media & stickers: how TG→MAX photo/file sending works through MAX's attach
-> menu, and how Lottie stickers become Telegram `.tgs`/`.gif`/`.webm` — see [docs/MEDIA_PIPELINE.md](docs/MEDIA_PIPELINE.md).
+> menu, and how stickers become real Telegram stickers (and back) — see [docs/MEDIA_PIPELINE.md](docs/MEDIA_PIPELINE.md).
 
 ### Infrastructure
 
@@ -166,9 +171,9 @@ MAX Relay
 ### Requirements
 
 - **What it costs**: an always-on Linux VPS with 2 GB RAM and ~10 GB disk (typically
-  €5–10/month), plus a mandatory cron job restarting the container every 2 hours because
-  Chromium leaks (see [Known Limitations](#known-limitations) and SETUP_GUIDE §11.1).
-  A laptop that sleeps will not do
+  €5–10/month). A laptop that sleeps will not do. No cron job is needed any more: the
+  bridge relaunches Chromium by itself when it grows (see
+  [Known Limitations](#known-limitations) and SETUP_GUIDE §11.1)
 - **Server**: Debian 12/13 VPS with Docker + Docker Compose v2
 - **Telegram**: a bot token from [@BotFather](https://t.me/BotFather); a private group
   with Topics is optional and detected automatically
@@ -176,7 +181,7 @@ MAX Relay
 
 ### Supported Systems
 
-The bot runs entirely in Docker: the image is built from `node:20-bookworm-slim`, with Chromium, Xvfb, ffmpeg and all required libraries installed inside the container. Docker isolates the runtime from the host OS, so the host barely matters.
+The bot runs entirely in Docker: the image is built from `node:22-bookworm-slim`, with Chromium, Xvfb, ffmpeg and all required libraries installed inside the container. Docker isolates the runtime from the host OS, so the host barely matters.
 
 | Requirement | Status |
 |---|---|
@@ -188,7 +193,7 @@ The bot runs entirely in Docker: the image is built from `node:20-bookworm-slim`
 | RAM | **2 GB minimum** (`mem_limit: 2048m`, `shm_size: 1gb`). On 1 GB the build dies with `Killed` / `exit code: 137` — better-sqlite3 is compiled inside the container and Chromium runs there |
 | Disk | ~10 GB free, minimum, for the image and data |
 | Windows / macOS | Fine for development/testing via Docker Desktop; a Linux server is recommended for production (uptime, resources) |
-| Native install without Docker | Possible on Debian/Ubuntu (needs Node 20, Chromium, Xvfb, ffmpeg), but this is not the officially supported path |
+| Native install without Docker | Possible on Debian/Ubuntu (needs Node 22, Chromium, Xvfb, ffmpeg), but this is not the officially supported path |
 
 ### Step 1: Install
 
@@ -223,9 +228,9 @@ until it has an owner it runs nothing but `/pair`) and send the code:
 
 The bot confirms that you now own this bridge. Until an owner exists, it executes no
 other command from anyone — `/pair` in a private chat is the only thing that gets
-through, and a wrong code is logged as a rejected attempt. After five wrong attempts the
-code is regenerated: the new one goes into the same log line, so a guessing attacker
-starts from zero while you just read the fresh code.
+through, and a wrong code is logged as a rejected attempt. After five wrong attempts
+that Telegram account is locked out of `/pair` for 10 minutes; the code itself stays the
+same, so a stranger guessing at it cannot keep you from pairing.
 
 Why the code is long and random (8 random bytes in base64url, like `k3Jq7Rr2_bA`): an
 unclaimed bot accepts `/pair` from anyone, and a bot's @username is globally searchable
@@ -331,6 +336,7 @@ topics for every current chat.
 | `/diagnostics` | Send latest diagnostic files |
 | `/sync` | Force refresh chats and topics |
 | `/chats` | List Max chats and routes |
+| `/new <name or number>` | Start a new MAX chat: MAX's search (your chats, people, public chats; a phone number via "Найти по номеру"), a button per result, and only on your choice the chat is opened and gets a topic. Nothing is sent to anyone |
 | `/history` | Recent messages in current topic |
 | `/deliveries` | Delivery stats (sent/failed/pending) |
 | `/merge <name>` | Merge a duplicate chat into current topic |
@@ -383,13 +389,14 @@ topics for every current chat.
 |---|-----------|---------|
 | 1 | **Max Web DOM** | Project depends on DOM selectors. Max Web updates may break things. Use `/check` for diagnostics |
 | 2 | **Stickers** | Network intercept of the Lottie/sticker asset, then a canvas screenshot; if neither works the message arrives as the text `[Стикер]` |
-| 3 | **Chromium memory leak** | The renderer grows to ~2 GB in about 3 hours, after which photos from Telegram stop reaching MAX while `/status` and `/check` still look fine. Mitigated by a scheduled restart every 2 hours — cron job in [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
+| 3 | **Chromium memory** | The leak that grew the renderer to ~2 GB in ~3 hours is fixed. As a safety net the bridge reloads the MAX tab above 900 MB and relaunches Chromium above 1300 MB or every 6 hours, between poll cycles (`MAX_PAGE_RELOAD_MEMORY_MB`, `MAX_BROWSER_MEMORY_LIMIT_MB`, `MAX_BROWSER_RECYCLE_MINUTES`); the Telegram bot stays online and no cron job is needed — [SETUP_GUIDE §11.1](docs/SETUP_GUIDE.md) |
 | 4 | **At-least-once** | Possible duplicates if process crashes between send and SQLite write |
-| 5 | **Chat identity** | By title/index — same-named chats may be confused |
+| 5 | **Chat identity** | By title — same-named chats are confused (a warning is logged). A rename is recognised by MAX's own chat id — the chat stays in its topic |
 | 6 | **Single user** | Self-hosted for one Max account |
-| 7 | **No retry policy** | Failed deliveries are not automatically retried |
+| 7 | **Retries** | MAX→Telegram is retried on the next polls up to `MAX_DELIVERY_ATTEMPTS` (no backoff); Telegram→MAX with the "🔁 Повторить" button under the notice |
 | 8 | **Media reply matching accuracy** | Best-effort: photos match by dHash (most reliable), other types only when a CDN token for the original is available; messages forwarded before this update have no hash and won't be matched retroactively; if matching isn't confident, no quote is attached |
-| 9 | **Telegram→MAX replies** | Works for replies to text and media MAX originals, and to your own previously Telegram-sent text messages; replies to your own non-text messages (photos etc.) aren't resolved yet. Always best-effort: if the bot can't locate the target bubble in MAX Web, the message is sent without a quote rather than failing |
+| 9 | **Telegram→MAX replies** | Works for replies to text and media MAX originals, and to your own messages sent from Telegram (text, photos, files). Always best-effort: if the bot can't locate the target bubble in MAX Web, the message is sent without a quote rather than failing |
+| 10 | **Reactions** | A Telegram bot can set only one reaction, from Telegram's list — the most used one (or its nearest stand-in) is shown. Reactions work on messages that are on screen in MAX Web; the reaction markup is taken from MAX Web's own code — if it changes, see `/diagnostics` and the reaction `MAX_SELECTORS_*` |
 
 ---
 
@@ -397,14 +404,14 @@ topics for every current chat.
 
 ### P1 (Priority)
 
-- [ ] **`/new <phone|name>`** — start a new Max chat from Telegram with candidate confirmation
+- [x] **`/new <name|number>`** — start a new MAX chat from Telegram with confirmation, by phone number too
 - [ ] **Extended contact card** — avatar, phone, username, metadata
-- [ ] **Chat fingerprint** — stronger identification (avatar hash instead of title)
+- [ ] **MAX chat ids instead of titles** — tell same-named chats apart (renames are already recognised by the id in the page's address)
 
 ### P2 (After P1)
 
-- [ ] Retry policy for failed deliveries
-- [ ] Integration Puppeteer fixture tests (selector checks against a mock DOM)
+- [x] ~~Retry policy for failed deliveries~~ — MAX→Telegram retries and the "🔁 Повторить" button
+- [x] ~~Integration Puppeteer fixture tests~~ — `tests/browser`
 - [ ] Admin/status Mini App
 
 > Full roadmap: **[docs/ROADMAP.md](docs/ROADMAP.md)**

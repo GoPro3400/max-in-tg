@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractMediaToken, hammingHex } from '../../src/services/bridge.js';
+import { extractMediaToken, hammingHex, fingerprintWithoutMediaUrl, telegramRetryAfter } from '../../src/services/bridge.js';
 
 describe('extractMediaToken', () => {
   it('extracts the r= token from a MAX CDN url', () => {
@@ -36,5 +36,30 @@ describe('hammingHex', () => {
     expect(hammingHex(null, 'ffff')).toBe(Infinity);
     expect(hammingHex('ffff', undefined)).toBe(Infinity);
     expect(hammingHex('ff', 'ffff')).toBe(Infinity);
+  });
+});
+
+describe('fingerprintWithoutMediaUrl', () => {
+  it('drops exactly the trailing signed media URL', () => {
+    const url = 'https://i.oneme.ru/i?r=T&fn=w_1280';
+    expect(fingerprintWithoutMediaUrl(`Мама|12:00|подпись|${url}`, url)).toBe('Мама|12:00|подпись');
+    expect(fingerprintWithoutMediaUrl(url, url)).toBe('');
+  });
+
+  it('falls back to stripping a trailing URL-looking field, and leaves URL-less fingerprints whole', () => {
+    expect(fingerprintWithoutMediaUrl('Мама|12:00|https://other/x?y=1', null)).toBe('Мама|12:00');
+    expect(fingerprintWithoutMediaUrl('Мама|12:00', null)).toBe('Мама|12:00');
+    expect(fingerprintWithoutMediaUrl(null, null)).toBe('');
+  });
+});
+
+describe('telegramRetryAfter', () => {
+  it('reads retry_after from a Telegraf 429 and ignores other errors', () => {
+    expect(telegramRetryAfter({ code: 429, parameters: { retry_after: 31 } })).toBe(31);
+    expect(telegramRetryAfter({ response: { error_code: 429, parameters: { retry_after: 7 } } })).toBe(7);
+    expect(telegramRetryAfter({ code: 429 })).toBe(5);
+    expect(telegramRetryAfter({ code: 400 })).toBe(0);
+    expect(telegramRetryAfter(new Error('boom'))).toBe(0);
+    expect(telegramRetryAfter(null)).toBe(0);
   });
 });

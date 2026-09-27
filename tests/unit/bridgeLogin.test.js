@@ -337,6 +337,55 @@ describe('BridgeService QR sign-in', () => {
       expect(telegramBot.sendText).toHaveBeenCalledTimes(1);
       expect(telegramBot.sendText.mock.calls[0][0]).toContain('/login');
     });
+
+    // Polling and failure recovery stand down for the whole (open-ended) wait,
+    // so the QR loop itself is the only thing that can notice a dead browser.
+    // Before the in-process recycling this was masked by the host cron
+    // restarting the container; without it the sign-in would hang forever.
+    it('relaunches a browser that disappeared during the wait and keeps going', async () => {
+      vi.useFakeTimers();
+      const { bridge, maxClient, telegramBot } = makeBridge();
+      maxClient.getSessionState.mockResolvedValue(LOGIN_REQUIRED);
+      maxClient.captureLoginQr.mockResolvedValue(makeQr('hash-1'));
+      let alive = true;
+      maxClient.isAlive = vi.fn(() => alive);
+      maxClient.start.mockImplementation(async () => { alive = true; });
+
+      const flow = bridge.ensureMaxLogin({ reason: 'startup' });
+      await vi.advanceTimersByTimeAsync(SETTLE_MS + LOGIN_POLL_INTERVAL_MS);
+      expect(maxClient.start).not.toHaveBeenCalled();
+
+      alive = false; // Chromium crashed
+      await vi.advanceTimersByTimeAsync(LOGIN_POLL_INTERVAL_MS * 2);
+
+      expect(maxClient.stop).toHaveBeenCalledTimes(1);
+      expect(maxClient.start).toHaveBeenCalledTimes(1);
+      // The fresh page's code is delivered again, editing the same message.
+      expect(telegramBot.sendOwnerQr.mock.calls.at(-1)[1]).toBe(QR_MESSAGE_ID);
+      expect(bridge.loginInProgress).toBe(true);
+
+      bridge.stopping = true;
+      await vi.advanceTimersByTimeAsync(LOGIN_POLL_INTERVAL_MS * 2);
+      await expect(flow).resolves.toBe(false);
+    });
+
+    it('relaunches after repeated capture failures (a crashed renderer leaves the browser connected)', async () => {
+      vi.useFakeTimers();
+      const { bridge, maxClient } = makeBridge();
+      maxClient.getSessionState.mockResolvedValue(LOGIN_REQUIRED);
+      maxClient.captureLoginQr.mockRejectedValue(new Error('Target crashed'));
+
+      const flow = bridge.ensureMaxLogin({ reason: 'startup' });
+      await vi.advanceTimersByTimeAsync(SETTLE_MS + LOGIN_POLL_INTERVAL_MS * 4);
+      expect(maxClient.start).not.toHaveBeenCalled(); // 4 failures: still patient
+
+      await vi.advanceTimersByTimeAsync(LOGIN_POLL_INTERVAL_MS * 2);
+      expect(maxClient.start).toHaveBeenCalledTimes(1);
+
+      bridge.stopping = true;
+      await vi.advanceTimersByTimeAsync(LOGIN_POLL_INTERVAL_MS * 2);
+      await flow;
+    });
   });
 
   describe('handlePollFailure', () => {

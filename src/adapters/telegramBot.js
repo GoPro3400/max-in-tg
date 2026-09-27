@@ -1,8 +1,10 @@
-import fs from 'node:fs';
 import crypto from 'node:crypto';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { Telegraf } from 'telegraf';
 import { Direction, MessageType, stableId } from '../domain/messages.js';
 import { logger } from '../logger.js';
+import { documentDisplayName } from '../utils/fileHelpers.js';
 
 export class TelegramBotAdapter {
   constructor(telegramConfig, mediaService) {
@@ -24,12 +26,22 @@ export class TelegramBotAdapter {
     this.onUnmuteRequested = null;
     this.onLoginRequested = null;
     this.onIdentityDiscoveredHandler = null;
+    this.onRelayLostHandler = null;
+    this.onReactionHandler = null;
     // Set by startPairing() when no owner is configured (see /pair).
     this.pairingCode = null;
-    this.pairingAttempts = 0;
-    // A group the bot was added to before anyone claimed it (see /pair).
-    this.pendingRelayChatId = null;
+    // Wrong /pair attempts per Telegram user (see /pair).
+    this.pairingFailures = new Map();
+    // Groups the bot was added to before anyone claimed it, keyed by the user
+    // who added it (see /pair).
+    this.pendingRelayChats = new Map();
     this.launchPromise = null;
+    // Keeps outbound Telegram messages in the order they were sent (see the
+    // 'message' handler).
+    this.outboundQueue = Promise.resolve();
+    // Reactions mirrored into MAX, in the order they were made (see the
+    // 'message_reaction' handler).
+    this.reactionQueue = Promise.resolve();
     this.installHandlers();
   }
 
@@ -40,6 +52,7 @@ export class TelegramBotAdapter {
     const commands = [
       { command: 'status', description: 'Состояние моста' },
       { command: 'chats', description: 'Список чатов MAX и маршрутов' },
+      { command: 'new', description: 'Начать чат в MAX: /new <имя или номер>' },
       { command: 'login', description: 'Прислать QR для входа в MAX' },
       { command: 'relay', description: 'Сделать эту группу местом для чатов MAX' },
       { command: 'sync', description: 'Обновить чаты и темы' },
@@ -63,16 +76,30 @@ export class TelegramBotAdapter {
   start() {
     return new Promise((resolve, reject) => {
       let launched = false;
-      this.launchPromise = this.bot.launch({}, () => {
+      // allowed_updates must be spelled out: Telegram never sends
+      // message_reaction (the owner reacting to a message) unless asked to.
+      this.launchPromise = this.bot.launch({ allowedUpdates: ALLOWED_UPDATES }, () => {
         launched = true;
         logger.info({ username: this.bot.botInfo?.username }, 'Telegram bot polling started');
         this.publishCommandMenu();
         resolve();
       }).catch((error) => {
         logger.error({ err: error }, 'Telegram bot polling failed');
-        if (!launched) reject(error);
+        if (!launched) {
+          reject(error);
+          return;
+        }
+        // Polling died after launch (409: the same token polled elsewhere,
+        // 401: token revoked). Nothing restarts it, and the process stayed
+        // up looking healthy while every command and message from Telegram
+        // was ignored. Hand it to the supervisor instead (index.js exits).
+        this.onFatalHandler?.(error);
       });
     });
+  }
+
+  onFatal(handler) {
+    this.onFatalHandler = handler;
   }
 
   stop(signal = 'SIGTERM') {
@@ -135,6 +162,16 @@ export class TelegramBotAdapter {
     this.onMuteRequested = handler;
   }
 
+  // /new <query>: returns { text, choices: [{ label, data }] }.
+  onNewChat(handler) {
+    this.onNewChatRequested = handler;
+  }
+
+  // A button under /new's answer: (sessionId, choice) → text.
+  onNewChatChoice(handler) {
+    this.onNewChatChosen = handler;
+  }
+
   onUnmute(handler) {
     this.onUnmuteRequested = handler;
   }
@@ -149,6 +186,28 @@ export class TelegramBotAdapter {
     this.onIdentityDiscoveredHandler = handler;
   }
 
+  // Called when the bot is removed from the relay group.
+  onRelayLost(handler) {
+    this.onRelayLostHandler = handler;
+  }
+
+  // Called when the owner changes their reaction on a message.
+  onReaction(handler) {
+    this.onReactionHandler = handler;
+  }
+
+  // "typing…" (or "recording a voice message"…) in a chat's topic; Telegram
+  // shows it for about 5 seconds.
+  async sendChatAction(route, action = 'typing') {
+    await this.bot.telegram.sendChatAction(route.telegramChatId, action, threadExtra(route));
+  }
+
+  // Sets the bot's reaction on a message (null clears it). Only emoji from
+  // Telegram's fixed list are accepted — see domain/reactions.js.
+  async setReaction(chatId, messageId, emoji) {
+    await this.bot.telegram.setMessageReaction(chatId, messageId, emoji ? [{ type: 'emoji', emoji }] : []);
+  }
+
   // Zero-config ownership: with TELEGRAM_OWNER_ID unset the bot accepts a
   // single `/pair <code>` from anyone who can read the container logs, and
   // binds that user as the owner. The code is what keeps a stranger who merely
@@ -157,11 +216,11 @@ export class TelegramBotAdapter {
   // was deployed can find an unclaimed instance and start guessing. Six digits
   // is ~900k combinations — hours of brute force at Telegram's own rate limit,
   // and winning it means the attacker is handed the MAX login QR. Hence a
-  // 64-bit code plus a cap on wrong attempts.
+  // 64-bit code plus a cap on wrong attempts per user.
   startPairing() {
     if (!this.pairingCode) {
       this.pairingCode = crypto.randomBytes(8).toString('base64url');
-      this.pairingAttempts = 0;
+      this.pairingFailures.clear();
     }
     return this.pairingCode;
   }
@@ -213,10 +272,17 @@ export class TelegramBotAdapter {
   // assumed: the freshly paired owner must themselves be a member of that
   // group, otherwise anyone could add this bot to a group they control and
   // wait for the real owner to pair.
+  //
+  // And only a group the new owner added the bot to themselves: membership
+  // alone proves little, since by default anyone can add a user to a group.
+  // With a single "last group seen" slot, a stranger who found the unclaimed
+  // bot could add it to their own forum group (and the owner to that group),
+  // overwrite the owner's candidate, and have every private conversation
+  // relayed to them once the owner paired.
   async adoptPendingRelayGroup(ctx) {
-    const chatId = this.pendingRelayChatId;
+    const chatId = this.pendingRelayChats.get(this.config.ownerId);
+    this.pendingRelayChats.clear();
     if (!chatId || this.config.relayChatId || !this.config.ownerId) return false;
-    this.pendingRelayChatId = null;
 
     const chat = await this.bot.telegram.getChat(chatId);
     if (chat.type !== 'supergroup' || !chat.is_forum) {
@@ -277,6 +343,16 @@ export class TelegramBotAdapter {
     );
   }
 
+  // Tells the owner that one of their messages did not reach MAX: a reply to
+  // it, with a button that sends it again (see the RETRY_ACTION handler).
+  async sendRetryNotice(text, route = {}, replyToMessageId = null) {
+    return this.bot.telegram.sendMessage(route.telegramChatId || this.targetChatId(), text, {
+      ...threadExtra(route),
+      ...replyParameters(replyToMessageId),
+      reply_markup: { inline_keyboard: [[{ text: '🔁 Повторить', callback_data: RETRY_ACTION }]] }
+    });
+  }
+
   async sendPinnedText(text, route = {}) {
     const chatId = route.telegramChatId || this.targetChatId();
     const sent = await this.bot.telegram.sendMessage(chatId, text, threadExtra(route));
@@ -291,35 +367,76 @@ export class TelegramBotAdapter {
 
   async sendMessage(message, route = {}) {
     const chatId = route.telegramChatId || this.targetChatId();
+    const replyExtra = replyParameters(message.replyToMessageId);
 
-    // When the MAX message is a reply, instruct Telegram to render it as a quote.
-    // allow_sending_without_reply: true ensures delivery even if the original
-    // message was deleted or is unavailable in the target chat.
-    const replyExtra = message.replyToMessageId
-      ? { reply_parameters: { message_id: message.replyToMessageId, allow_sending_without_reply: true } }
-      : {};
-
-    const extra = {
-      ...threadExtra(route),
-      ...replyExtra,
-      caption: message.text || undefined
-    };
+    // In a group chat, the sender's name in bold on top — as Telegram shows
+    // it in its own groups. An entity rather than HTML: nothing to escape.
+    const sender = String(message.sender || '').trim();
+    const withSender = (text) => (sender ? (text ? `${sender}\n${text}` : sender) : text);
+    const senderEntities = sender ? [{ type: 'bold', offset: 0, length: sender.length }] : undefined;
 
     if (message.type === MessageType.TEXT) {
-      return await this.bot.telegram.sendMessage(chatId, message.text || '', { ...threadExtra(route), ...replyExtra });
+      return await this.sendTextChunks(chatId, withSender(message.text || ''), route, replyExtra, senderEntities);
     }
 
     const filePath = message.mediaPath;
     if (!filePath) {
-      return await this.bot.telegram.sendMessage(chatId, message.text || `[${message.type}] ${message.mediaUrl || ''}`, { ...threadExtra(route), ...replyExtra });
+      return await this.sendTextChunks(chatId, withSender(message.text || `[${message.type}] ${message.mediaUrl || ''}`), route, replyExtra, senderEntities);
     }
 
+    // Telegram takes at most 50 MB from a bot. A bigger upload failed on every
+    // retry until the message was given up on; say what it was right away.
+    const size = await fsp.stat(filePath).then((stat) => stat.size, () => 0);
+    if (size > TELEGRAM_UPLOAD_LIMIT_BYTES) {
+      const name = documentDisplayName(message.originalFilename, filePath) || path.basename(filePath);
+      const notice = `📎 «${name}» — ${formatMb(size)}: больше 50 МБ, столько бот в Telegram отправить не может. Файл можно открыть в MAX.`;
+      return await this.sendTextChunks(chatId, withSender(message.text ? `${notice}\n\n${message.text}` : notice), route, replyExtra, senderEntities);
+    }
+
+    // Telegram rejects the whole upload when a caption is over 1024 characters
+    // — on every retry, until the message was given up on and dropped. A
+    // longer text is sent right after the media instead, as a reply to it.
+    const text = message.text || '';
+    const captionFits = withSender(text).length <= TELEGRAM_CAPTION_LIMIT;
+    const caption = captionFits ? withSender(text) : withSender('');
+    const extra = {
+      ...threadExtra(route),
+      ...replyExtra,
+      caption: caption || undefined,
+      ...(caption && senderEntities ? { caption_entities: senderEntities } : {})
+    };
+    const sent = await this.sendMedia(chatId, message, filePath, extra, route, replyExtra);
+    if (!captionFits) {
+      await this.sendTextChunks(chatId, text, route, replyParameters(sent?.message_id));
+    }
+    return sent;
+  }
+
+  // Telegram caps a text message at 4096 characters and rejects anything
+  // longer outright, so long MAX texts go out in several parts. Returns the
+  // first part (its message_id is what later replies are matched against).
+  // `entities` (formatting, e.g. the sender's bold name) apply to the first part.
+  async sendTextChunks(chatId, text, route = {}, replyExtra = {}, entities = undefined) {
+    let first = null;
+    const chunks = splitTelegramText(text);
+    for (let index = 0; index < chunks.length; index++) {
+      const sent = await this.bot.telegram.sendMessage(chatId, chunks[index], {
+        ...threadExtra(route),
+        ...(index === 0 ? replyExtra : {}),
+        ...(index === 0 && entities ? { entities } : {})
+      });
+      first = first || sent;
+    }
+    return first;
+  }
+
+  async sendMedia(chatId, message, filePath, extra, route, replyExtra) {
     if (message.type === MessageType.STICKER && message.metadata?.lottie) {
       // Animated sticker as a Telegram .tgs (gzipped Lottie). Telegram validates
       // .tgs strictly; if it is rejected, deliver a text marker rather than
       // dropping the message (the log tells us .tgs failed → fall back to webm).
       try {
-        return await this.bot.telegram.sendSticker(chatId, { source: fs.createReadStream(filePath) }, { ...threadExtra(route), ...replyExtra });
+        return await this.bot.telegram.sendSticker(chatId, { source: filePath }, { ...threadExtra(route), ...replyExtra });
       } catch (tgsError) {
         logger.warn({ err: tgsError, filePath }, 'sendSticker (.tgs) rejected by Telegram');
         return await this.bot.telegram.sendMessage(chatId, '[Стикер]', { ...threadExtra(route), ...replyExtra });
@@ -329,51 +446,60 @@ export class TelegramBotAdapter {
     if (message.type === MessageType.STICKER && message.metadata?.animated) {
       // Animated sticker encoded as a GIF — Telegram autoplays it inline.
       // Fall back to a document only if the animation upload is rejected.
-      const source = () => ({ source: fs.createReadStream(filePath) });
       try {
-        return await this.bot.telegram.sendAnimation(chatId, source(), extra);
+        return await this.bot.telegram.sendAnimation(chatId, { source: filePath }, extra);
       } catch (animationError) {
-        logger.warn({ err: animationError, filePath }, 'sendAnimation rejected, sending as document');
-        return await this.bot.telegram.sendDocument(chatId, source(), extra);
+        logger.warn({ err: animationError?.message || String(animationError), filePath }, 'sendAnimation rejected, sending as document');
+        return await this.bot.telegram.sendDocument(chatId, { source: filePath }, extra);
       }
     } else if (message.type === MessageType.PHOTO || message.type === MessageType.STICKER) {
-      return await this.bot.telegram.sendPhoto(chatId, { source: fs.createReadStream(filePath) }, extra);
+      // A photo over 10 MB is refused as a photo, but fine as a file.
+      const size = await fsp.stat(filePath).then((stat) => stat.size, () => 0);
+      if (size > TELEGRAM_PHOTO_LIMIT_BYTES) return await this.bot.telegram.sendDocument(chatId, { source: filePath }, extra);
+      return await this.bot.telegram.sendPhoto(chatId, { source: filePath }, extra);
     } else if (message.type === MessageType.VOICE) {
-      return await this.bot.telegram.sendVoice(chatId, { source: fs.createReadStream(filePath) }, extra);
+      return await this.bot.telegram.sendVoice(chatId, { source: filePath }, extra);
     } else if (message.type === MessageType.VIDEO_NOTE) {
-      return await this.bot.telegram.sendVideoNote(chatId, { source: fs.createReadStream(filePath) }, { ...threadExtra(route), ...replyExtra });
+      return await this.bot.telegram.sendVideoNote(chatId, { source: filePath }, { ...threadExtra(route), ...replyExtra });
     } else if (message.type === MessageType.VIDEO) {
-      return await this.bot.telegram.sendVideo(chatId, { source: fs.createReadStream(filePath) }, extra);
+      return await this.bot.telegram.sendVideo(chatId, { source: filePath }, extra);
     } else {
-      const docSource = { source: fs.createReadStream(filePath) };
-      if (message.originalFilename) {
-        docSource.filename = message.originalFilename;
-      }
+      // The name comes from MAX's page, where it can carry invisible bidi
+      // characters (and so lose its extension in the eyes of Telegram
+      // clients, which then add it again: "report.pdf.pdf").
+      const docSource = { source: filePath, filename: documentDisplayName(message.originalFilename, filePath) };
       return await this.bot.telegram.sendDocument(chatId, docSource, extra);
     }
   }
 
-  // Try to send a file as a Telegram sticker (.tgs/.webm). Returns true on
-  // success, false if Telegram rejects it (so the caller can fall back). The
-  // rejection reason is logged so we can tell whether MAX's Lottie conforms.
-  async trySendSticker(filePath, route = {}) {
+  // Sends a file as a real Telegram sticker (a .webp, or a .webm video
+  // sticker). Telegram does not always refuse a file it cannot use as a
+  // sticker: it may post it as a plain document instead. So the result is
+  // checked and such a stray message removed. Returns the sent message, or
+  // null so the caller can fall back (GIF / photo). Flood control (429) is
+  // rethrown: the bridge has to pause, not fall back and send again.
+  async sendStickerFile(filePath, route = {}, replyToMessageId = null) {
+    const chatId = route.telegramChatId || this.targetChatId();
     try {
-      await this.bot.telegram.sendSticker(
-        route.telegramChatId || this.targetChatId(),
-        { source: fs.createReadStream(filePath) },
-        threadExtra(route)
-      );
-      return true;
+      const sent = await this.bot.telegram.sendSticker(chatId, { source: filePath }, {
+        ...threadExtra(route),
+        ...replyParameters(replyToMessageId)
+      });
+      if (sent?.sticker) return sent;
+      if (sent?.message_id) await this.bot.telegram.deleteMessage(chatId, sent.message_id).catch(() => {});
+      logger.warn({ filePath }, 'Telegram did not take the file as a sticker');
+      return null;
     } catch (error) {
+      if ((error?.code ?? error?.response?.error_code) === 429) throw error;
       logger.warn({ err: error?.message || String(error), filePath }, 'sendSticker rejected by Telegram');
-      return false;
+      return null;
     }
   }
 
   async sendDocument(filePath, route = {}, caption) {
     await this.bot.telegram.sendDocument(
       route.telegramChatId || this.targetChatId(),
-      { source: fs.createReadStream(filePath) },
+      { source: filePath },
       {
         ...threadExtra(route),
         caption
@@ -410,6 +536,7 @@ export class TelegramBotAdapter {
       '/check - run Max Web selector healthcheck',
       '/diagnostics - send latest Max Web diagnostic files',
       '/chats - route list',
+      '/new <имя или +7…> - начать новый чат в MAX',
       '/sync - force refresh if a topic is missing',
       '/history - last messages in this topic'
     ].join('\n')));
@@ -436,9 +563,10 @@ export class TelegramBotAdapter {
 
     this.bot.command('select', async (ctx) => {
       try {
-        const [, arg] = ctx.message.text.split(/\s+/, 2);
+        // Everything after the command: a chat name can have spaces in it.
+        const arg = ctx.message.text.replace(/^\/select(@\w+)?/i, '').trim();
         if (!arg) {
-          await ctx.reply('Usage: /select <number>', threadExtraFromContext(ctx));
+          await ctx.reply('Usage: /select <номер из /chats или название чата>', threadExtraFromContext(ctx));
           return;
         }
         const text = await this.onChatSelectRequested?.(arg);
@@ -545,26 +673,29 @@ export class TelegramBotAdapter {
           await ctx.reply('Использование: /pair <код из логов контейнера>');
           return;
         }
-        // Constant-time-ish compare is overkill for a 6-digit code that is only
-        // valid until the first success, but a failed attempt must be logged:
-        // it means someone else found this bot.
+        // A failed attempt must be logged: it means someone else found this
+        // bot. Failures are counted per user and lock out only that user for
+        // a while. The code itself is never rotated because of them: with 64
+        // random bits guessing is hopeless anyway, and a shared rotation let
+        // any stranger keep changing the code faster than the operator could
+        // copy it out of the logs.
+        const userId = ctx.from?.id;
+        const failures = this.pairingFailures.get(userId) || { count: 0, lockedUntil: 0 };
+        if (Date.now() < failures.lockedUntil) {
+          await ctx.reply('Слишком много неудачных попыток — попробуй позже.');
+          return;
+        }
         if (code !== this.pairingCode) {
-          this.pairingAttempts = (this.pairingAttempts || 0) + 1;
-          logger.warn(
-            { telegramUserId: ctx.from?.id, attempts: this.pairingAttempts },
-            'Rejected /pair attempt with a wrong code'
-          );
-          if (this.pairingAttempts >= MAX_PAIRING_ATTEMPTS) {
-            // Rotate rather than lock out: a guessing attacker has to start
-            // over from zero knowledge, while the real operator only needs to
-            // re-read the new code from the logs.
-            this.pairingCode = crypto.randomBytes(8).toString('base64url');
-            this.pairingAttempts = 0;
-            logger.warn({ pairingCode: this.pairingCode }, 'Too many wrong /pair attempts — pairing code regenerated, use the new one');
-            await ctx.reply('Слишком много неудачных попыток. Код перевыпущен — возьми новый в логах контейнера.');
-            return;
+          failures.count += 1;
+          if (failures.count >= MAX_PAIRING_ATTEMPTS) {
+            failures.count = 0;
+            failures.lockedUntil = Date.now() + PAIRING_LOCKOUT_MS;
           }
-          await ctx.reply('Код не подходит.');
+          this.pairingFailures.set(userId, failures);
+          logger.warn({ telegramUserId: userId, lockedOut: failures.lockedUntil > Date.now() }, 'Rejected /pair attempt with a wrong code');
+          await ctx.reply(failures.lockedUntil > Date.now()
+            ? 'Слишком много неудачных попыток — попробуй позже.'
+            : 'Код не подходит.');
           return;
         }
 
@@ -631,9 +762,17 @@ export class TelegramBotAdapter {
         this.config.relayChatId = chat.id;
         await this.onIdentityDiscoveredHandler?.({ relayChatId: chat.id });
         logger.info({ relayChatId: chat.id, previous, title: chat.title }, 'Relay group set via /relay');
-        await ctx.reply(previous && previous !== chat.id
+        const lines = [previous && previous !== chat.id
           ? '✅ Теперь чаты MAX идут сюда. Темы, созданные в прошлой группе, там и останутся — новые появятся здесь.'
-          : '✅ Эта группа подключена — чаты MAX будут появляться здесь отдельными темами.');
+          : '✅ Эта группа подключена — чаты MAX будут появляться здесь отдельными темами.'];
+        // The environment wins over what /relay stores (see restoreIdentity):
+        // without this the bridge went back to the old group on the next
+        // restart, silently.
+        const pinned = Number.parseInt(process.env.TELEGRAM_RELAY_CHAT_ID || '', 10);
+        if (pinned && pinned !== chat.id) {
+          lines.push('', `⚠️ В .env задан TELEGRAM_RELAY_CHAT_ID=${pinned}: после перезапуска мост вернётся в ту группу. Убери эту строку из .env или впиши туда ${chat.id}.`);
+        }
+        await ctx.reply(lines.join('\n'));
       } catch (error) {
         logger.error({ err: error }, 'Command /relay failed');
         await ctx.reply(`⚠️ Relay failed: ${error.message}`).catch(() => {});
@@ -659,6 +798,11 @@ export class TelegramBotAdapter {
         const status = update?.new_chat_member?.status;
         const chat = update?.chat;
         if (!chat || (chat.type !== 'supergroup' && chat.type !== 'group')) return;
+        if ((status === 'left' || status === 'kicked') && chat.id === this.config.relayChatId) {
+          logger.warn({ chatId: chat.id, status }, 'Removed from the relay group');
+          await this.onRelayLostHandler?.(chat.id, status);
+          return;
+        }
         if (status !== 'administrator' && status !== 'member') return;
         if (this.config.relayChatId) {
           if (chat.id !== this.config.relayChatId) {
@@ -672,8 +816,9 @@ export class TelegramBotAdapter {
         // pair"). Remember it and let /pair adopt it after verifying the new
         // owner is actually in that group.
         if (!this.config.ownerId) {
-          this.pendingRelayChatId = chat.id;
-          logger.info({ chatId: chat.id }, 'Added to a group before pairing — remembered as a candidate relay group');
+          const addedBy = update?.from?.id;
+          if (addedBy) this.pendingRelayChats.set(addedBy, chat.id);
+          logger.info({ chatId: chat.id, addedBy }, 'Added to a group before pairing — remembered as a candidate relay group');
           return;
         }
 
@@ -710,6 +855,45 @@ export class TelegramBotAdapter {
       }
     });
 
+    // /new <имя или номер>: MAX's search, then a button per chat found. Only
+    // the owner reaches it (see isAllowedContext), and nothing is sent to
+    // anyone in MAX.
+    this.bot.command('new', async (ctx) => {
+      const extra = threadExtraFromContext(ctx);
+      try {
+        const arg = ctx.message.text.replace(/^\/new(@\w+)?/i, '').trim();
+        if (arg) await ctx.sendChatAction('typing', extra).catch(() => {});
+        const result = await this.onNewChatRequested?.(arg);
+        const choices = result?.choices || [];
+        await ctx.reply(result?.text || '/new is not available.', {
+          ...extra,
+          ...(choices.length ? { reply_markup: { inline_keyboard: choices.map((choice) => [{ text: choice.label, callback_data: choice.data }]) } } : {})
+        });
+      } catch (error) {
+        logger.error({ err: error }, 'Command /new failed');
+        await ctx.reply(`⚠️ /new: ${error.message}`, extra).catch(() => {});
+      }
+    });
+
+    this.bot.action(/^new:([A-Za-z0-9_-]{1,32}):(\d{1,2}|x)$/, async (ctx) => {
+      const [, sessionId, choice] = ctx.match;
+      await ctx.answerCbQuery(choice === 'x' ? 'Отменено' : 'Открываю чат в MAX…').catch(() => {});
+      // The buttons go at once: a second press must not open a second chat.
+      await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+      let text;
+      try {
+        text = await this.onNewChatChosen?.(sessionId, choice);
+      } catch (error) {
+        logger.error({ err: error }, '/new choice failed');
+        text = `⚠️ ${error.message}`;
+      }
+      // A second press of a button already pressed: the first one answers.
+      if (text === null) return;
+      const reply = text || '/new is not available.';
+      await ctx.editMessageText(reply, { link_preview_options: { is_disabled: true } })
+        .catch(() => ctx.reply(reply, { ...threadExtra({ telegramThreadId: ctx.callbackQuery?.message?.message_thread_id || null }) }).catch(() => {}));
+    });
+
     this.bot.command('mute', async (ctx) => {
       try {
         const arg = ctx.message.text.replace(/^\/mute\s*/, '').trim();
@@ -740,21 +924,81 @@ export class TelegramBotAdapter {
       }
     });
 
-    this.bot.on('message', async (ctx) => {
-      if (!this.onOutboundMessage || !ctx.message) return;
+    this.bot.on('message_reaction', (ctx) => {
+      const update = ctx.messageReaction;
+      if (!update || !this.onReactionHandler) return undefined;
+      const emojis = (list) => (list || []).filter((reaction) => reaction.type === 'emoji').map((reaction) => reaction.emoji);
+      const reaction = {
+        telegramChatId: update.chat.id,
+        telegramMessageId: update.message_id,
+        emojis: emojis(update.new_reaction),
+        previousEmojis: emojis(update.old_reaction),
+        // Custom-emoji and paid reactions have no MAX counterpart.
+        otherReactions: (update.new_reaction || []).filter((reaction) => reaction.type !== 'emoji').length
+      };
+      // Mirroring drives the MAX page and can take seconds: it must not hold
+      // up Telegram polling, only keep its order.
+      this.reactionQueue = this.reactionQueue
+        .then(() => this.onReactionHandler(reaction))
+        .catch((error) => {
+          logger.error({ err: error, chatId: reaction.telegramChatId }, 'Failed to mirror a Telegram reaction into MAX');
+        });
+      return undefined;
+    });
+
+    // "Повторить" under a notice that a message did not reach MAX: the
+    // notice is a reply to that message, so Telegram hands it back here and
+    // it goes through the ordinary path again — nothing has to be resent.
+    this.bot.action(RETRY_ACTION, async (ctx) => {
+      const notice = ctx.callbackQuery?.message;
+      const original = notice?.reply_to_message;
+      if (!original || !this.onOutboundMessage) {
+        await ctx.answerCbQuery('Исходное сообщение не найдено — пришли его ещё раз.').catch(() => {});
+        return;
+      }
+      await ctx.answerCbQuery('Отправляю ещё раз…').catch(() => {});
+      await ctx.deleteMessage().catch(() => {});
+      const task = this.outboundQueue.then(() => this.processOutbound(ctx, original));
+      this.outboundQueue = task.catch(() => {});
+      await task;
+    });
+
+    this.bot.on('message', (ctx) => {
+      if (!this.onOutboundMessage || !ctx.message) return undefined;
       // Skip only real bot commands (already served by their own handlers).
       // Matching every leading "/" silently swallowed ordinary messages that
       // merely start with one — a file path like "/home/user/photo.jpg" or a
       // note like "/2 ideas" never reached MAX and produced no log at all.
-      if ('text' in ctx.message && isBotCommand(ctx.message.text)) return;
-      try {
-        const message = await this.telegramMessageToDomain(ctx);
-        if (message) await this.onOutboundMessage(message);
-      } catch (error) {
-        logger.error({ err: error, chatId: ctx.chat?.id }, 'Failed to process outbound Telegram message');
-        await ctx.reply(`⚠️ Failed to process message: ${error.message}`, threadExtraFromContext(ctx)).catch(() => {});
-      }
+      if ('text' in ctx.message && isBotCommand(ctx.message.text)) return undefined;
+      // Telegraf handles all updates of one getUpdates batch concurrently,
+      // and a photo first waits for its download while a text sent right
+      // after it does not: "photo, then 'what do you think?'" reached MAX
+      // text first, and album items in whatever order their downloads
+      // finished. Queue each message now, before anything awaits, so they go
+      // out in the order they were sent.
+      const task = this.outboundQueue.then(() => this.processOutbound(ctx));
+      this.outboundQueue = task.catch(() => {});
+      return task;
     });
+  }
+
+  // `msg`: the owner's message — the update's own, or the one a "retry"
+  // button points back to.
+  async processOutbound(ctx, msg = ctx.message) {
+    const answer = (text) => ctx.telegram.sendMessage(msg.chat.id, text, threadExtra({ telegramThreadId: msg.message_thread_id || null })).catch(() => {});
+    try {
+      const message = await this.telegramMessageToDomain(ctx, msg);
+      if (message) {
+        await this.onOutboundMessage(message);
+      } else if (UNSUPPORTED_CONTENT.some((key) => key in msg)) {
+        // These used to vanish without a word, so the owner assumed they
+        // were delivered. (Service messages also land here and stay quiet.)
+        await answer('⚠️ Такой тип сообщения в MAX не пересылается — отправь текстом или файлом.');
+      }
+    } catch (error) {
+      logger.error({ err: error, chatId: msg.chat?.id }, 'Failed to process outbound Telegram message');
+      await answer(error?.userFacing ? `⚠️ ${error.message}` : `⚠️ Failed to process message: ${error.message}`);
+    }
   }
 
   isAllowedContext(ctx) {
@@ -769,20 +1013,29 @@ export class TelegramBotAdapter {
       if (ctx.updateType === 'my_chat_member') return true;
       return ctx.chat?.type === 'private' && /^\/pair(\s|$|@)/.test(ctx.message?.text || '');
     }
+    // Being removed from the relay group arrives from whichever admin did
+    // it, not necessarily the owner — and must still be noticed. It carries
+    // no user input; the handler only reacts to left/kicked there.
+    if (ctx.updateType === 'my_chat_member' && this.config.relayChatId && ctx.chat?.id === this.config.relayChatId) return true;
     if (ctx.from?.id !== this.config.ownerId) return false;
-    if (!this.config.relayChatId) return true;
-    if (ctx.chat?.id === this.config.relayChatId) return true;
+    // The owner adding the bot to a group is how the relay group is found;
+    // the my_chat_member handler itself decides whether to adopt it.
+    if (ctx.updateType === 'my_chat_member') return true;
+    if (this.config.relayChatId && ctx.chat?.id === this.config.relayChatId) return true;
     // /relay is how the owner MOVES the bridge to a different group, so it has
     // to be reachable from a group that is not the current relay — otherwise
     // the escape hatch only works where it is not needed, and re-pointing the
     // bridge means editing SQLite on the server. Owner-only: the sender was
     // already checked above.
     if (isGroupChat(ctx.chat) && /^\/relay(\s|$|@)/.test(ctx.message?.text || '')) return true;
+    // Anything else only from the owner's private chat. Without a relay group
+    // this used to accept the owner's messages from ANY chat the bot was in —
+    // an ordinary message typed in some unrelated group was then delivered to
+    // the MAX chat picked with /select.
     return ctx.chat?.type === 'private' && ctx.chat.id === this.config.ownerId;
   }
 
-  async telegramMessageToDomain(ctx) {
-    const msg = ctx.message;
+  async telegramMessageToDomain(ctx, msg = ctx.message) {
     const base = {
       id: stableId('tg', msg.chat.id, msg.message_thread_id || 0, msg.message_id, msg.date),
       direction: Direction.TG_TO_MAX,
@@ -804,36 +1057,62 @@ export class TelegramBotAdapter {
 
     if ('photo' in msg) {
       const photo = msg.photo.at(-1);
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, photo.file_id, 'photo');
+      const mediaPath = await this.fetchFile(ctx, photo, 'photo');
       return { ...base, type: MessageType.PHOTO, text: msg.caption, mediaPath };
     }
 
     if ('voice' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.voice.file_id, 'voice.ogg');
-      return { ...base, type: MessageType.VOICE, mediaPath };
+      const mediaPath = await this.fetchFile(ctx, msg.voice, 'voice');
+      return { ...base, type: MessageType.VOICE, text: msg.caption, mediaPath };
     }
 
     if ('video' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.video.file_id, msg.video.file_name || 'video');
+      const mediaPath = await this.fetchFile(ctx, msg.video, msg.video.file_name || 'video');
       return { ...base, type: MessageType.VIDEO, text: msg.caption, mediaPath };
     }
 
     if ('video_note' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.video_note.file_id, 'video-note');
+      const mediaPath = await this.fetchFile(ctx, msg.video_note, 'video-note');
       return { ...base, type: MessageType.VIDEO_NOTE, mediaPath };
     }
 
     if ('document' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.document.file_id, msg.document.file_name || 'document');
+      const mediaPath = await this.fetchFile(ctx, msg.document, msg.document.file_name || 'document');
+      return { ...base, type: MessageType.DOCUMENT, text: msg.caption, mediaPath };
+    }
+
+    // Music and other audio files (mp3/m4a) arrive as `audio`, not
+    // `document`, and used to disappear without a trace.
+    if ('audio' in msg) {
+      const mediaPath = await this.fetchFile(ctx, msg.audio, msg.audio.file_name || 'audio');
       return { ...base, type: MessageType.DOCUMENT, text: msg.caption, mediaPath };
     }
 
     if ('sticker' in msg) {
-      const mediaPath = await this.mediaService.telegramFileToLocal(ctx, msg.sticker.file_id, 'sticker.webp');
-      return { ...base, type: MessageType.STICKER, mediaPath };
+      // The sticker file itself: .webp (static), .tgs (animated Lottie) or
+      // .webm (video). The bridge turns it into something MAX shows — a PNG
+      // or an animated GIF, transparency kept — and sends the emoji instead
+      // if that fails.
+      const sticker = msg.sticker;
+      const mediaPath = await this.fetchFile(ctx, sticker, 'sticker');
+      return {
+        ...base,
+        type: MessageType.STICKER,
+        mediaPath,
+        metadata: { ...base.metadata, stickerEmoji: sticker.emoji || null }
+      };
     }
 
     return null;
+  }
+
+  // Telegram hands a bot files of up to 20 MB; for a bigger one getFile fails
+  // with a bare "file is too big". Say it in words the owner can act on.
+  async fetchFile(ctx, file, name) {
+    if (file?.file_size > TELEGRAM_DOWNLOAD_LIMIT_BYTES) {
+      throw userFacingError(`Файл «${name}» весит ${formatMb(file.file_size)}, а Telegram отдаёт ботам файлы только до 20 МБ — в MAX он не ушёл. Отправь его в MAX напрямую или сожми.`);
+    }
+    return this.mediaService.telegramFileToLocal(ctx, file.file_id, name);
   }
 }
 
@@ -842,11 +1121,32 @@ export class TelegramBotAdapter {
 const BOT_COMMANDS = new Set([
   'start', 'sync', 'chats', 'select', 'history', 'status',
   'check', 'diagnostics', 'deliveries', 'merge', 'unmerge',
-  'mute', 'unmute', 'pair', 'login', 'relay'
+  'mute', 'unmute', 'pair', 'login', 'relay', 'new'
 ]);
 
-// Wrong /pair codes tolerated before the code is rotated (see startPairing).
+// Wrong /pair codes one user may send before being locked out for a while.
 const MAX_PAIRING_ATTEMPTS = 5;
+const PAIRING_LOCKOUT_MS = 10 * 60 * 1000;
+
+// What Telegram lets a bot upload and download, and send as a photo.
+const TELEGRAM_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
+const TELEGRAM_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
+const TELEGRAM_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024;
+
+const formatMb = (bytes) => `${(bytes / (1024 * 1024)).toFixed(1).replace('.', ',')} МБ`;
+
+// An error whose message is written for the owner, shown to them as is.
+const userFacingError = (message) => Object.assign(new Error(message), { userFacing: true });
+
+// The update types the bot handles. Listing them is required to receive
+// message_reaction at all.
+const ALLOWED_UPDATES = ['message', 'my_chat_member', 'message_reaction', 'callback_query'];
+
+// callback_data of the "Повторить" button (see sendRetryNotice).
+const RETRY_ACTION = 'retry';
+
+// Telegram content the bridge cannot represent in MAX; the sender is told.
+const UNSUPPORTED_CONTENT = ['location', 'venue', 'contact', 'poll', 'dice', 'game', 'story'];
 
 const isGroupChat = (chat) => chat?.type === 'supergroup' || chat?.type === 'group';
 
@@ -858,6 +1158,35 @@ const isBotCommand = (text) => {
 const threadExtra = (route = {}) => (
   route.telegramThreadId ? { message_thread_id: route.telegramThreadId } : {}
 );
+
+// When the MAX message is a reply, Telegram renders it as a quote.
+// allow_sending_without_reply keeps delivery working if the original was
+// deleted or is unavailable in the target chat.
+const replyParameters = (messageId) => (
+  messageId ? { reply_parameters: { message_id: messageId, allow_sending_without_reply: true } } : {}
+);
+
+// Bot API limits, in UTF-16 code units (what String#length counts).
+const TELEGRAM_TEXT_LIMIT = 4096;
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+// Splits text into parts Telegram accepts, preferring a line break, then a
+// space, in the second half of each part; never splits a surrogate pair.
+export const splitTelegramText = (text, limit = TELEGRAM_TEXT_LIMIT) => {
+  const chunks = [];
+  let rest = String(text ?? '');
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n', limit);
+    if (cut < limit / 2) cut = rest.lastIndexOf(' ', limit);
+    if (cut < limit / 2) cut = limit;
+    const code = rest.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^[\n ]/, '');
+  }
+  chunks.push(rest);
+  return chunks;
+};
 
 const threadExtraFromContext = (ctx) => threadExtra({
   telegramThreadId: ctx.message?.message_thread_id || null

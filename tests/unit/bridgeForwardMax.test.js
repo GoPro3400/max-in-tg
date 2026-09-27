@@ -84,21 +84,23 @@ describe('forwardMaxMessage', () => {
   it('re-forward guard: skips sending an already-forwarded bubble but marks the delivery sent', async () => {
     const { bridge, db, telegramBot, mediaService } = makeBridge();
     linkChat(db, 'chat-4');
-    // Prior forwarded copy of the same bubble under an older signed URL:
-    // same chat, same perceptual hash, same stable fingerprint prefix
-    // (the part before the first '|').
+    // Prior forwarded copy of the same bubble under an older signed URL,
+    // stored before the current page was loaded: same chat, same perceptual
+    // hash, same fingerprint apart from the (re-signed) media URL.
     db.insertMessage({
       ...maxMessage('old-copy', 'chat-4', {
         type: 'photo',
-        sourceMessageId: '12:00 photo|old-signed-url'
+        sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=OLDTOKEN&fn=w_1280'
       }),
+      createdAt: Date.now() - 60000,
       mediaHash: 'a1b2c3d4e5f60718'
     });
+    bridge.pageLoadedAt = Date.now() - 1000; // a page load since then
 
     const message = maxMessage('m4', 'chat-4', {
       type: 'photo',
       mediaUrl: 'https://i.oneme.ru/i?r=NEWTOKEN&fn=w_1280',
-      sourceMessageId: '12:00 photo|new-signed-url'
+      sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=NEWTOKEN&fn=w_1280'
     });
     const result = await bridge.forwardMaxMessage(message);
 
@@ -119,21 +121,80 @@ describe('forwardMaxMessage', () => {
     db.insertMessage({
       ...maxMessage('old-copy', 'chat-4', {
         type: 'photo',
-        sourceMessageId: '12:00 photo|old-signed-url'
+        sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=OLDTOKEN&fn=w_1280'
       }),
+      createdAt: Date.now() - 60000,
       mediaHash: 'a1b2c3d4e5f60718'
     });
+    bridge.pageLoadedAt = Date.now() - 1000;
 
     const message = maxMessage('m4b', 'chat-4', {
       type: 'photo',
       mediaUrl: 'https://i.oneme.ru/i?r=OTHERTOKEN&fn=w_1280',
-      sourceMessageId: '18:45 photo|new-signed-url' // different prefix
+      // Same sender, different time: used to be swallowed, because only the
+      // first field (here the sender's name) was compared.
+      sourceMessageId: 'Мама|18:45|https://i.oneme.ru/i?r=OTHERTOKEN&fn=w_1280'
     });
     const result = await bridge.forwardMaxMessage(message);
 
     expect(result).toBe(true);
     expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
     expect(telegramBot.sendMessage.mock.calls[0][0].id).toBe('m4b');
+  });
+
+  it('re-forward guard: an old id (without the time) only counts where old ids still decide', async () => {
+    // A group member's uncaptioned photo had just her name for its old id's
+    // prefix: every later photo of hers with the same picture matched it.
+    const setup = () => {
+      const made = makeBridge();
+      linkChat(made.db, 'Семья');
+      made.db.insertMessage({
+        ...maxMessage('old-photo', 'Семья', { type: 'photo', sourceMessageId: 'Анна|https://i.oneme.ru/i?r=OLD&fn=w_1280' }),
+        createdAt: Date.now() - 86400000,
+        mediaHash: 'a1b2c3d4e5f60718'
+      });
+      made.bridge.pageLoadedAt = Date.now() - 1000;
+      return made;
+    };
+    const photo = (id) => maxMessage(id, 'Семья', {
+      type: 'photo',
+      mediaUrl: 'https://i.oneme.ru/i?r=NEW&fn=w_1280',
+      sourceMessageId: '13:00|https://i.oneme.ru/i?r=NEW&fn=w_1280',
+      metadata: { legacyId: 'Анна|https://i.oneme.ru/i?r=NEW&fn=w_1280' }
+    });
+
+    // Sent again today, below everything known: new.
+    const fresh = setup();
+    await fresh.bridge.forwardMaxMessage(photo('p-new'));
+    expect(fresh.telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+
+    // Old history on the first read after the update: the same photo.
+    const old = setup();
+    await old.bridge.forwardMaxMessage(Object.assign(photo('p-old'), { legacyMatchable: true }));
+    expect(old.telegramBot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('re-forward guard ignores copies from the current page load: an identical twin sent the same minute is new', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    linkChat(db, 'chat-4');
+    bridge.pageLoadedAt = Date.now() - 60000;
+    db.insertMessage({
+      ...maxMessage('first', 'chat-4', {
+        type: 'photo',
+        sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=A&fn=w_1280'
+      }),
+      createdAt: Date.now() - 1000, // forwarded in THIS session
+      mediaHash: 'a1b2c3d4e5f60718'
+    });
+
+    const result = await bridge.forwardMaxMessage(maxMessage('second', 'chat-4', {
+      type: 'photo',
+      mediaUrl: 'https://i.oneme.ru/i?r=B&fn=w_1280',
+      sourceMessageId: 'Мама|12:00|https://i.oneme.ru/i?r=B&fn=w_1280'
+    }));
+
+    expect(result).toBe(true);
+    expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('records a failed delivery with the error message when the Telegram send rejects', async () => {
@@ -199,9 +260,74 @@ describe('forwardMaxMessage', () => {
     const [outgoing] = telegramBot.sendMessage.mock.calls[0];
     expect(outgoing.type).toBe('sticker');
     expect(outgoing.mediaPath).toBe('/tmp/frames/stick-1/out.gif');
-    // Non-photo media identity uses the content hash of the encoded file.
-    expect(mediaService.fileContentHash).toHaveBeenCalledWith('/tmp/frames/stick-1/out.gif');
+    // The sticker's identity is its first frame — the same whichever encoder
+    // (video sticker or GIF) ends up being used.
+    expect(mediaService.fileContentHash).toHaveBeenCalledWith('/tmp/frames/stick-1/frame-000.png');
     expect(db.getDeliveryStats()).toEqual([{ status: 'sent', count: 1 }]);
+  });
+
+  describe('stickers as real Telegram stickers', () => {
+    function stickerBridge({ sendStickerFile = vi.fn(async () => ({ message_id: 555, sticker: {} })) } = {}) {
+      const mediaService = makeFakeMediaService({
+        framesDirToWebmSticker: vi.fn(async (dir) => `${dir}/sticker.webm`),
+        toWebpSticker: vi.fn(async (file) => `${file}-tg-sticker.webp`)
+      });
+      const telegramBot = makeFakeTelegramBot({ sendStickerFile });
+      const harness = makeBridge({ mediaService, telegramBot });
+      linkChat(harness.db, 'chat-s');
+      return harness;
+    }
+
+    it('an animated MAX sticker goes out as a VP9 video sticker, not as a GIF', async () => {
+      const { bridge, telegramBot, mediaService } = stickerBridge();
+
+      const result = await bridge.forwardMaxMessage(maxMessage('st1', 'chat-s', {
+        type: 'sticker', mediaPath: '/tmp/frames/st1', metadata: { animated: true, fps: 24 }
+      }));
+
+      expect(result).toBe(true);
+      expect(mediaService.framesDirToWebmSticker).toHaveBeenCalledWith('/tmp/frames/st1', 24);
+      expect(telegramBot.sendStickerFile).toHaveBeenCalledWith('/tmp/frames/st1/sticker.webm', expect.objectContaining({ maxChatId: 'chat-s' }), null);
+      expect(mediaService.framesDirToGif).not.toHaveBeenCalled();
+      expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the GIF when Telegram does not take the video sticker', async () => {
+      const { bridge, telegramBot, mediaService } = stickerBridge({ sendStickerFile: vi.fn(async () => null) });
+
+      await bridge.forwardMaxMessage(maxMessage('st2', 'chat-s', {
+        type: 'sticker', mediaPath: '/tmp/frames/st2', metadata: { animated: true, fps: 24 }
+      }));
+
+      expect(mediaService.framesDirToGif).toHaveBeenCalledWith('/tmp/frames/st2', 24);
+      expect(telegramBot.sendMessage.mock.calls[0][0].mediaPath).toBe('/tmp/frames/st2/out.gif');
+    });
+
+    it('a static MAX sticker goes out as a WEBP sticker, with the photo as fallback', async () => {
+      const { bridge, telegramBot, mediaService } = stickerBridge();
+
+      await bridge.forwardMaxMessage(maxMessage('st3', 'chat-s', {
+        type: 'sticker', mediaPath: '/tmp/media/sticker-st3.png'
+      }));
+
+      expect(mediaService.toWebpSticker).toHaveBeenCalledWith('/tmp/media/sticker-st3.png');
+      expect(telegramBot.sendStickerFile.mock.calls[0][0]).toBe('/tmp/media/sticker-st3.png-tg-sticker.webp');
+      expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('a sticker reply keeps its quote', async () => {
+      const { bridge, db, telegramBot } = stickerBridge();
+      db.insertMessage({
+        id: 'orig', chatId: 'chat-s', direction: 'max_to_tg', type: 'text', text: 'как дела?',
+        sourceMessageId: 'o', createdAt: Date.now(), metadata: {}, telegramMessageId: 321
+      });
+
+      await bridge.forwardMaxMessage(maxMessage('st4', 'chat-s', {
+        type: 'sticker', mediaPath: '/tmp/media/sticker-st4.png', metadata: { replyToSnippet: 'как дела?' }
+      }));
+
+      expect(telegramBot.sendStickerFile.mock.calls[0][2]).toBe(321);
+    });
   });
 
   it('falls back to the first frame as a photo when GIF encoding fails', async () => {
@@ -254,5 +380,103 @@ describe('computeMediaHash', () => {
     });
     const { bridge } = makeBridge({ mediaService });
     expect(await bridge.computeMediaHash('/tmp/a.jpg', 'photo')).toBeNull();
+  });
+});
+
+describe('forwardMaxMessage: files over Telegram\'s limit for bots', () => {
+  it('sends a notice instead of failing on every retry', async () => {
+    const tooBig = Object.assign(new Error('exceeds the 52428800 byte limit'), { code: 'EFILETOOBIG', bytes: 80 * 1024 * 1024 });
+    const { bridge, db, telegramBot, mediaService } = makeBridge();
+    linkChat(db, 'chat-a');
+    mediaService.downloadUrl.mockRejectedValue(tooBig);
+    const message = maxMessage('big-1', 'chat-a', { type: 'document', mediaUrl: 'https://fu.oneme.ru/f?r=T1', text: '' });
+    message.originalFilename = 'Отчёт.pdf';
+
+    await expect(bridge.forwardMaxMessage(message)).resolves.toBe(true);
+
+    expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+    const [sent] = telegramBot.sendMessage.mock.calls[0];
+    expect(sent.type).toBe('text');
+    expect(sent.text).toContain('«Отчёт.pdf»');
+    expect(sent.text).toContain('больше 50 МБ');
+    expect(message.telegramMessageId).toBeTruthy();
+  });
+});
+
+describe('files MAX did not hand over', () => {
+  const file = (id, metadata, text = '') => Object.assign(
+    maxMessage(id, 'chat-a', { type: 'document', text, metadata }),
+    { originalFilename: 'Фильм.mkv' }
+  );
+
+  it('names a file too big for Telegram, with its size, instead of sending it', async () => {
+    const { bridge, db, telegramBot, mediaService } = makeBridge();
+    linkChat(db, 'chat-a');
+
+    await expect(bridge.forwardMaxMessage(file('f-1', { fileTooBig: true, fileSize: 1.5 * 1024 ** 3 }, 'смотри'))).resolves.toBe(true);
+
+    expect(mediaService.downloadUrl).not.toHaveBeenCalled();
+    const [sent] = telegramBot.sendMessage.mock.calls[0];
+    expect(sent).toMatchObject({ type: 'text', mediaPath: null });
+    expect(sent.text).toBe('📎 «Фильм.mkv» (1,5 ГБ) — больше 50 МБ, столько бот в Telegram отправить не может. Файл можно открыть в MAX.\n\nсмотри');
+  });
+
+  it('says a file was deleted in MAX, or could not be fetched', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    linkChat(db, 'chat-a');
+
+    await bridge.forwardMaxMessage(file('f-2', { fileUnavailable: true }));
+    await bridge.forwardMaxMessage(file('f-3', { fileCaptureFailed: true, fileSize: 1290000 }));
+
+    const texts = telegramBot.sendMessage.mock.calls.map(([sent]) => sent.text);
+    expect(texts[0]).toBe('📎 «Фильм.mkv» — файл удалён или недоступен в MAX.');
+    expect(texts[1]).toBe('📎 «Фильм.mkv» (1,2 МБ) — не удалось забрать из MAX. Файл можно открыть там.');
+  });
+
+  it('tries a file that did not download again on the next reads before giving up on it', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, 'chat-a', { unread: true });
+    const failed = file('f-4', { fileCaptureFailed: true });
+    maxClient.readMessages.mockResolvedValue([failed]);
+
+    await bridge.pollMax();
+    await bridge.pollMax();
+    expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+    expect(db.hasMessage('f-4')).toBe(false);
+
+    await bridge.pollMax();
+    expect(telegramBot.sendMessage.mock.calls[0][0].text).toContain('не удалось забрать из MAX');
+    expect(db.hasMessage('f-4')).toBe(true);
+  });
+
+  it('delivers the file when a later read gets it', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, 'chat-a', { unread: true });
+    maxClient.readMessages.mockResolvedValueOnce([file('f-5', { fileCaptureFailed: true })]);
+    await bridge.pollMax();
+
+    const fetched = file('f-5', {});
+    fetched.mediaPath = '/tmp/media/doc-f-5/Фильм.mkv';
+    maxClient.readMessages.mockResolvedValue([fetched]);
+    await bridge.pollMax();
+
+    const [sent] = telegramBot.sendMessage.mock.calls[0];
+    expect(sent).toMatchObject({ type: 'document', mediaPath: '/tmp/media/doc-f-5/Фильм.mkv' });
+  });
+});
+
+describe('forwardMaxMessage: group chats', () => {
+  it('passes the sender on, so Telegram shows who wrote it', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    linkChat(db, 'Семья', { title: 'Семья' });
+    await bridge.forwardMaxMessage(maxMessage('g-1', 'Семья', { text: 'ужин в 7', metadata: { sender: 'Мама' } }));
+    expect(telegramBot.sendMessage.mock.calls[0][0].sender).toBe('Мама');
+  });
+
+  it('does not repeat the chat\'s own name (a channel, or a private chat)', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    linkChat(db, 'Новости', { title: 'Новости' });
+    await bridge.forwardMaxMessage(maxMessage('c-1', 'Новости', { text: 'пост', metadata: { sender: 'Новости' } }));
+    expect(telegramBot.sendMessage.mock.calls[0][0].sender).toBeUndefined();
   });
 });

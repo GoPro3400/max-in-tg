@@ -2,6 +2,9 @@ services:
   max-in-tg:
     build: .
     restart: unless-stopped
+    # Graceful shutdown drains in-flight browser work and closes Chromium
+    # (index.js allows itself 25 s); Docker's default 10 s would SIGKILL first.
+    stop_grace_period: 30s
     env_file:
       - .env
     volumes:

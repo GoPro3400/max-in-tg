@@ -10,14 +10,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      # Tests never launch a browser; skip the Chromium download to keep installs fast.
+      # No Puppeteer download: the browser tests (tests/browser) use the Chrome
+      # the GitHub runner already has, and are skipped where there is none.
       PUPPETEER_SKIP_DOWNLOAD: 'true'
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       # `npm ci`, not `npm install`: it installs exactly what package-lock.json

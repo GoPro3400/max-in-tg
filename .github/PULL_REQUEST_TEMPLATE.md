@@ -8,7 +8,7 @@
 
 ## Чеклист
 
-- [ ] `npx vitest run` проходит локально (Node 20)
+- [ ] `npx vitest run` проходит локально (Node 22)
 - [ ] `CHANGELOG.md` обновлён (раздел `[Unreleased]`)
 - [ ] Документация обновлена, если менялись `.env`, деплой или поведение в Telegram
       (README.md / README.ru.md / README.en.md — правятся все три)

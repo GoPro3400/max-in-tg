@@ -115,12 +115,20 @@ describe('resolveMaxReplyTarget', () => {
       expect(bridge.resolveMaxReplyTarget({ metadata: { replyToTelegramMessageId: 42 } })).toBeNull();
     });
 
-    it('returns null for a non-text own message (media not supported in v2)', () => {
+    it('quotes an own file by the media token captured after sending it', () => {
       const bridge = makeBridge(
         () => null,
-        () => ({ type: MessageType.PHOTO, maxFingerprint: 'Me|02:40 PM||url' })
+        () => ({ type: MessageType.PHOTO, maxFingerprint: 'media-token:TOKEN9' })
       );
-      expect(bridge.resolveMaxReplyTarget({ metadata: { replyToTelegramMessageId: 42 } })).toBeNull();
+      expect(bridge.resolveMaxReplyTarget({ metadata: { replyToTelegramMessageId: 42 } })).toBe('media-token:TOKEN9');
+    });
+
+    it('does not quote an own message from another MAX chat', () => {
+      const bridge = makeBridge(
+        () => null,
+        () => ({ chatId: 'other-chat', type: MessageType.TEXT, maxFingerprint: 'Me|02:40 PM|hi' })
+      );
+      expect(bridge.resolveMaxReplyTarget({ chatId: 'this-chat', metadata: { replyToTelegramMessageId: 42 } })).toBeNull();
     });
 
     it('returns null when neither lookup finds anything', () => {

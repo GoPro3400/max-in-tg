@@ -57,6 +57,24 @@ describe('sanitizeDiagnosticHtml', () => {
     expect(out).not.toContain('Подпись');
   });
 
+  it('drops the signed query of media URLs, which would let anyone fetch the private file', () => {
+    const out = sanitizeDiagnosticHtml(
+      '<img src="https://i.oneme.ru/i?r=SIGNED_TOKEN&fn=w_1280">'
+      + '<a href="https://fs.oneme.ru/getfile?sig=SECRET&expires=99" download>x</a>'
+      + '<div style="background-image: url(https://i.oneme.ru/i?r=BG_TOKEN)"></div>'
+      + '<input value="черновик сообщения">'
+    );
+    expect(out).not.toContain('SIGNED_TOKEN');
+    expect(out).not.toContain('SECRET');
+    expect(out).not.toContain('BG_TOKEN');
+    expect(out).not.toContain('черновик');
+    // Where each element points still shows.
+    expect(out).toContain('src="https://i.oneme.ru/i?[redacted]"');
+    expect(out).toContain('href="https://fs.oneme.ru/getfile?[redacted]"');
+    // Fragment-only references are structure, not secrets.
+    expect(sanitizeDiagnosticHtml('<use href="#icon_send"></use>')).toContain('href="#icon_send"');
+  });
+
   it('still strips scripts and inline handlers', () => {
     const out = sanitizeDiagnosticHtml('<div onclick="steal()"><script>evil()</script>hi</div>');
     expect(out).not.toContain('evil()');

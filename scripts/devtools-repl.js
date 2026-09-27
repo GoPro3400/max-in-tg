@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Attaches to the ALREADY-RUNNING production Puppeteer browser via CDP
-// (see the --remote-debugging-port=9222 flag in maxWebClient.js) and
+// (see the --remote-debugging-port flag in maxWebClient.js — 9222 unless
+// MAX_REMOTE_DEBUGGING_PORT says otherwise) and
 // evaluates a JS expression in the live MAX Web page. This exists so DOM
 // exploration (finding selectors, testing interactions) doesn't require
 // deploying probe code into the app and rebuilding/restarting the container
@@ -32,8 +33,9 @@ if (!expression) {
   process.exit(1);
 }
 
+const port = Number(process.env.MAX_REMOTE_DEBUGGING_PORT) || 9222;
 const browser = await puppeteer.connect({
-  browserURL: 'http://127.0.0.1:9222',
+  browserURL: `http://127.0.0.1:${port}`,
   // Never impose a viewport on the running app — see the DANGER note above.
   defaultViewport: null,
 });

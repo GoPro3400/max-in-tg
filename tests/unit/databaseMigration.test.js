@@ -151,6 +151,22 @@ describe('AppDatabase.migrate — message_deliveries legacy-FK rebuild', () => {
     expect(getTableSql(app.db, 'message_deliveries_legacy')).toBeUndefined();
   });
 
+  it('gives the rebuilt table its indexes back (the renamed legacy table kept their names)', () => {
+    buildLegacyDbFile(dbPath);
+    const raw = new Database(dbPath);
+    raw.exec(`
+      CREATE INDEX idx_deliveries_status ON message_deliveries(status);
+      CREATE INDEX idx_deliveries_message ON message_deliveries(message_id);
+    `);
+    raw.close();
+
+    const app = open(AppDatabase, dbPath);
+
+    const indexes = app.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='message_deliveries'").all().map((row) => row.name);
+    expect(indexes).toEqual(expect.arrayContaining(['idx_deliveries_status', 'idx_deliveries_message']));
+    expect(dumpDeliveries(app.db)).toEqual(LEGACY_ROWS);
+  });
+
   it('continues AUTOINCREMENT strictly above the max preserved id after the rebuild', () => {
     buildLegacyDbFile(dbPath);
 

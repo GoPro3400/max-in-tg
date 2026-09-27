@@ -22,7 +22,7 @@
     "db:reset": "node src/scripts/resetDatabase.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

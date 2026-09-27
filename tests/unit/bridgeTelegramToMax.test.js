@@ -3,6 +3,8 @@ import {
   makeBridge,
   makeFakeMaxClient,
   makeFakeMediaService,
+  makeFakeTelegramBot,
+  makeTestConfig,
   linkChat,
   telegramMessage
 } from '../helpers/bridgeHarness.js';
@@ -99,8 +101,12 @@ describe('handleTelegramMessage', () => {
 
     expect(mediaService.ensureMaxCompatible).toHaveBeenCalledWith('/tmp/original.jpg', 'photo');
     expect(maxClient.sendFile).toHaveBeenCalledTimes(1);
-    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/converted.jpg', 'caption');
-    expect(maxClient.sendText).not.toHaveBeenCalled();
+    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/converted.jpg');
+    // The caption used to be passed to sendFile, which ignored it: the text
+    // never reached MAX. It now follows the file as its own message.
+    expect(maxClient.sendText).toHaveBeenCalledWith('max-1', 'caption');
+    expect(maxClient.sendFile.mock.invocationCallOrder[0])
+      .toBeLessThan(maxClient.sendText.mock.invocationCallOrder[0]);
     // Photo hash is computed over the file actually sent into MAX.
     expect(mediaService.imageDHash).toHaveBeenCalledWith('/tmp/converted.jpg');
 
@@ -110,10 +116,36 @@ describe('handleTelegramMessage', () => {
     expect(stored.mediaHash).toBe('a1b2c3d4e5f60718');
     expect(db.getDeliveryStats()).toEqual([{ status: 'sent', count: 1 }]);
 
-    // Fingerprint capture is deliberately text-only (a later Telegram reply
-    // to a media send cannot be quoted back inside MAX) — pin that boundary.
-    expect(maxClient.getLastOutgoingFingerprint).not.toHaveBeenCalled();
+    // The media message itself gets no MAX-side fingerprint (a later Telegram
+    // reply to a media send cannot be quoted back inside MAX) — pin that.
     expect(stored.maxFingerprint).toBeNull();
+  });
+
+  it('a media send without a caption sends no text', async () => {
+    const { bridge, db, maxClient } = makeBridge();
+    linkChat(db, 'max-1');
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-401', { type: 'photo', mediaPath: '/tmp/a.jpg', text: '' }));
+
+    expect(maxClient.sendFile).toHaveBeenCalledTimes(1);
+    expect(maxClient.sendText).not.toHaveBeenCalled();
+  });
+
+  it('a caption that fails after the file went through is reported, but the file is not marked failed', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge({
+      maxClient: makeFakeMaxClient({
+        sendText: vi.fn(async () => { throw new Error('composer did not clear'); })
+      })
+    });
+    linkChat(db, 'max-1');
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-402', { type: 'photo', mediaPath: '/tmp/a.jpg', text: 'подпись' }));
+
+    expect(maxClient.sendFile).toHaveBeenCalledTimes(1);
+    expect(db.hasMessage('tg-402')).toBe(true);
+    expect(db.getDeliveryStats()).toEqual([{ status: 'sent', count: 1 }]);
+    expect(telegramBot.sendText).toHaveBeenCalledTimes(1);
+    expect(telegramBot.sendText.mock.calls[0][0]).toContain('подпись к нему — нет');
   });
 
   it('records a failed delivery, keeps the message unstored, and notifies the user when the MAX send fails', async () => {
@@ -140,7 +172,7 @@ describe('handleTelegramMessage', () => {
 
     expect(telegramBot.sendText).toHaveBeenCalledTimes(1);
     const [notice, route] = telegramBot.sendText.mock.calls[0];
-    expect(notice).toContain('Failed to send to MAX');
+    expect(notice).toContain('Не ушло в MAX');
     expect(notice).toContain('MAX exploded');
     expect(route).toEqual({ telegramChatId: -100500, telegramThreadId: 77 });
   });
@@ -212,5 +244,156 @@ describe('handleTelegramMessage', () => {
 
     expect(maxClient.sendText).toHaveBeenCalledTimes(1);
     expect(maxClient.sendText).toHaveBeenCalledWith('max-1', 'reply anyway', null);
+  });
+});
+
+describe('routing without topics (no relay group)', () => {
+  const OWNER = 12345;
+
+  // Without topics every MAX chat is delivered into the owner's private chat,
+  // so every mapping is (owner, no thread): a lookup by thread returned the
+  // first-inserted chat and ignored /select — a reply meant for one contact was
+  // typed into another contact's chat.
+  function fallbackBridge() {
+    const harness = makeBridge({
+      config: makeTestConfig({ telegram: { relayChatId: null } }),
+      telegramBot: makeFakeTelegramBot({ targetChatId: vi.fn(() => OWNER) })
+    });
+    linkChat(harness.db, 'Mom', { telegramChatId: OWNER, telegramThreadId: null });
+    linkChat(harness.db, 'Boss', { telegramChatId: OWNER, telegramThreadId: null });
+    return harness;
+  }
+
+  it('sends to the chat picked with /select, not to whichever mapping came first', async () => {
+    const { bridge, db, maxClient } = fallbackBridge();
+    db.selectChat('Boss');
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-1', {
+      text: 'for the boss', telegramChatId: OWNER, telegramThreadId: null
+    }));
+
+    expect(maxClient.sendText).toHaveBeenCalledWith('Boss', 'for the boss', null);
+  });
+
+  it('a reply goes to the chat of the message it replies to', async () => {
+    const { bridge, db, maxClient } = fallbackBridge();
+    db.selectChat('Boss');
+    db.insertMessage({
+      id: 'max-from-mom',
+      chatId: 'Mom',
+      direction: 'max_to_tg',
+      type: 'text',
+      text: 'are you coming?',
+      sourceMessageId: 'fp-mom|18:00|are you coming?',
+      createdAt: Date.now(),
+      metadata: {},
+      telegramMessageId: 901
+    });
+
+    await bridge.handleTelegramMessage(telegramMessage('tg-2', {
+      text: 'yes', telegramChatId: OWNER, telegramThreadId: null,
+      metadata: { replyToTelegramMessageId: 901 }
+    }));
+
+    expect(maxClient.sendText).toHaveBeenCalledWith('Mom', 'yes', 'fp-mom|18:00|are you coming?');
+  });
+
+  it('/history shows the selected chat', async () => {
+    const { bridge, db } = fallbackBridge();
+    db.selectChat('Boss');
+    db.insertMessage({
+      id: 'boss-1', chatId: 'Boss', direction: 'max_to_tg', type: 'text', text: 'report due',
+      sourceMessageId: 'b1', createdAt: Date.now(), metadata: {}
+    });
+    db.insertMessage({
+      id: 'mom-1', chatId: 'Mom', direction: 'max_to_tg', type: 'text', text: 'dinner at 7',
+      sourceMessageId: 'm1', createdAt: Date.now(), metadata: {}
+    });
+
+    const history = await bridge.formatHistory(OWNER, null);
+
+    expect(history).toContain('report due');
+    expect(history).not.toContain('dinner at 7');
+  });
+});
+
+describe('Telegram stickers into MAX', () => {
+  function stickerBridge(overrides = {}) {
+    const mediaService = makeFakeMediaService({
+      ensureMaxCompatible: vi.fn(async (file) => file.replace(/\.webp$/, '.png')),
+      videoStickerToGif: vi.fn(async (file) => file.replace(/\.webm$/, '.gif')),
+      framesDirToGif: vi.fn(async (dir) => `${dir}.gif`),
+      ...overrides.mediaService
+    });
+    const maxClient = makeFakeMaxClient({
+      renderLottieToFrames: vi.fn(async () => ({ frames: [Buffer.from('a'), Buffer.from('b'), Buffer.from('c')], fps: 20 })),
+      saveFrameBuffers: vi.fn((id) => `/tmp/media/sticker-frames-${id}`),
+      ...overrides.maxClient
+    });
+    const harness = makeBridge({ mediaService, maxClient });
+    linkChat(harness.db, 'max-1');
+    return harness;
+  }
+  const sticker = (id, file) => telegramMessage(id, { type: 'sticker', mediaPath: file, text: '', metadata: { stickerEmoji: '😂' } });
+
+  it('a static sticker goes as a PNG (transparent), not a black-backed JPEG', async () => {
+    const { bridge, maxClient, mediaService } = stickerBridge();
+
+    await bridge.handleTelegramMessage(sticker('tg-s1', '/tmp/tg-1/sticker.webp'));
+
+    expect(mediaService.ensureMaxCompatible).toHaveBeenCalledWith('/tmp/tg-1/sticker.webp', 'sticker');
+    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/tg-1/sticker.png');
+  });
+
+  it('a video sticker becomes an animated GIF', async () => {
+    const { bridge, maxClient, mediaService } = stickerBridge();
+
+    await bridge.handleTelegramMessage(sticker('tg-s2', '/tmp/tg-2/sticker.webm'));
+
+    expect(mediaService.videoStickerToGif).toHaveBeenCalledWith('/tmp/tg-2/sticker.webm');
+    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/tg-2/sticker.gif');
+  });
+
+  it('an animated .tgs sticker is rendered frame by frame and sent as a GIF', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tgs-'));
+    const tgs = path.join(dir, 'sticker.tgs');
+    fs.writeFileSync(tgs, 'gzipped lottie');
+    const { bridge, maxClient, mediaService } = stickerBridge();
+
+    await bridge.handleTelegramMessage(sticker('tg-s3', tgs));
+
+    expect(maxClient.renderLottieToFrames).toHaveBeenCalledWith(Buffer.from('gzipped lottie'));
+    expect(mediaService.framesDirToGif).toHaveBeenCalledWith('/tmp/media/sticker-frames-tg-tg-s3', 20);
+    expect(maxClient.sendFile).toHaveBeenCalledWith('max-1', '/tmp/media/sticker-frames-tg-tg-s3.gif');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('when nothing MAX can show can be made, the emoji is sent instead', async () => {
+    const { bridge, maxClient } = stickerBridge({
+      mediaService: { videoStickerToGif: vi.fn(async () => { throw new Error('ffmpeg failed'); }) }
+    });
+
+    await bridge.handleTelegramMessage(sticker('tg-s4', '/tmp/tg-4/sticker.webm'));
+
+    expect(maxClient.sendFile).not.toHaveBeenCalled();
+    expect(maxClient.sendText).toHaveBeenCalledWith('max-1', '😂');
+  });
+});
+
+describe('handleTelegramMessage: files remember their MAX bubble', () => {
+  it('stores the media token of the file just sent, for later replies and reactions', async () => {
+    const { bridge, db, maxClient } = makeBridge({
+      maxClient: makeFakeMaxClient({ getLastOutgoingMediaFingerprint: vi.fn(async () => 'media-token:NEW1') })
+    });
+    linkChat(db, 'chat-a', { telegramThreadId: 77 });
+    const message = telegramMessage('tg-501', { type: 'photo', text: '', mediaPath: '/tmp/p.jpg', telegramThreadId: 77 });
+
+    await bridge.handleTelegramMessage(message);
+
+    expect(maxClient.getLastOutgoingMediaFingerprint).toHaveBeenCalledWith('chat-a');
+    expect(db.getTgToMaxMessageBySourceId(501).maxFingerprint).toBe('media-token:NEW1');
   });
 });

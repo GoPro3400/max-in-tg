@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import net from 'node:net';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { Readable } from 'node:stream';
@@ -10,7 +12,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import mime from 'mime-types';
 import sharp from 'sharp';
 import { logger } from '../logger.js';
-import { replaceExtension, safeName } from '../utils/fileHelpers.js';
+import { replaceExtension, safeDisplayName, safeName } from '../utils/fileHelpers.js';
 
 // FFMPEG_PATH wins over the bundled binary. Two reasons to use it: a distro
 // ffmpeg is often better optimised for the host, and — the licensing one —
@@ -52,30 +54,54 @@ const runFfmpeg = (command, label) => new Promise((resolve, reject) => {
 });
 
 export class MediaService {
-  constructor(mediaDir) {
+  constructor(mediaDir, { lookup = dns.lookup } = {}) {
     this.mediaDir = mediaDir;
+    this.lookup = lookup;
     fs.mkdirSync(mediaDir, { recursive: true });
   }
 
+  // The file lands under its own name in a directory of its own: sendFile
+  // uploads the basename, so the basename is exactly what the MAX contact
+  // sees. It used to be "<timestamp>-<name><ext>" run through the ASCII-only
+  // safeName — "Договор.pdf" arrived as "1790429360882-_.pdf.pdf".
   async telegramFileToLocal(bot, fileId, preferredName = 'telegram-file') {
     const link = await bot.telegram.getFileLink(fileId);
-    const extension = path.extname(link.pathname) || path.extname(preferredName) || '';
-    const filename = this.safeFilename(`${Date.now()}-${preferredName}${extension}`);
-    const target = path.join(this.mediaDir, filename);
+    const extension = path.extname(preferredName) ? '' : path.extname(link.pathname);
+    const dir = await fsp.mkdtemp(path.join(this.mediaDir, TELEGRAM_UPLOAD_DIR_PREFIX));
+    const target = path.join(dir, safeDisplayName(`${preferredName}${extension}`));
+    // The file link carries the bot token in its path: downloadToFile quotes
+    // URLs only through redactUrl, so a failure cannot leak it.
     await downloadToFile(link.href, target);
     return target;
   }
 
+  // URLs taken from the MAX page (media bubbles, reply thumbnails). Whoever
+  // writes into a MAX chat has some say over those, so only public https hosts
+  // are fetched — no http, no loopback/private/link-local addresses (cloud
+  // metadata, the container's own CDP port) — and every redirect hop is
+  // checked the same way.
   async downloadUrl(url, preferredName = 'max-file') {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-      throw new Error(`Refused to download URL with disallowed scheme: ${parsed.protocol}`);
-    }
+    const parsed = await this.assertPublicHttpsUrl(url);
     const extension = path.extname(parsed.pathname) || '';
     const filename = this.safeFilename(`${Date.now()}-${preferredName}${extension}`);
     const target = path.join(this.mediaDir, filename);
-    await downloadToFile(url, target);
+    await downloadToFile(url, target, { validateUrl: (next) => this.assertPublicHttpsUrl(next) });
     return target;
+  }
+
+  async assertPublicHttpsUrl(url) {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') {
+      throw new Error(`Refused to download URL with disallowed scheme: ${parsed.protocol}`);
+    }
+    const host = parsed.hostname.replace(/^\[|\]$/g, '');
+    const addresses = net.isIP(host)
+      ? [{ address: host }]
+      : await this.lookup(host, { all: true, verbatim: true });
+    if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
+      throw new Error(`Refused to download from a non-public address: ${redactUrl(url)}`);
+    }
+    return parsed;
   }
 
   // Computes a 64-bit difference hash (dHash) of an image, returned as 16 hex
@@ -124,10 +150,12 @@ export class MediaService {
     if (type === 'video_note') return this.convertVideo(inputPath, 'mp4');
     if (type === 'photo') return this.convertImage(inputPath, 'jpg');
     if (type === 'sticker') {
+      // PNG, not JPEG: a sticker is mostly transparency, which JPEG turned
+      // into a black square.
       try {
-        return await this.convertImage(inputPath, 'jpg');
+        return await this.convertImage(inputPath, 'png');
       } catch (error) {
-        logger.warn({ inputPath, error }, 'Sticker image conversion failed; sending original file');
+        logger.warn({ inputPath, err: error?.message || String(error) }, 'Sticker image conversion failed; sending original file');
         return inputPath;
       }
     }
@@ -144,7 +172,8 @@ export class MediaService {
     const outputPath = replaceExtension(inputPath, targetExtension);
     if (inputPath === outputPath && fs.existsSync(outputPath)) return outputPath;
 
-    let audioCommand = ffmpeg(inputPath).output(outputPath);
+    await assertPlainMedia(inputPath);
+    let audioCommand = ffmpeg(inputPath).inputOptions(LOCAL_FILES_ONLY).output(outputPath);
     if (targetExtension === 'ogg') {
       audioCommand = audioCommand.audioCodec('libopus').format('ogg');
     }
@@ -165,7 +194,8 @@ export class MediaService {
 
     const image = sharp(inputPath, { animated: false }).rotate();
     if (targetExtension === 'jpg' || targetExtension === 'jpeg') {
-      await image.jpeg({ quality: 90 }).toFile(outputPath);
+      // JPEG has no alpha: without flattening, transparent pixels come out black.
+      await image.flatten({ background: '#ffffff' }).jpeg({ quality: 90 }).toFile(outputPath);
     } else if (targetExtension === 'png') {
       await image.png().toFile(outputPath);
     } else {
@@ -180,7 +210,8 @@ export class MediaService {
     const outputPath = replaceExtension(inputPath, targetExtension);
     if (inputPath === outputPath && fs.existsSync(outputPath)) return outputPath;
 
-    let videoCommand = ffmpeg(inputPath).output(outputPath);
+    await assertPlainMedia(inputPath);
+    let videoCommand = ffmpeg(inputPath).inputOptions(LOCAL_FILES_ONLY).output(outputPath);
     if (targetExtension === 'mp4') {
       videoCommand = videoCommand.videoCodec('libx264').audioCodec('aac').format('mp4');
     }
@@ -192,36 +223,89 @@ export class MediaService {
     return outputPath;
   }
 
+  // A static sticker the way Telegram's sendSticker wants it: WEBP, 512 px on
+  // the longer side, transparency kept — shown as a real sticker instead of a
+  // photo on a white (or black) background.
+  async toWebpSticker(inputPath) {
+    const outputPath = path.join(path.dirname(inputPath), `${path.basename(inputPath, path.extname(inputPath))}-tg-sticker.webp`);
+    await sharp(inputPath, { animated: false })
+      .resize(STICKER_SIDE, STICKER_SIDE, { fit: 'inside' })
+      .webp({ quality: 90, alphaQuality: 100 })
+      .toFile(outputPath);
+    return outputPath;
+  }
+
   // Encode a directory of PNG frames (frame-000.png …) into a Telegram video
-  // sticker: VP9 .webm, 512x512, <3s, no audio, transparent. Telegram requires
-  // VP9 alpha, which libvpx-vp9 only produces correctly with `-auto-alt-ref 0`
-  // — without it Telegram silently treats the upload as a plain document.
+  // sticker, within Telegram's limits for them: VP9 WEBM with alpha, 512 px
+  // on the longer side, at most 3 s, at most 30 fps, no audio, at most 256 KB.
+  // A longer animation is played faster rather than cut short. Telegram
+  // requires VP9 alpha, which libvpx-vp9 only produces correctly with
+  // `-auto-alt-ref 0` — without it the upload silently becomes a document.
+  // The frames are left in place: if Telegram refuses the sticker, the caller
+  // falls back to a GIF made from the same frames.
   async framesDirToWebmSticker(framesDir, fps = 20) {
+    const frameCount = (await fsp.readdir(framesDir)).filter((name) => /^frame-\d+\.png$/.test(name)).length;
+    if (frameCount < 2) throw new Error(`Not enough frames for a video sticker: ${frameCount}`);
+    let inputFps = Math.min(STICKER_MAX_FPS, Math.max(1, Number(fps) || 20));
+    if (frameCount / inputFps > STICKER_MAX_SECONDS) inputFps = frameCount / STICKER_MAX_SECONDS;
+    const durationSec = frameCount / inputFps;
     const outputPath = path.join(this.mediaDir, `sticker-${path.basename(framesDir)}.webm`);
-    const webmCommand = ffmpeg()
-      .input(path.join(framesDir, 'frame-%03d.png'))
-      .inputFPS(fps)
-      .videoCodec('libvpx-vp9')
-      .videoFilters('scale=512:512:flags=lanczos')
-      .outputOptions([
-        '-pix_fmt', 'yuva420p',
-        '-an',
-        '-auto-alt-ref', '0',
-        '-cpu-used', '5',
-        '-deadline', 'realtime'
-      ])
-      .videoBitrate('400k')
-      .format('webm');
-    const webmDone = runFfmpeg(webmCommand, 'framesDirToWebmSticker');
-    webmCommand.save(outputPath);
-    try {
+
+    // Quality first, then a bitrate that fits 256 KB if the first pass is too big.
+    const attempts = [
+      ['-crf', '32', '-b:v', '0'],
+      ['-b:v', `${Math.floor((STICKER_MAX_BYTES * 8 * 0.9) / durationSec / 1000)}k`]
+    ];
+    for (const [index, rateOptions] of attempts.entries()) {
+      const webmCommand = ffmpeg()
+        .input(path.join(framesDir, 'frame-%03d.png'))
+        .inputFPS(inputFps)
+        .videoCodec('libvpx-vp9')
+        .videoFilters([
+          `scale=${STICKER_SIDE}:${STICKER_SIDE}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos`,
+          `fps=${Math.min(STICKER_MAX_FPS, Math.ceil(inputFps))}`
+        ])
+        .outputOptions([
+          '-pix_fmt', 'yuva420p',
+          '-an',
+          '-auto-alt-ref', '0',
+          '-cpu-used', '5',
+          '-deadline', 'realtime',
+          '-t', String(STICKER_MAX_SECONDS),
+          ...rateOptions
+        ])
+        .format('webm');
+      const webmDone = runFfmpeg(webmCommand, 'framesDirToWebmSticker');
+      webmCommand.save(outputPath);
       await webmDone;
-    } finally {
-      // Also drop the frames on failure/timeout: cleanupOlderThan only unlinks
-      // files, never directories, so a leaked frames dir is never reclaimed.
-      await fsp.rm(framesDir, { recursive: true, force: true }).catch(() => {});
+      const { size } = await fsp.stat(outputPath);
+      logger.debug({ framesDir, outputPath, size, durationSec, pass: index + 1 }, 'Encoded animated sticker webm');
+      if (size <= STICKER_MAX_BYTES) return outputPath;
     }
-    logger.debug({ framesDir, outputPath }, 'Encoded animated sticker webm');
+    throw new Error(`Video sticker is larger than ${STICKER_MAX_BYTES} bytes even at a reduced bitrate`);
+  }
+
+  // Telegram's video sticker (VP9 WEBM with alpha) as an animated GIF with
+  // transparency, for MAX. The alpha channel is only decoded by libvpx, not by
+  // ffmpeg's native VP9 decoder, hence the explicit input codec.
+  async videoStickerToGif(inputPath, fps = 20) {
+    const outputPath = path.join(path.dirname(inputPath), `${path.basename(inputPath, path.extname(inputPath))}.gif`);
+    await assertPlainMedia(inputPath);
+    const gifCommand = ffmpeg()
+      .input(inputPath)
+      .inputOptions([...LOCAL_FILES_ONLY, '-c:v', 'libvpx-vp9'])
+      .complexFilter([
+        { filter: 'fps', options: String(fps), inputs: '0:v', outputs: 'timed' },
+        { filter: 'scale', options: `${STICKER_SIDE}:-2:flags=lanczos`, inputs: 'timed', outputs: 'scaled' },
+        { filter: 'split', inputs: 'scaled', outputs: ['s0', 's1'] },
+        { filter: 'palettegen', options: 'reserve_transparent=1', inputs: 's0', outputs: 'pal' },
+        { filter: 'paletteuse', options: 'alpha_threshold=128', inputs: ['s1', 'pal'], outputs: 'out' }
+      ], 'out')
+      .outputOptions(['-loop', '0'])
+      .format('gif');
+    const gifDone = runFfmpeg(gifCommand, 'videoStickerToGif');
+    gifCommand.save(outputPath);
+    await gifDone;
     return outputPath;
   }
 
@@ -245,13 +329,9 @@ export class MediaService {
       .format('gif');
     const gifDone = runFfmpeg(gifCommand, 'framesDirToGif');
     gifCommand.save(outputPath);
-    try {
-      await gifDone;
-    } finally {
-      // See framesDirToWebmSticker: cleanupOlderThan never removes directories,
-      // so the frames must be dropped here even when encoding fails.
-      await fsp.rm(framesDir, { recursive: true, force: true }).catch(() => {});
-    }
+    await gifDone;
+    // Only on success — see framesDirToWebmSticker.
+    await fsp.rm(framesDir, { recursive: true, force: true }).catch(() => {});
     logger.debug({ framesDir, outputPath }, 'Encoded animated sticker gif');
     return outputPath;
   }
@@ -280,14 +360,19 @@ export class MediaService {
   async cleanupOlderThan(maxAgeMs) {
     const now = Date.now();
     const entries = await fsp.readdir(this.mediaDir, { withFileTypes: true });
+    // Loose files, plus the per-message temporary directories this code
+    // creates (Telegram uploads, MAX documents, sticker frames). Any other
+    // directory — notably downloads/, Chromium's configured download folder —
+    // is left alone.
     await Promise.all(entries
-      .filter((entry) => entry.isFile())
+      .filter((entry) => entry.isFile()
+        || (entry.isDirectory() && TEMP_DIR_PREFIXES.some((prefix) => entry.name.startsWith(prefix))))
       .map(async (entry) => {
         const filePath = path.join(this.mediaDir, entry.name);
         try {
           const stat = await fsp.stat(filePath);
           if (now - stat.mtimeMs > maxAgeMs) {
-            await fsp.unlink(filePath);
+            await fsp.rm(filePath, { recursive: true, force: true });
           }
         } catch (error) {
           if (error.code !== 'ENOENT') {
@@ -295,51 +380,209 @@ export class MediaService {
           }
         }
       }));
+
+    // Chromium's download folder: when a document is captured from the
+    // network, the browser still saves its own copy there, and nothing else
+    // ever removed those (nor interrupted .crdownload files).
+    const downloadsDir = path.join(this.mediaDir, 'downloads');
+    const downloads = await fsp.readdir(downloadsDir, { withFileTypes: true }).catch(() => []);
+    await Promise.all(downloads.filter((entry) => entry.isFile()).map(async (entry) => {
+      const filePath = path.join(downloadsDir, entry.name);
+      const stat = await fsp.stat(filePath).catch(() => null);
+      if (stat && now - stat.mtimeMs > maxAgeMs) await fsp.rm(filePath, { force: true }).catch(() => {});
+    }));
   }
 }
+
+// Telegram's limits for stickers sent with sendSticker.
+const STICKER_SIDE = 512;
+const STICKER_MAX_SECONDS = 2.9; // "up to 3 seconds", with a margin
+const STICKER_MAX_FPS = 30;
+const STICKER_MAX_BYTES = 256 * 1024;
 
 // Hard cap on any single download. Media comes from remote sources (MAX's CDN
 // and Telegram) and lands on the container's small bind-mounted volume, which
 // also holds the SQLite DB, the Chromium profile and the logs — a single
 // oversized file could fill it and take all of those down together. Telegram
-// itself refuses documents over 50 MB, so nothing legitimate is lost here.
-const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+// takes at most 50 MB from a bot, so a bigger file could not be delivered
+// anyway: it is not downloaded at all (the error says so, see EFILETOOBIG).
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
+const tooBigError = (message, bytes) => Object.assign(new Error(message), { code: 'EFILETOOBIG', bytes });
+// Downloads run inside the bridge's global maxLock (forwardMaxMessage is
+// called from the poll), so a stalled transfer wedges polling AND both send
+// directions. No byte for this long — headers included — aborts it...
+const DOWNLOAD_IDLE_TIMEOUT_MS = 60 * 1000;
+// ...and so does a transfer that trickles along but never finishes. The old
+// single 60 s timer was cleared as soon as the headers arrived, leaving the
+// body with no deadline at all.
+const DOWNLOAD_TOTAL_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_DOWNLOAD_REDIRECTS = 5;
 
-const downloadToFile = async (url, target) => {
+// Per-file directories created by telegramFileToLocal, reclaimed by
+// cleanupOlderThan together with the other known temporary directories.
+const TELEGRAM_UPLOAD_DIR_PREFIX = 'tg-';
+const TEMP_DIR_PREFIXES = [TELEGRAM_UPLOAD_DIR_PREFIX, 'doc-', 'sticker-frames-'];
+
+// URLs end up in logs and in error replies posted to Telegram. A Telegram
+// file link carries the BOT TOKEN in its path (/file/bot<token>/…) and MAX's
+// media URLs carry signed access tokens in the query, so errors quote only
+// origin + path, with any bot token masked.
+export const redactUrl = (url) => {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname.replace(/\/bot\d+:[\w-]+/g, '/bot<redacted>')}`;
+  } catch {
+    return '<invalid url>';
+  }
+};
+
+// ffmpeg picks a demuxer by the file's contents, and a few of them follow
+// references to OTHER files or to the network: an HLS playlist (#EXTM3U), a
+// concat script (ffconcat), a DASH manifest (<MPD>) or an SDP description
+// (v=0, opens RTP sockets). A "voice message" from a MAX contact made like
+// that would have the converter read local files or reach internal hosts.
+// Real media never starts like that; the protocol whitelist is the second
+// line of defence.
+const LOCAL_FILES_ONLY = ['-protocol_whitelist', 'file'];
+
+export const assertPlainMedia = async (filePath) => {
+  const handle = await fsp.open(filePath, 'r');
+  let head;
+  try {
+    const { buffer, bytesRead } = await handle.read(Buffer.alloc(512), 0, 512, 0);
+    head = buffer.subarray(0, bytesRead).toString('latin1');
+  } finally {
+    await handle.close();
+  }
+  const text = head.replace(/^\xEF\xBB\xBF/, '').trimStart().toLowerCase();
+  if (text.startsWith('#extm3u') || text.startsWith('ffconcat') || text.startsWith('<mpd')
+      || (text.startsWith('<?xml') && text.includes('<mpd')) || /^v=0\r?\n/.test(text)) {
+    throw new Error('Refused to convert a playlist/manifest posing as media');
+  }
+};
+
+// The eight 16-bit groups of an IPv6 address (a trailing dotted IPv4 part
+// included), or null.
+const ipv6Groups = (ip) => {
+  let text = ip;
+  const dotted = /(\d+\.\d+\.\d+\.\d+)$/.exec(text);
+  if (dotted) {
+    if (!net.isIPv4(dotted[1])) return null;
+    const [a, b, c, d] = dotted[1].split('.').map(Number);
+    text = text.slice(0, -dotted[1].length) + `${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const groups = [...head, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...tail].map((group) => Number.parseInt(group, 16));
+  return groups.length === 8 && groups.every((group) => Number.isInteger(group) && group >= 0 && group <= 0xffff) ? groups : null;
+};
+
+const ipv4From = (high, low) => `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
+
+// Loopback, private, link-local, CGNAT, multicast and reserved ranges, IPv4
+// and IPv6 — including IPv6 forms that carry an IPv4 address (mapped
+// ::ffff:7f00:1, which is how a URL spells [::ffff:127.0.0.1]; NAT64
+// 64:ff9b::/96; 6to4 2002::/16; the old IPv4-compatible ::a.b.c.d).
+export const isPrivateAddress = (address) => {
+  const ip = String(address || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, '');
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 198 && (b === 18 || b === 19));
+  }
+  if (net.isIPv6(ip)) {
+    const g = ipv6Groups(ip);
+    if (!g) return true;
+    const zeros = (from, to) => g.slice(from, to).every((group) => group === 0);
+    if (zeros(0, 8) || (zeros(0, 7) && g[7] === 1)) return true; // :: and ::1
+    if (zeros(0, 5) && g[5] === 0xffff) return isPrivateAddress(ipv4From(g[6], g[7])); // IPv4-mapped
+    if (zeros(0, 6)) return isPrivateAddress(ipv4From(g[6], g[7])); // IPv4-compatible
+    if (g[0] === 0x64 && g[1] === 0xff9b && zeros(2, 6)) return isPrivateAddress(ipv4From(g[6], g[7])); // NAT64
+    if (g[0] === 0x2002) return isPrivateAddress(ipv4From(g[1], g[2])); // 6to4
+    return (g[0] & 0xfe00) === 0xfc00 // fc00::/7 unique local
+      || (g[0] & 0xffc0) === 0xfe80 // fe80::/10 link-local
+      || (g[0] & 0xff00) === 0xff00 // multicast
+      || (g[0] === 0x2001 && g[1] === 0x0db8); // documentation
+  }
+  return true; // not an IP at all: refuse rather than guess
+};
+
+const downloadToFile = async (url, target, { validateUrl = null } = {}) => {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
-  let response;
-  try { response = await fetch(url, { signal: controller.signal }); } finally { clearTimeout(timeout); }
-  if (!response.ok || !response.body) {
-    throw new Error(`Failed to download ${url}: ${response.status} ${response.statusText}`);
-  }
-
-  const declared = Number(response.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES) {
-    throw new Error(`Refusing to download ${url}: ${declared} bytes exceeds the ${MAX_DOWNLOAD_BYTES} byte limit`);
-  }
-
-  const body = typeof response.body.getReader === 'function'
-    ? Readable.fromWeb(response.body)
-    : response.body;
-
-  // Content-Length can be absent or lie, so enforce the cap on the actual
-  // stream too and abort mid-flight rather than after the disk is already full.
-  let received = 0;
-  body.on('data', (chunk) => {
-    received += chunk.length;
-    if (received > MAX_DOWNLOAD_BYTES) {
-      body.destroy(new Error(`Download of ${url} exceeded the ${MAX_DOWNLOAD_BYTES} byte limit`));
-    }
-  });
+  let failure = null;
+  const abort = (message) => {
+    if (controller.signal.aborted) return;
+    failure = new Error(message);
+    controller.abort(failure);
+  };
+  const totalTimer = setTimeout(() => abort(`Download of ${redactUrl(url)} did not finish within ${DOWNLOAD_TOTAL_TIMEOUT_MS / 1000}s`), DOWNLOAD_TOTAL_TIMEOUT_MS);
+  let idleTimer = null;
+  const armIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => abort(`Download of ${redactUrl(url)} stalled for ${DOWNLOAD_IDLE_TIMEOUT_MS / 1000}s`), DOWNLOAD_IDLE_TIMEOUT_MS);
+  };
 
   try {
-    await pipeline(body, fs.createWriteStream(target));
+    armIdle();
+    let current = url;
+    let response;
+    for (let hop = 0; ; hop++) {
+      response = await fetch(current, { signal: controller.signal, redirect: validateUrl ? 'manual' : 'follow' });
+      const location = response.status >= 300 && response.status < 400 ? response.headers.get('location') : null;
+      if (!validateUrl || !location) break;
+      if (hop >= MAX_DOWNLOAD_REDIRECTS) throw new Error(`Too many redirects downloading ${redactUrl(url)}`);
+      current = new URL(location, current).href;
+      await validateUrl(current);
+    }
+    if (!response.ok || !response.body) {
+      throw new Error(`Failed to download ${redactUrl(current)}: ${response.status} ${response.statusText}`);
+    }
+
+    const declared = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES) {
+      throw tooBigError(`Refusing to download ${redactUrl(current)}: ${declared} bytes exceeds the ${MAX_DOWNLOAD_BYTES} byte limit`, declared);
+    }
+
+    const body = typeof response.body.getReader === 'function'
+      ? Readable.fromWeb(response.body)
+      : response.body;
+
+    // Content-Length can be absent or lie, so enforce the cap on the actual
+    // stream too and abort mid-flight rather than after the disk is already full.
+    let received = 0;
+    body.on('data', (chunk) => {
+      armIdle();
+      received += chunk.length;
+      if (received > MAX_DOWNLOAD_BYTES) {
+        body.destroy(tooBigError(`Download of ${redactUrl(current)} exceeded the ${MAX_DOWNLOAD_BYTES} byte limit`, received));
+      }
+    });
+    if (controller.signal.aborted) throw failure || new Error('Download aborted');
+    controller.signal.addEventListener('abort', () => body.destroy(failure || new Error('Download aborted')), { once: true });
+
+    try {
+      await pipeline(body, fs.createWriteStream(target));
+    } catch (error) {
+      // Never leave a partial file behind: it would be forwarded as a corrupt
+      // attachment, and cleanupOlderThan would not remove it for an hour.
+      await fsp.rm(target, { force: true }).catch(() => {});
+      throw failure || error;
+    }
   } catch (error) {
-    // Never leave a partial file behind: it would be forwarded as a corrupt
-    // attachment, and cleanupOlderThan would not remove it for an hour.
-    await fsp.rm(target, { force: true }).catch(() => {});
-    throw error;
+    // fetch's own errors (DNS, reset, abort) never embed the URL, but an abort
+    // must surface as the timeout that caused it, not as "This operation was aborted".
+    throw failure || error;
+  } finally {
+    clearTimeout(totalTimer);
+    clearTimeout(idleTimer);
   }
 };
 

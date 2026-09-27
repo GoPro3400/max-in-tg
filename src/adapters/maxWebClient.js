@@ -8,10 +8,37 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import sharp from 'sharp';
 import { Direction, MessageType, normalizeText, stableId } from '../domain/messages.js';
 import { logger } from '../logger.js';
-import { listFilesByMtime, safeName, saveBuffer } from '../utils/fileHelpers.js';
+import { listFilesByMtime, safeDisplayName, safeName, saveBuffer } from '../utils/fileHelpers.js';
 import { findNewestCapture, consumeNewestCapture } from '../utils/networkCapture.js';
+import { measureProcessTreeMemory } from '../utils/processMemory.js';
 
 puppeteer.use(StealthPlugin());
+
+// How long browser.close() may take before the Chromium process is killed.
+// close() waits for a clean CDP shutdown, which a wedged or crashed browser
+// never answers; without a bound, a planned recycle or a failure restart would
+// sit inside the bridge's global lock for the whole protocol timeout (minutes).
+const BROWSER_CLOSE_TIMEOUT_MS = 15000;
+
+// Every ElementHandle pins its node — and through it the DOM that node belongs
+// to — in the renderer until it is disposed, and the MAX page is never
+// navigated. The handles this client used to drop on every chat switch (the
+// chat-row list, the first bubble it waited for) kept one entire old chat view
+// alive per switch: on a MAX-like test page, 146k DOM nodes after 400 switches
+// against ~400 with them disposed. That — not MAX itself — was the bulk of the
+// renderer growth behind the old 2-hourly restart.
+const disposeHandles = async (...handles) => {
+  await Promise.all(handles.flat().filter(Boolean).map((handle) => handle.dispose().catch(() => {})));
+};
+
+// Puppeteer enables the Network domain with no size limits, so Chromium keeps
+// up to 200 MB of response bodies for the page — copying an image's body into
+// that buffer when the image itself is garbage-collected — and only a
+// navigation empties it. With the HTTP cache off (see start()) every chat
+// switch re-downloads every picture, so the buffer filled to its cap and
+// stayed there (+250 MB measured). Capped, response.buffer() still works for
+// anything up to the per-resource limit.
+const NETWORK_BUFFER_LIMITS = { maxTotalBufferSize: 64 * 1024 * 1024, maxResourceBufferSize: 20 * 1024 * 1024 };
 
 const MAX_CAPTURE_MAP_SIZE = 100;
 const capMap = (map, maxSize = MAX_CAPTURE_MAP_SIZE) => {
@@ -29,12 +56,124 @@ const capMap = (map, maxSize = MAX_CAPTURE_MAP_SIZE) => {
 // evaluate blocks had drifted out of sync).
 const DOCUMENT_LINK_FALLBACK_SELECTOR = 'a[href][download], a[href*="/file"], a[href*="/download"], a[href*="blob:"], [class*="document"] a[href], [class*="attach"] a[href], [class*="file"] a[href]';
 
+// What MAX draws in a bubble as pictures that are never the message's own
+// media: an emoji in text is <span class="emoji"><img alt="😀">, an animoji a
+// <span class="animoji" data-lexical-animoji-emoji="😀">, and an emoji-only
+// message shows its emoji big in .emojis (reaction chips come from the
+// messageReactions selector). Shared by scrapeMessageRows and
+// findAndHoverMessage.
+const BUBBLE_DECOR = {
+  graphics: '.emoji, .animoji, [data-lexical-emoji], [data-lexical-animoji]',
+  bigEmoji: '.emojis',
+  // Kinds of message the bridge cannot carry over (MAX Web's bubble
+  // templates): Telegram gets a note saying what it was.
+  kinds: [
+    ['.bubbleContent > .location', '📍 Геопозиция'],
+    ['.bubbleContent > .attaches-fullWidth, .bubbleContent [class*="pollOption"]', '📊 Опрос'],
+    ['.bubbleContent > .unknownAttachWarning', '⚠️ Сообщение нового вида (MAX Web его не показывает)']
+  ]
+};
+
+// Runs in the MAX page before MAX's own scripts. MAX animates emoji
+// ("animoji") by fetching a Lottie JSON with fetch(url, { mode: 'cors' }) and
+// drawing it on a canvas — and a canvas does not say which emoji it shows,
+// so reactions could not be read or picked. Handing the page an empty body for
+// those files makes MAX keep the stand-in it shows while loading: a plain
+// <img alt="👍">. Only what MAX uses the result for changes: the request
+// itself still goes out (the network capture sees it), and sticker animations
+// ("lottie=true" URLs, see findNetworkLottie) are left alone.
+const STATIC_ANIMOJI_SCRIPT = `(() => {
+  try {
+    const nativeFetch = window.fetch;
+    if (typeof nativeFetch !== 'function' || nativeFetch.__maxInTgStaticAnimoji) return;
+    const isLottieJson = (text) => text.length > 1 && text.length < 5000000 && text.charCodeAt(0) === 123
+      && text.includes('"layers"') && text.includes('"fr"');
+    const staticFetch = function (input, init) {
+      const result = nativeFetch.apply(window, arguments);
+      try {
+        const url = typeof input === 'string' ? input : String((input && input.url) || input || '');
+        if (!init || init.mode !== 'cors' || /lottie=true|sticker/i.test(url)) return result;
+        return result.then((response) => {
+          if (!response || !response.ok) return response;
+          return response.clone().text().then(
+            (text) => (isLottieJson(text) ? new Response('', { status: 200, headers: { 'content-type': 'application/json' } }) : response),
+            () => response
+          );
+        });
+      } catch (error) {
+        return result;
+      }
+    };
+    staticFetch.__maxInTgStaticAnimoji = true;
+    window.fetch = staticFetch;
+  } catch (error) {
+    // Never break the page over this.
+  }
+})();`;
+
+// How long the reactions scraped by readMessages are reused by readReactions.
+const REACTION_SCAN_MAX_AGE_MS = 5000;
+
+// What MAX says someone is doing ("записывает аудио", "sending a file"…), as
+// the Telegram chat action showing the same.
+// The label ends with what they do, after the names ("Фотограф Анна
+// печатает" is typing).
+const TYPING_ACTIONS = [
+  [/(записыва\S*|recording)\s+(аудио|голосовое\S*|a voice message|audio)$/i, 'record_voice'],
+  [/(записыва\S*|recording)\s+(видеосообщение|a video message)$/i, 'record_video_note'],
+  [/(отправля\S*|sending)\s+(видео|a video)$/i, 'upload_video'],
+  [/(отправля\S*|sending)\s+(фото|a photo)$/i, 'upload_photo'],
+  [/(отправля\S*|sending)\s+(файл|a file)$/i, 'upload_document'],
+  [/(выбира\S*|choosing|selecting)\s+(стикер|a sticker)$/i, 'choose_sticker']
+];
+export const typingAction = (label) => {
+  const text = String(label || '').replace(/\s+/g, ' ').trim();
+  return TYPING_ACTIONS.find(([pattern]) => pattern.test(text))?.[1] || 'typing';
+};
+
+// Files bigger than this are not downloaded from MAX: a bot may upload at most
+// 50 MB to Telegram, so the bridge could only say it is too big — after the
+// browser had written it all to disk and the bridge read it into memory.
+const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
+// How long a download clicked in MAX may take: a few seconds to start, then
+// as long as it keeps growing, up to this.
+const DOCUMENT_DOWNLOAD_START_MS = 5000;
+const DOCUMENT_DOWNLOAD_MAX_MS = 120000;
+// Sent in place of a voice message or video note that could not be fetched.
+const VOICE_MISSING = '🎤 Голосовое сообщение — не удалось забрать из MAX, послушай его там.';
+const VIDEO_NOTE_MISSING = '📹 Видеосообщение — не удалось забрать из MAX, посмотри его там.';
+
+const reactionRowOf = (row) => ({
+  rawId: row.rawId,
+  legacyRawId: row.legacyRawId && row.legacyRawId !== row.rawId ? row.legacyRawId : null,
+  time: row.time || '',
+  outgoing: Boolean(row.outgoing),
+  mediaToken: (/[?&]r=([^&]+)/.exec(row.mediaUrl || '') || [])[1] || null,
+  reactions: (row.reactions || []).map(({ emoji, count, active }) => ({ emoji, count, active: Boolean(active) })),
+  reactionsUnknown: Boolean(row.reactionsUnknown)
+});
+
 export class MaxWebClient {
   constructor(maxConfig, options = {}) {
     this.config = maxConfig;
     this.browser = null;
     this.page = null;
     this.activeChatId = null;
+    this.activeChatTitle = null;
+    // The open chat's own id in MAX (see currentMaxChatId), when known.
+    this.activeMaxChatId = null;
+    // Ids in MAX of chats known by title (see rememberChatId): a chat not in
+    // MAX's list — a new one without messages yet — is opened by its id.
+    this.knownChatIds = new Map();
+    // Of those, the ones MAX did not list last time: opened by their id
+    // straight away, without scrolling the whole list first.
+    this.unlistedChatIds = new Set();
+    // Chats MAX has taken a message into from here (see
+    // checkFirstMessageAccepted).
+    this.chatsTakingMessages = new Set();
+    // The chat whose network traffic media captures are attributed to (set
+    // when a chat is being opened, before it is verified — see selectChat).
+    this.captureChatId = null;
     this.selectors = maxConfig.selectors;
     this.diagnosticDir = options.diagnosticDir;
     this.diagnosticRetentionFiles = options.diagnosticRetentionFiles ?? 80;
@@ -58,6 +197,12 @@ export class MaxWebClient {
       userDataDir: this.config.userDataDir,
       protocolTimeout: this.config.protocolTimeoutMs,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      // Puppeteer would kill Chromium itself on SIGTERM/SIGINT, before the
+      // bridge's shutdown lets an in-flight send finish (bridge.stop drains
+      // maxLock first). index.js handles the signals and closes the browser.
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -76,21 +221,52 @@ export class MaxWebClient {
         // debugging to 127.0.0.1 by default and this port is not published
         // in docker-compose, so it is reachable only from inside the
         // container's network namespace (e.g. via `docker exec`) — never
-        // exposed to the host network or the internet.
-        '--remote-debugging-port=9222'
+        // exposed to the host network or the internet. 0 leaves the port to
+        // Puppeteer (any free one), so several browsers can run side by side
+        // (the browser tests do).
+        ...(this.config.remoteDebuggingPort === 0 ? [] : [`--remote-debugging-port=${this.config.remoteDebuggingPort || 9222}`])
       ]
     });
+    // A close requested through stop() also fires 'disconnected'; only a
+    // browser that vanishes on its own is worth an error.
+    const browser = this.browser;
+    browser.on('disconnected', () => {
+      if (this.browser !== browser) {
+        logger.debug('Closed Chrome browser disconnected');
+        return;
+      }
+      logger.error('Chrome browser disconnected unexpectedly');
+      this.onDisconnect?.();
+    });
+
     this.page = await this.browser.newPage();
+    // A crashed renderer ("Page crashed!") leaves a page object on which every
+    // later call fails or hangs; isAlive() reports it so the bridge relaunches
+    // the browser at once instead of after several failed polls.
+    this.pageCrashed = false;
+    const page = this.page;
+    page.on('error', (error) => {
+      if (this.page !== page) return;
+      this.pageCrashed = true;
+      logger.error({ err: error?.message || String(error) }, 'MAX page crashed');
+    });
+    // Before the first navigation, so it is in place for every load (reloads
+    // included) — see STATIC_ANIMOJI_SCRIPT.
+    if (this.config.staticAnimoji !== false) {
+      await this.page.evaluateOnNewDocument(STATIC_ANIMOJI_SCRIPT).catch((error) => {
+        logger.warn({ err: error?.message || String(error) }, 'Could not install the static-animoji script; reactions may be unreadable');
+      });
+    }
     await this.page.setViewport({ width: 1440, height: 980 });
     // MAX serves sticker assets (Lottie JSON) from the HTTP cache, so on repeat
     // displays no `response` fires and we cannot capture the animation. Disable
     // the page cache so every sticker is re-fetched over the network and our
     // interceptor reliably sees the Lottie.
     await this.page.setCacheEnabled(false);
-
-    this.browser.on('disconnected', () => {
-      logger.error('Chrome browser disconnected unexpectedly');
-      this.onDisconnect?.();
+    // Must go through Puppeteer's own session (a second CDP session would get a
+    // second, uncapped buffer); it survives reloads.
+    await this.page._client?.().send('Network.enable', NETWORK_BUFFER_LIMITS).catch((error) => {
+      logger.warn({ err: error?.message || String(error) }, 'Could not cap the DevTools network buffer');
     });
 
     // Set download path for document downloads
@@ -111,7 +287,10 @@ export class MaxWebClient {
         const ct = response.headers()['content-type'] || '';
         // H5: tag every capture with the chat that is active at capture time so
         // that a slow network response from chat A cannot be attributed to chat B.
-        const capturedChatId = this.activeChatId;
+        // captureChatId, not activeChatId: the chat being opened is only
+        // marked active after its header is verified, while its stickers and
+        // media start loading right after the click.
+        const capturedChatId = this.captureChatId ?? this.activeChatId;
 
         const isStickerUrl = url.includes('/sticker') || url.includes('/emoji') ||
           url.includes('sticker') || url.includes('emoji') ||
@@ -185,16 +364,6 @@ export class MaxWebClient {
           }
         }
 
-        if (url.includes('max.ru') && !url.includes('.js') && !url.includes('.css') && !url.includes('.woff') && !url.includes('.svg') && !url.includes('favicon') && !url.includes('/_app/immutable/')) {
-          try {
-            const buffer = await response.buffer();
-            if (buffer.length > 5000 && buffer.length < 500000 && ct.includes('audio')) {
-              logger.debug({ url, size: buffer.length, contentType: ct }, 'Potential voice: audio response from max.ru');
-            }
-          } catch (error) {
-            logger.debug({ url, err: error.message }, 'Failed to capture max.ru audio response buffer');
-          }
-        }
       } catch (err) {
         logger.debug({ err }, 'response capture handler error');
       }
@@ -220,7 +389,7 @@ export class MaxWebClient {
   }
 
   async waitForReady(timeoutMs = 120000) {
-    await this.page.waitForSelector(this.selectors.chatList, { timeout: timeoutMs });
+    await this.waitForSelectorFree(this.selectors.chatList, { timeout: timeoutMs });
     const url = this.page.url();
     if (!url.includes('web.max.ru')) {
       throw new Error(`Max Web session may have expired. Current URL: ${url}`);
@@ -399,8 +568,19 @@ export class MaxWebClient {
 
   async listChats() {
     await this.ensurePage();
+    const chats = await this.readChatList();
+    // MAX's contacts in place of its chats (it shows them after a search by
+    // phone number): back to the chats.
+    if (!chats.length && await this.showChatList() === 'switched') return this.readChatList();
+    return chats;
+  }
+
+  async readChatList() {
     const selectors = this.selectors;
     return this.page.$$eval(selectors.chatItem, (nodes, innerSelectors) => nodes.map((node, index) => {
+      // MAX's contacts (shown in place of the chats after a search by phone
+      // number) are links, chats are buttons: a contact is never a chat.
+      if (node.querySelector('a.cell') && !node.querySelector('button.cell')) return null;
       const titleNode = node.querySelector(innerSelectors.chatTitle);
       const unreadNode = node.querySelector(innerSelectors.chatUnread);
       const title = titleNode?.textContent?.trim() || node.textContent?.trim() || `Chat ${index + 1}`;
@@ -418,10 +598,10 @@ export class MaxWebClient {
           unreadText: unreadNode?.textContent?.trim() || ''
         }
       };
-    }), selectors);
+    }).filter(Boolean), selectors);
   }
 
-  async selectChat(chatIdOrIndex) {
+  async selectChat(chatIdOrIndex, { detour = true } = {}) {
     await this.ensurePage();
 
     const url = this.page.url();
@@ -437,9 +617,11 @@ export class MaxWebClient {
     // Try to find the chat in the visible list; if not found, scroll down
     // to load virtualized items that are off-screen.
     let chat = null;
-    const maxScrollAttempts = 10;
+    let chats = [];
+    const key = String(chatIdOrIndex);
+    const maxScrollAttempts = this.unlistedChatIds.has(key) && this.knownChatIds.has(key) ? 0 : 10;
     for (let attempt = 0; attempt <= maxScrollAttempts; attempt++) {
-      const chats = await this.listChats();
+      chats = await this.listChats();
       chat = chats.find((candidate, index) =>
         candidate.id === chatIdOrIndex || String(index + 1) === String(chatIdOrIndex)
       );
@@ -459,6 +641,12 @@ export class MaxWebClient {
       }
     }
 
+    // Not in MAX's list — a chat started with /new has no messages yet, and
+    // MAX lists it only after the first one — but its id is known: it is
+    // opened by its address.
+    const openById = !chat ? this.knownChatIds.get(key) || null : null;
+    if (chat) this.unlistedChatIds.delete(key);
+    else if (openById) this.unlistedChatIds.add(key);
     if (!chat) {
       // Scroll back to top for next operation
       await this.page.evaluate((sel) => {
@@ -466,21 +654,39 @@ export class MaxWebClient {
         const scrollable = content?.closest('.scrollable, .scrollListScrollable') || content?.parentElement;
         if (scrollable) scrollable.scrollTop = 0;
       }, this.selectors.chatList).catch(() => null);
-      throw new Error(`Max chat not found: ${chatIdOrIndex}`);
+      if (!openById) throw new Error(`Max chat not found: ${chatIdOrIndex}`);
+      chat = { id: String(chatIdOrIndex), title: String(chatIdOrIndex), lastSeenAt: Date.now(), metadata: {} };
     }
 
-    const chatItems = await this.page.$$(this.selectors.chatItem);
-    const targetNode = chatItems[chat.metadata.index];
-    if (!targetNode) throw new Error(`Chat node index not found: ${chat.metadata.index}`);
+    // From the click on, the page no longer shows the previous chat. Forget it
+    // now, so a switch that fails below (title never verified, list reordered
+    // under the click) cannot leave activeChatId naming a chat that is not on
+    // screen — readMessages/sendText skip re-selection when the ids match, and
+    // would then read or type into whatever chat the page actually shows.
+    const previousChatId = this.activeChatId;
+    const maxIdBefore = await this.currentMaxChatId();
+    this.activeChatId = null;
+    this.activeChatTitle = null;
+    this.activeMaxChatId = null;
+    this.captureChatId = chat.id;
 
-    await targetNode.evaluate((node) => {
-      const btn = node.querySelector('button.cell') || node;
-      btn.scrollIntoView({ block: 'center' });
-    });
-    await targetNode.evaluate((node) => {
-      const btn = node.querySelector('button.cell') || node;
-      btn.click();
-    });
+    // Clicked inside the page: no ElementHandles, so nothing is pinned (see
+    // disposeHandles). The resource-timing list is cleared at the same time:
+    // fetchRecentLottieFromPage reads the newest sticker files from it, and
+    // in a page that lives for days that list (250 entries, then it stops
+    // recording) otherwise held stickers from long-gone chats.
+    const clicked = openById
+      ? await this.openChatByAddress(openById)
+      : await this.page.evaluate((selector, index) => {
+        const node = document.querySelectorAll(selector)[index];
+        if (!node) return false;
+        try { performance.clearResourceTimings(); } catch { /* not available */ }
+        const btn = node.querySelector('button.cell') || node;
+        btn.scrollIntoView({ block: 'center' });
+        btn.click();
+        return true;
+      }, this.selectors.chatItem, chat.metadata.index);
+    if (!clicked) throw new Error(openById ? `Max chat not found: ${chat.id}` : `Chat node index not found: ${chat.metadata.index}`);
 
     // Scroll chat list back to top so future listChats sees top items
     await this.page.evaluate((sel) => {
@@ -489,24 +695,55 @@ export class MaxWebClient {
       if (scrollable) scrollable.scrollTop = 0;
     }, this.selectors.chatList).catch(() => null);
 
-    await this.page.waitForFunction(
-      (selector) => {
-        const el = document.querySelector(selector);
-        return el && el.textContent.trim().length > 0;
-      },
-      { timeout: 30000 },
-      this.selectors.activeChatTitle
-    );
-    await this.verifyActiveChat(chat);
+    try {
+      await this.page.waitForFunction(
+        (selector) => {
+          const el = document.querySelector(selector);
+          return el && el.textContent.trim().length > 0;
+        },
+        { timeout: openById ? 10000 : 30000 },
+        this.selectors.activeChatTitle
+      );
+      await this.verifyActiveChat(chat);
+    } catch (error) {
+      // Opened by its address and not there (left, deleted, renamed): as good
+      // as not found, which the bridge takes for what it is — rather than a
+      // failure on every poll, and MAX Web restarted over it.
+      if (openById) throw new Error(`Max chat not found: ${chat.id} (${error.message})`);
+      throw error;
+    }
+    // Its id in MAX — only once the address has changed with the switch, so
+    // it can never be the previous chat's.
+    const maxIdAfter = await this.currentMaxChatId();
+    this.activeMaxChatId = maxIdAfter && (maxIdAfter !== maxIdBefore || maxIdAfter === openById) ? maxIdAfter : null;
+    // Another title opened and the address stayed: the chat that was open,
+    // renamed in MAX — or the address is late. Opening another chat and
+    // coming back tells which, and gives a renamed chat its id (the bridge
+    // recognises it by that: BridgeService.noteMaxChatId).
+    if (!this.activeMaxChatId && maxIdAfter && detour && previousChatId && previousChatId !== chat.id) {
+      const other = chats.find((candidate) => candidate.id !== chat.id && candidate.id !== previousChatId);
+      if (other) {
+        logger.debug({ chatId: chat.id, via: other.id }, 'Chat opened without its address changing — opening another one and coming back');
+        try {
+          await this.selectChat(other.id, { detour: false });
+        } catch (error) {
+          // Not this chat's failure: it is opened again all the same.
+          logger.debug({ err: error?.message, via: other.id }, 'Could not open another chat on the way');
+        }
+        return this.selectChat(chat.id, { detour: false });
+      }
+    }
 
     // Mark the chat active BEFORE the scroll below. Scrolling lazy-loads message
     // bubbles and triggers MAX to fetch their media (e.g. sticker Lottie); those
     // network captures are tagged with activeChatId, so it must already point at
     // this chat or the captures get attributed to the previous one and lost.
     this.activeChatId = chat.id;
+    this.activeChatTitle = chat.title;
 
-    // Wait for message bubbles to render (lazy-loaded after chat opens)
-    await this.page.waitForSelector(this.selectors.messageItem, { timeout: 5000 }).catch(() => null);
+    // Wait for message bubbles to render (lazy-loaded after chat opens). A
+    // chat opened by its id is most likely new, without any.
+    await this.waitForSelectorFree(this.selectors.messageItem, { timeout: openById ? 1500 : 5000 }).catch(() => null);
 
     // Scroll message area to bottom to ensure newest messages are visible
     await this.scrollMessageListToBottom();
@@ -516,6 +753,373 @@ export class MaxWebClient {
 
     logger.debug({ chatId: chat.id, title: chat.title }, 'Selected Max chat');
     return chat;
+  }
+
+  // The open chat's own id in MAX: while a chat is open the page's address
+  // is /<id> (a number; negative for groups and channels) — the page carries
+  // no chat id anywhere else, and chats are otherwise known by their titles.
+  async currentMaxChatId() {
+    let pathname = '';
+    try {
+      pathname = await this.page.evaluate(() => location.pathname);
+    } catch {
+      return null;
+    }
+    return String(pathname || '').split('/').find((segment) => /^-?\d+$/.test(segment)) || null;
+  }
+
+  // Remembers a chat's id in MAX, so it can be opened when MAX does not list
+  // it (see selectChat). null forgets it. `listed: false` — MAX does not list
+  // it yet (no messages): opened straight by its address, and its first
+  // message watched (checkFirstMessageAccepted).
+  rememberChatId(chatId, maxId, { listed } = {}) {
+    const key = String(chatId);
+    if (maxId) this.knownChatIds.set(key, String(maxId));
+    else this.knownChatIds.delete(key);
+    if (maxId && listed === false) this.unlistedChatIds.add(key);
+    else if (!maxId || listed === true) this.unlistedChatIds.delete(key);
+  }
+
+  // Forgets which chat is open: the next read or send opens its chat again.
+  // For a chat that opened but must not be taken for the chat of its name.
+  forgetActiveChat() {
+    this.activeChatId = null;
+    this.activeChatTitle = null;
+    this.activeMaxChatId = null;
+    this.captureChatId = null;
+  }
+
+  // Whether the page has moved on from the chat opened last: its address is
+  // another chat's. Such a page is not read or typed into as that chat.
+  async activeChatMovedOn() {
+    if (!this.activeChatId || !this.activeMaxChatId) return false;
+    const current = await this.currentMaxChatId();
+    if (!current || current === this.activeMaxChatId) return false;
+    logger.warn({ chatId: this.activeChatId }, 'MAX shows another chat than the one opened last — opening it again');
+    return true;
+  }
+
+  // Opens a chat by its address (/<id>) the way MAX itself does: a click on
+  // a link, which MAX's router takes over — no page reload. True once the
+  // address shows it.
+  async openChatByAddress(maxId) {
+    await this.page.evaluate((id) => {
+      try { performance.clearResourceTimings(); } catch { /* not available */ }
+      const link = document.createElement('a');
+      link.href = `/${id}`;
+      link.style.display = 'none';
+      document.body.append(link);
+      link.click();
+      link.remove();
+    }, String(maxId));
+    return this.page.waitForFunction(
+      (id) => location.pathname.split('/').includes(id),
+      { timeout: 10000 },
+      String(maxId)
+    ).then(() => true, () => false);
+  }
+
+  // --- MAX's search, for /new ---
+
+  // What MAX's search above the chat list finds for `query`, once its list
+  // stops changing: the owner's chats first, then "Глобальный поиск"
+  // (people and public chats), and for a whole phone number the "Найти по
+  // номеру" action; found messages are left out. [{ kind: 'chat' | 'global'
+  // | 'phone', title, hint, ordinal }]. The search is cleared afterwards:
+  // while it shows, MAX lists no chats.
+  async searchChats(query, { settleMs = 1200, timeoutMs = 12000 } = {}) {
+    await this.ensurePage();
+    try {
+      await this.typeSearch(query);
+      return (await this.readSettledSearch({ settleMs, timeoutMs })).results;
+    } finally {
+      await this.clearSearch();
+    }
+  }
+
+  // Opens what searchChats found (`candidate`), after searching again: MAX
+  // clears its search when a chat opens, and the results may have changed.
+  // Returns { title, maxId, listed } of the chat that opened (listed: in
+  // MAX's chat list), and leaves it open. Throws — nothing opened, or not
+  // that — rather than guess: a route is made for what this returns.
+  async openSearchResult(query, candidate) {
+    await this.ensurePage();
+    // The chat that opens is told from the one open now by its address, which
+    // has to change. So when the one open now may be the one asked for (the
+    // same name; for a number, anyone), another chat is opened first: a
+    // namesake that is slow to open, or a click MAX let pass, would otherwise
+    // leave the chat open now looking like the one found.
+    await this.leaveOpenChat(candidate.kind === 'phone' ? null : candidate.title);
+    const maxIdBefore = await this.currentMaxChatId();
+    const titleBefore = await this.openChatTitle();
+    let results;
+    try {
+      await this.typeSearch(query);
+      ({ results } = await this.readSettledSearch());
+    } catch (error) {
+      await this.clearSearch();
+      throw error;
+    }
+    // The one picked: its kind, its name and, for people and public chats,
+    // what MAX shows under the name (a description, an @name) — people who
+    // share a name come back in any order.
+    const matching = results.filter((result) => result.kind === candidate.kind
+      && (candidate.kind === 'phone' || (sameTitle(result.title, candidate.title) && result.hint === (candidate.hint || ''))));
+    const target = matching[candidate.ordinal || 0] || null;
+    if (!target) {
+      await this.clearSearch();
+      throw new Error('MAX больше не находит этот вариант — пришли /new ещё раз.');
+    }
+
+    // From the click on, the page shows another chat (or tries to).
+    this.activeChatId = null;
+    this.activeChatTitle = null;
+    this.activeMaxChatId = null;
+    const clicked = await this.page.evaluate((sel, position, expected) => {
+      const button = document.querySelector(sel)?.querySelectorAll('button.item')[position];
+      if (!button) return false;
+      const text = (button.textContent || '').replace(/\s+/g, ' ').trim();
+      if (expected && !text.toLowerCase().includes(expected.toLowerCase())) return false;
+      button.click();
+      return true;
+    }, this.selectors.searchResults, target.position, candidate.kind === 'phone' ? '' : candidate.title).catch(() => false);
+    if (!clicked) {
+      await this.clearSearch();
+      throw new Error('MAX успел поменять результаты поиска — пришли /new ещё раз.');
+    }
+
+    // The chat opens, or MAX says why not. It counts as open once its
+    // address has moved on and its header names it — the header may still
+    // name the previous chat for a moment, and that name must never be taken
+    // for a new contact's — the same in two reads in a row.
+    const deadline = Date.now() + 15000;
+    let opened = null;
+    let seen = null;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const refusal = await this.searchRefusal();
+      if (refusal) {
+        await this.page.keyboard.press('Escape').catch(() => {});
+        await this.clearSearch();
+        await this.showChatList();
+        throw new Error(refusal);
+      }
+      const maxId = await this.currentMaxChatId();
+      const title = await this.openChatTitle();
+      let ready;
+      if (candidate.kind === 'phone') {
+        // The number's owner is known only once their chat shows.
+        ready = maxId && maxId !== maxIdBefore && title && title !== titleBefore;
+      } else {
+        // A chat found by name: that name in the header.
+        ready = maxId && maxId !== maxIdBefore && sameTitle(title, candidate.title);
+      }
+      const current = ready ? `${maxId}\u0000${title}` : null;
+      if (current && current === seen) {
+        opened = { maxId, title };
+        break;
+      }
+      seen = current;
+    }
+    await this.showChatList();
+    await this.clearSearch();
+    if (!opened) throw new Error('Чат в MAX так и не открылся — попробуй /new ещё раз.');
+    if (candidate.kind !== 'phone' && !sameTitle(opened.title, candidate.title)) {
+      throw new Error(`Вместо «${candidate.title}» в MAX открылся «${opened.title}» — ничего не создаю.`);
+    }
+
+    // A chat with no messages yet is not in MAX's list.
+    const listed = (await this.listChats().catch(() => [])).some((chat) => sameTitle(chat.title, opened.title));
+
+    this.activeChatId = opened.title;
+    this.activeChatTitle = opened.title;
+    this.activeMaxChatId = opened.maxId;
+    this.captureChatId = opened.title;
+    await this.waitForSelectorFree(this.selectors.messageItem, { timeout: 3000 }).catch(() => null);
+    await this.scrollMessageListToBottom();
+    logger.info({ kind: candidate.kind, listed }, 'Opened a chat found in MAX search');
+    return { ...opened, listed };
+  }
+
+  // Opens another chat than the one open now when that one is named `title`
+  // (null: whatever its name). False when there was none to open.
+  async leaveOpenChat(title) {
+    const openTitle = await this.openChatTitle();
+    if (!openTitle || (title !== null && !sameTitle(openTitle, title))) return true;
+    const other = (await this.listChats()).find((chat) => !sameTitle(chat.title, openTitle)
+      && (title === null || !sameTitle(chat.title, title)));
+    if (!other) return false;
+    try {
+      await this.selectChat(other.id, { detour: false });
+      return true;
+    } catch (error) {
+      logger.debug({ err: error?.message }, 'Could not open another chat first');
+      return false;
+    }
+  }
+
+  // A chat MAX does not list yet (started with /new) may belong to someone
+  // who takes messages only from their contacts: MAX then refuses the first
+  // one — once its server has said no — with its "Хотите написать первым?"
+  // window. Said as an error rather than taken for a delivery. A chat that
+  // took a message is not watched again.
+  async checkFirstMessageAccepted(chatId, { waitMs = 3000 } = {}) {
+    const key = String(chatId);
+    if (!this.unlistedChatIds.has(key) || this.chatsTakingMessages.has(key)) return;
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const refusal = await this.page.evaluate((sel) => document.querySelector(sel)?.textContent || '', this.selectors.modalTitle)
+        .catch(() => '');
+      if (refusal.trim()) {
+        await this.page.keyboard.press('Escape').catch(() => {});
+        throw new Error(`MAX не дал отправить: ${refusal.replace(/\s+/g, ' ').trim()}`);
+      }
+    }
+    this.chatsTakingMessages.add(key);
+  }
+
+  // The open chat's name, from its (hidden) header; '' when none is open.
+  async openChatTitle() {
+    return chatTitleFromHeader(await this.page.evaluate(
+      (sel) => document.querySelector(sel)?.textContent || '', this.selectors.activeChatTitle
+    ).catch(() => ''));
+  }
+
+  // Types into MAX's search (the field above the chat list), replacing what
+  // was there.
+  async typeSearch(query) {
+    const focused = await this.page.evaluate((selector) => {
+      const input = document.querySelector(selector);
+      if (!input) return false;
+      input.focus();
+      input.select?.();
+      return true;
+    }, this.selectors.searchInput).catch(() => false);
+    if (!focused) throw new Error('Не нашёл поиск в MAX Web (поле «Найти» над списком чатов).');
+    await this.page.keyboard.press('Backspace');
+    await this.page.keyboard.type(String(query), { delay: 15 });
+  }
+
+  // The search results once they have not changed for `settleMs` (MAX adds
+  // the global ones a moment after its own chats), or what is there when
+  // time runs out.
+  async readSettledSearch({ settleMs = 1200, timeoutMs = 12000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    let lastSignature = '';
+    let stableSince = Date.now();
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const current = await this.readSearchResults().catch(() => null);
+      const signature = JSON.stringify(current);
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        stableSince = Date.now();
+        last = current;
+      } else if (current && Date.now() - stableSince >= settleMs) {
+        break;
+      }
+    }
+    return last || { results: [], empty: true };
+  }
+
+  async readSearchResults() {
+    return this.page.evaluate((selector) => {
+      const list = document.querySelector(selector);
+      if (!list) return null;
+      const results = [];
+      let section = 'chat';
+      let position = 0;
+      for (const el of list.querySelectorAll('.separator, button.item')) {
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!el.matches('button.item')) {
+          section = /Действия|Actions/i.test(text) ? 'actions'
+            : /Глобальный поиск|Global search/i.test(text) ? 'global'
+              : /Сообщения|Messages/i.test(text) ? 'messages'
+                : 'other';
+          continue;
+        }
+        const itemPosition = position;
+        position += 1;
+        if (section === 'actions') {
+          if (/Найти по номеру|Search by number/i.test(text)) results.push({ kind: 'phone', title: '', hint: '', position: itemPosition });
+          continue;
+        }
+        if (section !== 'chat' && section !== 'global') continue;
+        const titleEl = el.querySelector('.title .name .text, .title .text, .title');
+        const title = (titleEl?.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!title) continue;
+        // For people and public chats, what MAX shows under the name (a
+        // description, an @name) — never a chat's last message.
+        const hintEl = section === 'global'
+          ? el.querySelector('.cell > .text') || [...el.querySelectorAll('.text')].find((candidate) => !candidate.closest('.title'))
+          : null;
+        const hint = (hintEl?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+        results.push({ kind: section, title, hint, position: itemPosition });
+      }
+      // Which of the results alike (kind, name, what it says under the name)
+      // each one is.
+      const seen = new Map();
+      for (const result of results) {
+        const key = `${result.kind}\u0000${result.title.toLowerCase()}\u0000${result.hint}`;
+        result.ordinal = seen.get(key) || 0;
+        seen.set(key, result.ordinal + 1);
+      }
+      return { results, empty: Boolean(list.querySelector('.empty')) };
+    }, this.selectors.searchResults);
+  }
+
+  async clearSearch() {
+    await this.page.evaluate((sel) => {
+      const clear = document.querySelector(sel.searchClear);
+      if (clear) {
+        clear.click();
+        return;
+      }
+      const input = document.querySelector(sel.searchInput);
+      if (input && input.value) {
+        input.value = '';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }, this.selectors).catch(() => null);
+    await this.page.waitForFunction((selector) => !document.querySelector(selector), { timeout: 5000 }, this.selectors.searchResults)
+      .catch(() => null);
+  }
+
+  // Why MAX did not open anything: its "Не нашли номер …" window, or its
+  // "Не получилось найти" notice. null when it says nothing.
+  async searchRefusal() {
+    const said = await this.page.evaluate((sel) => {
+      const modal = document.querySelector(sel.modalTitle)?.textContent || '';
+      const snackbar = document.querySelector('.snackbar')?.textContent || '';
+      return (modal || snackbar).replace(/\s+/g, ' ').trim();
+    }, this.selectors).catch(() => '');
+    if (!said) return null;
+    if (/принадлежит вам|belongs to you/i.test(said)) return 'Это твой собственный номер в MAX.';
+    if (/Не нашли|not found|Не получилось найти/i.test(said)) return `MAX не нашёл такой номер (${said}).`;
+    return `MAX ответил: ${said}`;
+  }
+
+  // After a search by phone number MAX shows its contacts in place of the
+  // chats (its "Контакты" tab): back to all chats. The chat list would read
+  // contacts otherwise. 'shown' when the chats were there, 'switched' when
+  // they are now, false when MAX still shows its contacts.
+  async showChatList() {
+    const contactsShown = () => this.page.evaluate(
+      (selector) => [...document.querySelectorAll(selector)].some((item) => item.querySelector('a.cell') && !item.querySelector('button.cell')),
+      this.selectors.chatItem
+    ).catch(() => false);
+    if (!await contactsShown()) return 'shown';
+    await this.page.evaluate((selector) => document.querySelector(selector)?.click(), this.selectors.chatsTab).catch(() => null);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      if (!await contactsShown()) return 'switched';
+    }
+    logger.warn('MAX still shows its contacts instead of the chats');
+    await this.captureDiagnostics('contacts-tab-stuck', { throttleMs: 60000 }).catch(() => null);
+    return false;
   }
 
   // Scrolls every scrollable message-list container to the bottom (newest
@@ -548,127 +1152,364 @@ export class MaxWebClient {
   // fingerprint for later Telegram->MAX reply matching).
   scrapeMessageRows() {
     const selectors = this.selectors;
-    return this.page.$$eval(selectors.messageItem, (nodes, innerSelectors, docLinkFallbackSelector) => nodes.map((node, index) => {
-      // Detect reply quote: present only on reply bubbles as a direct child .link
-      const bubbleContent = node.querySelector('.bubbleContent') || node;
-      const replyLink = bubbleContent.querySelector(':scope > .link') || node.querySelector('.bubbleContent > .link');
-
-      let replyToAuthor = '';
-      let replyToSnippet = '';
-      let replyToHasMedia = false;
-      let replyToMediaUrl = '';
-      if (replyLink) {
-        const replyAuthorEl = replyLink.querySelector('.author');
-        replyToAuthor = replyAuthorEl ? replyAuthorEl.textContent.trim() : '';
-        // Find the quoted snippet: a .text inside the quote that is NOT inside .author
-        const markTexts = Array.from(replyLink.querySelectorAll('.text'));
-        const snippetEl = markTexts.find((el) => !replyAuthorEl || !replyAuthorEl.contains(el));
-        replyToSnippet = snippetEl ? snippetEl.textContent.trim() : '';
-        // A reply to media (photo/video/sticker) shows a thumbnail in the quote
-        // but no text snippet, so it cannot be matched by text — flag it so the
-        // bridge can fall back to matching the most recent media message.
-        const replyMediaEl = replyLink.querySelector('img, video');
-        replyToHasMedia = Boolean(replyMediaEl || replyLink.querySelector('canvas, [class*="sticker"], [class*="Sticker"]'));
-        // Capture the quoted thumbnail's URL so the bridge can match the reply to
-        // the original media by its CDN identity instead of guessing by recency.
-        replyToMediaUrl = replyMediaEl ? (replyMediaEl.currentSrc || replyMediaEl.src || '') : '';
-      }
-
-      // Extract the real message text: the .text that is a direct child of .bubbleContent,
-      // NOT the one inside .link (which is the quoted author's name or snippet).
-      let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
-      if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
-      const text = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
-
-      const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
-      const timeNode = node.querySelector(innerSelectors.messageTime);
-      const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
-      // Media/type detection must ignore anything inside the reply quote (.link):
-      // a reply to a photo/video/sticker embeds the quoted media's thumbnail,
-      // which would otherwise be misdetected as this message's own media and
-      // re-sent instead of forwarding the reply text.
-      const ownEl = (el) => (el && replyLink && replyLink.contains(el)) ? null : el;
-      const imgEl = ownEl(node.querySelector('img'));
-      const canvasEl = ownEl(node.querySelector('canvas'));
-      const videoEl = ownEl(node.querySelector('video'));
-      const sourceEl = ownEl(node.querySelector('source[type="video"], source[type="webm"]'));
-      const audioEl = ownEl(node.querySelector('audio'));
-      const voiceEl = ownEl(node.querySelector('[class*="voice"], [data-testid*="voice"], [aria-label*="voice"], [aria-label*="Voice"], [class*="audioMessage"], [class*="audio-player"], [class*="attachAudio"], [class*="wave"]'));
-      const roundVideoEl = ownEl(node.querySelector('[class*="roundVideo"], [class*="round-video"], [class*="videoNote"], [class*="video-note"], [data-testid*="video-note"], [data-testid*="round-video"], [class*="videoMessage"], [class*="videoCanvas"]'));
-      const durationEl = ownEl(node.querySelector('.duration, [class*="duration"]'));
-      const hasDuration = durationEl && /^\d{2}:\d{2}$/.test(durationEl.textContent.trim());
-      const imageUrl = imgEl?.src || '';
-      const audioUrl = audioEl?.src || '';
-      const videoUrl = videoEl?.src || sourceEl?.src || '';
-      const documentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
-        || ownEl(node.querySelector(docLinkFallbackSelector));
-      const documentEl = documentLink || ownEl(node.querySelector('[class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [class*="fileIcon"], [data-testid*="document"], [data-testid*="file"], button[aria-label*="качать"]'));
-      const documentUrl = documentLink?.href || '';
-      const hasDocumentElement = Boolean(documentEl);
-      // Try to extract original filename from document bubble
-      const fileNameEl = ownEl(node.querySelector('[class*="fileName"], [class*="file-name"], [class*="title"]'));
-      const documentFileName = fileNameEl?.textContent?.trim() || '';
-      const mediaUrl = imageUrl || audioUrl || videoUrl || documentUrl || '';
-      const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
-      const fallbackId = [author, time, text, mediaUrl].filter(Boolean).join('|');
-      const rawId = explicitId || fallbackId || `visible-${index}`;
-      const outgoing = Boolean(
-        node.closest('[data-outgoing="true"], .outgoing, .message-out')
-        || node.closest('[data-bubbles-variant="outgoing"]')
-        || node.parentElement?.getAttribute('data-bubbles-variant') === 'outgoing'
-      );
-
-      const stickerEl = ownEl(node.querySelector('[class*="sticker"], [class*="Sticker"], [data-testid*="sticker"], [class*="emoji-big"], [class*="animatedEmoji"]'));
-      // The weak voice signals ("wave"/"duration") also match some text
-      // bubbles, so they only mean "voice" when the bubble has no real text.
-      // roundVideoEl (videoMessage/videoCanvas/roundVideo) and audioUrl are
-      // specific enough to trust on their own — a video note may carry a
-      // duration/label in its text, and must still be detected as a video note.
-      const hasText = Boolean(text);
-      let type = 'text';
-      if (stickerEl) type = 'sticker';
-      else if (imageUrl) type = 'photo';
-      else if (roundVideoEl) type = 'video_note';
-      else if (audioUrl) type = 'voice';
-      else if ((voiceEl || hasDuration) && !hasText) type = 'voice';
-      else if (videoUrl) type = 'video';
-      else if (documentUrl || hasDocumentElement) type = 'document';
-      else if (canvasEl) {
-        const cw = canvasEl.width || 0;
-        const ch = canvasEl.height || 0;
-        if (cw > 40 && ch > 40) {
-          type = 'sticker';
-        }
-      }
-
-      // For stickers: if there's an img inside the sticker element, use it as mediaUrl
-      const stickerImgUrl = (type === 'sticker' && imgEl?.src && !imgEl.src.startsWith('data:')) ? imgEl.src : '';
-      const stickerIndex = (type === 'sticker' && !mediaUrl && !stickerImgUrl) ? index : -1;
-
-      return {
-        rawId,
-        text,
-        author,
-        time,
-        outgoing,
-        mediaUrl: stickerImgUrl || mediaUrl,
-        type,
-        stickerIndex,
-        hasVoiceElement: Boolean(voiceEl),
-        hasRoundVideoElement: Boolean(roundVideoEl),
-        hasDuration,
-        // Needed outside the page context to index document bubbles in DOM
-        // order the same way triggerDocumentDownload does (see readMessages).
-        hasDocumentElement,
-        documentFileName,
-        replyToAuthor,
-        replyToSnippet,
-        replyToHasMedia,
-        replyToMediaUrl,
-        replyLinkPresent: Boolean(replyLink),
-        _htmlSnippet: node.innerHTML.substring(0, 200)
+    return this.page.$$eval(selectors.messageItem, (nodes, innerSelectors, docLinkFallbackSelector, decor) => {
+      // --- Shared with findAndHoverMessage: keep the two in step. ---
+      const safeClosest = (el, sel) => {
+        try { return sel && el ? el.closest(sel) : null; } catch { return null; }
       };
-    }), selectors, DOCUMENT_LINK_FALLBACK_SELECTOR);
+      const safeAll = (root, sel) => {
+        try { return sel && root ? [...root.querySelectorAll(sel)] : []; } catch { return []; }
+      };
+      // Pictures of emoji — never a message's own media (see BUBBLE_DECOR).
+      const isDecor = (el) => Boolean(safeClosest(el, decor.graphics) || safeClosest(el, decor.bigEmoji)
+        || safeClosest(el, innerSelectors.messageReactions));
+      // What the static-animoji mode (STATIC_ANIMOJI_SCRIPT) turned from a
+      // canvas into an <img>: reaction chips and the stand-in of an animated
+      // big emoji. Left out of the id so a bubble keeps the id it always had;
+      // the other emoji pictures were always <img> and stay in it for the
+      // same reason.
+      const isAnimojiStandIn = (el) => {
+        if (safeClosest(el, innerSelectors.messageReactions)) return true;
+        const big = safeClosest(el, decor.bigEmoji);
+        const glyph = big && safeClosest(el, decor.graphics);
+        return Boolean(glyph) && glyph.parentElement !== big;
+      };
+      // --- End of the shared part. ---
+      const pictographic = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20E3/u;
+      const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+      const emojiIn = (value) => (segmenter ? [...segmenter.segment(value || '')].map((part) => part.segment) : Array.from(value || ''))
+        .filter((grapheme) => pictographic.test(grapheme));
+      // Text as the reader sees it. MAX draws emoji as <img alt="😀"> (and
+      // animoji as a span carrying the emoji), which textContent leaves out:
+      // "Привет 😀" used to come through as "Привет".
+      const readable = (root) => {
+        let out = '';
+        const walk = (n) => {
+          if (n.nodeType === 3) {
+            out += n.nodeValue;
+            return;
+          }
+          if (n.nodeType !== 1) return;
+          const glyph = n.getAttribute('data-lexical-animoji-emoji') || n.getAttribute('data-lexical-emoji');
+          if (glyph) {
+            out += glyph;
+            return;
+          }
+          if (n.tagName === 'IMG') {
+            const alt = n.getAttribute('alt') || '';
+            if (alt.length <= 32 && pictographic.test(alt)) out += alt;
+            return;
+          }
+          for (const child of n.childNodes) walk(child);
+        };
+        if (root) walk(root);
+        return out;
+      };
+      const parseCount = (value) => {
+        const match = /(\d+(?:[.,]\d+)?)\s*([KkКкMmМм])?/u.exec(String(value || ''));
+        if (!match) return 1;
+        const scale = /[KkКк]/u.test(match[2] || '') ? 1000 : (/[MmМм]/u.test(match[2] || '') ? 1000000 : 1);
+        return Math.max(1, Math.round(Number.parseFloat(match[1].replace(',', '.')) * scale));
+      };
+      const isOrHasMessage = (el) => {
+        try {
+          return el.matches(innerSelectors.messageItem) || Boolean(el.querySelector(innerSelectors.messageItem));
+        } catch {
+          return false;
+        }
+      };
+      // A bubble's reaction chips. MAX puts them inside the bubble for media,
+      // and for text right AFTER the bubble's wrapper, as its next sibling.
+      // Walking up stops at the level of the message rows, so a neighbour's
+      // reactions are never taken for this bubble's.
+      const reactionChipsOf = (node, replyLink) => {
+        const containerSel = innerSelectors.messageReactions;
+        const chipSel = innerSelectors.messageReactionChip;
+        if (!containerSel || !chipSel) return [];
+        const containers = safeAll(node, containerSel);
+        let level = node.parentElement;
+        for (let depth = 0; level && depth < 3 && !containers.length; depth++, level = level.parentElement) {
+          let reachedNextMessage = false;
+          for (let sibling = level.nextElementSibling, seen = 0; sibling && seen < 3; sibling = sibling.nextElementSibling, seen++) {
+            if (isOrHasMessage(sibling)) {
+              reachedNextMessage = true;
+              break;
+            }
+            let isContainer = false;
+            try { isContainer = sibling.matches(containerSel); } catch { /* bad selector */ }
+            if (isContainer) containers.push(sibling);
+            else containers.push(...safeAll(sibling, containerSel));
+          }
+          if (reachedNextMessage) break;
+        }
+        const chips = new Set();
+        for (const container of containers) {
+          if (replyLink && replyLink.contains(container)) continue;
+          safeAll(container, chipSel).forEach((chip) => chips.add(chip));
+        }
+        return [...chips];
+      };
+      const chipInfo = (chip) => {
+        const labels = safeAll(chip, '[data-lexical-animoji-emoji], [data-lexical-emoji], img[alt]')
+          .map((el) => el.getAttribute('data-lexical-animoji-emoji') || el.getAttribute('data-lexical-emoji') || el.getAttribute('alt') || '');
+        const emoji = [...labels, chip.getAttribute('aria-label') || '', chip.textContent || ''].flatMap(emojiIn)[0] || null;
+        const counter = chip.querySelector('.counter')?.textContent ?? chip.textContent;
+        const active = /(^|\s)[\w-]*--active(\s|$)/.test(chip.getAttribute('class') || '')
+          || chip.getAttribute('aria-pressed') === 'true';
+        const rect = chip.getBoundingClientRect();
+        return { emoji, count: parseCount(counter), active, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+      };
+
+      const rows = nodes.map((node, index) => {
+        // Detect reply quote: present only on reply bubbles as a direct child .link
+        const bubbleContent = node.querySelector('.bubbleContent') || node;
+        const replyLink = bubbleContent.querySelector(':scope > .link') || node.querySelector('.bubbleContent > .link');
+        const inQuote = (el) => Boolean(el && replyLink && replyLink.contains(el));
+
+        let replyToAuthor = '';
+        let replyToSnippet = '';
+        let replyToHasMedia = false;
+        let replyToMediaUrl = '';
+        if (replyLink) {
+          const replyAuthorEl = replyLink.querySelector('.author');
+          replyToAuthor = replyAuthorEl ? replyAuthorEl.textContent.trim() : '';
+          // Find the quoted snippet: a .text inside the quote that is NOT inside .author
+          const markTexts = Array.from(replyLink.querySelectorAll('.text'));
+          const snippetEl = markTexts.find((el) => !replyAuthorEl || !replyAuthorEl.contains(el));
+          replyToSnippet = snippetEl ? readable(snippetEl).trim() : '';
+          // A reply to media (photo/video/sticker) shows a thumbnail in the quote
+          // but no text snippet, so it cannot be matched by text — flag it so the
+          // bridge can fall back to matching the most recent media message.
+          // Emoji pictures in a quoted text are not media.
+          const replyMediaEl = safeAll(replyLink, 'img, video').find((el) => !isDecor(el)) || null;
+          replyToHasMedia = Boolean(replyMediaEl
+            || safeAll(replyLink, 'canvas, [class*="sticker"], [class*="Sticker"]').some((el) => !isDecor(el)));
+          // Capture the quoted thumbnail's URL so the bridge can match the reply to
+          // the original media by its CDN identity instead of guessing by recency.
+          replyToMediaUrl = replyMediaEl ? (replyMediaEl.currentSrc || replyMediaEl.src || '') : '';
+        }
+
+        // Extract the real message text: the .text that is a direct child of .bubbleContent,
+        // NOT the one inside .link (which is the quoted author's name or snippet).
+        let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
+        if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
+        // The id of a bubble before the time was part of it (see legacyRawId
+        // below) took the first .text of the bubble when it had no text of
+        // its own — the sender's name in a group, else the time.
+        const legacyFingerprintText = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
+        // The bubble's own chrome: the quote, the sender's name above it and
+        // its meta line (the time, "ред."). MAX draws the time as a .text too,
+        // so an uncaptioned photo came through captioned "12:04" — and a voice
+        // message, having "text", was not taken for a voice message.
+        const isChrome = (el) => inQuote(el)
+          || Boolean(safeClosest(el, innerSelectors.messageAuthor))
+          || Boolean(safeClosest(el, innerSelectors.messageSender))
+          || Boolean(safeClosest(el, innerSelectors.messageMetaTime));
+        // What is delivered: with its emoji. An emoji-only message has no
+        // .text at all; its emoji are drawn big instead.
+        const textSource = textEl || safeAll(node, innerSelectors.messageText).find((el) => !isChrome(el)) || null;
+        const bigEmojiEl = safeAll(node, decor.bigEmoji).find((el) => !inQuote(el)) || null;
+        // A location, a poll…: said in words (they used to come through as
+        // "12:04", their time).
+        const kind = (decor.kinds || []).find(([selector]) => safeAll(node, selector).some((el) => !inQuote(el)));
+        const text = readable(textSource).trim() || readable(bigEmojiEl).trim() || (kind ? `${kind[1]} — открой в MAX` : '');
+        const fingerprintText = (textSource ? textSource.textContent : '').trim();
+
+        const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
+        // Who wrote it, for showing in Telegram (group chats): the name above
+        // the bubble — MAX shows it on the first of a run of bubbles from one
+        // sender — else the bubble's own author line; never the quoted author
+        // of a reply (which `author` may have picked up, and keeps for the id).
+        const senderHeader = safeAll(node, innerSelectors.messageSender).find((el) => !inQuote(el)) || null;
+        const senderEl = (senderHeader && (senderHeader.querySelector('.name') || senderHeader))
+          || safeAll(node, innerSelectors.messageAuthor).find((el) => !inQuote(el)) || null;
+        const sender = senderEl ? readable(senderEl).replace(/\s+/g, ' ').trim() : '';
+        const timeNode = node.querySelector(innerSelectors.messageTime);
+        const legacyTime = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
+        // MAX shows a bubble's time as the text of its meta line, not in a
+        // .time[aria-label] element — which does not exist, so the time used
+        // to be missing from every id, and a text repeating any earlier
+        // message of the chat ("Ок" today after "Ок" last week) was taken for
+        // that one and never delivered.
+        const metaText = safeAll(node, innerSelectors.messageMetaTime).find((el) => !inQuote(el))?.textContent || '';
+        const time = legacyTime || (/\d{1,2}:\d{2}(?:\s?[AaPp][Mm])?/.exec(metaText) || [''])[0];
+        // Media/type detection must ignore anything inside the reply quote (.link):
+        // a reply to a photo/video/sticker embeds the quoted media's thumbnail,
+        // which would otherwise be misdetected as this message's own media and
+        // re-sent instead of forwarding the reply text. Emoji pictures are not
+        // media either: a text with an emoji used to become a "photo" of it.
+        const ownEl = (el) => (inQuote(el) ? null : el);
+        // A file is a card (.attaches > button.container: its name in .title,
+        // its size in .info — "Скачать • 1.23 MB"). Its preview picture (a
+        // photo or video sent as a file) is not the message's photo: the file
+        // itself is. Nor is the picture of a link's preview card (.share) —
+        // a text with a link used to arrive as a photo of that picture.
+        const fileCard = ownEl(safeAll(node, innerSelectors.messageFileCard)[0] || null);
+        const inLinkPreview = (el) => Boolean(safeClosest(el, innerSelectors.messageLinkPreview));
+        const notContent = (el) => inQuote(el) || isDecor(el) || inLinkPreview(el) || Boolean(fileCard && fileCard.contains(el));
+        const contentEl = (sel) => safeAll(node, sel).find((el) => !notContent(el)) || null;
+        const imgEl = contentEl('img');
+        // An animated big emoji is a canvas when it cannot be read as an emoji
+        // (static-animoji mode off); it is then treated as a sticker, as before.
+        const canvasEl = contentEl('canvas') || (text ? null : ownEl(node.querySelector('canvas')));
+        const videoEl = contentEl('video');
+        const sourceEl = contentEl('source[type="video"], source[type="webm"]');
+        const audioEl = contentEl('audio');
+        const voiceEl = ownEl(node.querySelector('[class*="voice"], [data-testid*="voice"], [aria-label*="voice"], [aria-label*="Voice"], [class*="audioMessage"], [class*="audio-player"], [class*="attachAudio"], [class*="wave"]'));
+        const roundVideoEl = ownEl(node.querySelector('[class*="roundVideo"], [class*="round-video"], [class*="videoNote"], [class*="video-note"], [data-testid*="video-note"], [data-testid*="round-video"], [class*="videoMessage"], [class*="videoCanvas"]'));
+        const durationEl = ownEl(node.querySelector('.duration, [class*="duration"]'));
+        const hasDuration = durationEl && /^\d{2}:\d{2}$/.test(durationEl.textContent.trim());
+        const imageUrl = imgEl?.src || '';
+        const audioUrl = audioEl?.src || '';
+        const videoUrl = videoEl?.src || sourceEl?.src || '';
+        // The first file-like link, as ids have always taken it (a link in the
+        // text included).
+        const legacyDocumentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
+          || ownEl(node.querySelector(docLinkFallbackSelector));
+        // A link in the text ("…/file/…", "…/download…") or in its preview
+        // card is not a file to download.
+        const inText = (el) => Boolean(safeClosest(el, innerSelectors.messageText)) || inLinkPreview(el);
+        const documentLink = [...safeAll(node, innerSelectors.messageDocument), ...safeAll(node, docLinkFallbackSelector)]
+          .find((el) => !inQuote(el) && !inText(el)) || null;
+        const documentEl = fileCard || documentLink || ownEl(node.querySelector('[class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [class*="fileIcon"], [data-testid*="document"], [data-testid*="file"], button[aria-label*="качать"]'));
+        const documentUrl = documentLink?.href || '';
+        const hasDocumentElement = Boolean(documentEl);
+        // The file's name, and its size as MAX states it — the bridge does not
+        // download what Telegram would not take anyway.
+        const fileNameEl = (fileCard && fileCard.querySelector('.title'))
+          || ownEl(node.querySelector('[class*="fileName"], [class*="file-name"], [class*="title"]'));
+        const documentFileName = fileNameEl?.textContent?.trim() || '';
+        const fileInfo = fileCard?.querySelector('.info')?.textContent || '';
+        const sizes = [...fileInfo.matchAll(/(\d+(?:[.,]\d+)?)\s*(B|KB|MB|GB|TB|Б|КБ|МБ|ГБ|ТБ)(?![\p{L}])/giu)];
+        const lastSize = sizes.at(-1);
+        const sizeUnits = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const unitIndex = lastSize ? Math.max(sizeUnits.indexOf(lastSize[2].toUpperCase()), ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'].indexOf(lastSize[2].toUpperCase())) : -1;
+        const documentSize = unitIndex >= 0 ? Math.round(Number.parseFloat(lastSize[1].replace(',', '.')) * 1024 ** unitIndex) : 0;
+        // "Файл удален" / "Файл недоступен", or the card switched off.
+        const documentUnavailable = Boolean(fileCard) && (fileCard.disabled || /удал[её]н|недоступ|deleted|unavailable/i.test(fileInfo));
+        const mediaUrl = imageUrl || audioUrl || videoUrl || documentUrl || '';
+        // The id: author|time|text|media. Its media part is built the way it
+        // always was — the first <img> (emoji pictures included), <audio>,
+        // <video> or file link, minus the animoji stand-ins, which used to be
+        // canvases — so an uncaptioned photo in a private chat keeps the id it
+        // had (then its time came in as its "text").
+        const legacySrc = (sel) => ownEl(node.querySelector(sel))?.src || '';
+        const fingerprintImg = ownEl(safeAll(node, 'img').find((el) => !isAnimojiStandIn(el)) || null);
+        const fingerprintMediaUrl = (fingerprintImg?.src || '') || legacySrc('audio')
+          || legacySrc('video') || legacySrc('source[type="video"], source[type="webm"]') || legacyDocumentLink?.href || '';
+        const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
+        // An uncaptioned file is known by its name too: by its time alone, a
+        // file sent at the same minute of another day was taken for it.
+        const fallbackId = [author, time, fingerprintText || (fileCard ? documentFileName : ''), fingerprintMediaUrl].filter(Boolean).join('|');
+        const rawId = explicitId || fallbackId || `visible-${index}`;
+        // The id this bubble had before the time was part of it — for finding
+        // messages recorded under it (see BridgeService.adoptLegacyId).
+        const legacyRawId = explicitId || [author, legacyTime, legacyFingerprintText, fingerprintMediaUrl].filter(Boolean).join('|') || `visible-${index}`;
+        const outgoing = Boolean(
+          node.closest('[data-outgoing="true"], .outgoing, .message-out')
+          || node.closest('[data-bubbles-variant="outgoing"]')
+          || node.parentElement?.getAttribute('data-bubbles-variant') === 'outgoing'
+        );
+
+        // Reactions (emoji, how many, whether one of them is ours), for the
+        // bridge to mirror into Telegram. A chip whose emoji cannot be read
+        // (an animoji still drawn on a canvas) is only counted as unknown.
+        const chips = reactionChipsOf(node, replyLink).map(chipInfo);
+        const reactions = chips.filter((chip) => chip.emoji);
+        const reactionsUnknown = chips.length > reactions.length;
+
+        const stickerEl = ownEl(node.querySelector('[class*="sticker"], [class*="Sticker"], [data-testid*="sticker"], [class*="emoji-big"], [class*="animatedEmoji"]'));
+        // The weak voice signals ("wave"/"duration") also match some text
+        // bubbles, so they only mean "voice" when the bubble has no real text.
+        // roundVideoEl (videoMessage/videoCanvas/roundVideo) and audioUrl are
+        // specific enough to trust on their own — a video note may carry a
+        // duration/label in its text, and must still be detected as a video note.
+        const hasText = Boolean(text);
+        let type = 'text';
+        if (stickerEl) type = 'sticker';
+        else if (imageUrl) type = 'photo';
+        else if (roundVideoEl) type = 'video_note';
+        else if (audioUrl) type = 'voice';
+        else if ((voiceEl || hasDuration) && !hasText) type = 'voice';
+        else if (videoUrl) type = 'video';
+        else if (documentUrl || hasDocumentElement) type = 'document';
+        else if (canvasEl) {
+          const cw = canvasEl.width || 0;
+          const ch = canvasEl.height || 0;
+          if (cw > 40 && ch > 40) {
+            type = 'sticker';
+          }
+        }
+
+        // For stickers: if there's an img inside the sticker element, use it as mediaUrl
+        const stickerImgUrl = (type === 'sticker' && imgEl?.src && !imgEl.src.startsWith('data:')) ? imgEl.src : '';
+        const stickerIndex = (type === 'sticker' && !mediaUrl && !stickerImgUrl) ? index : -1;
+        const rect = node.getBoundingClientRect();
+
+        return {
+          rawId,
+          legacyRawId,
+          text,
+          author,
+          sender,
+          time,
+          outgoing,
+          mediaUrl: stickerImgUrl || mediaUrl,
+          type,
+          stickerIndex,
+          hasVoiceElement: Boolean(voiceEl),
+          hasRoundVideoElement: Boolean(roundVideoEl),
+          hasDuration,
+          // Needed outside the page context to index document bubbles in DOM
+          // order the same way triggerDocumentDownload does (see readMessages).
+          hasDocumentElement,
+          documentFileName,
+          documentSize,
+          documentUnavailable,
+          replyToAuthor,
+          replyToSnippet,
+          replyToHasMedia,
+          replyToMediaUrl,
+          replyLinkPresent: Boolean(replyLink),
+          reactions,
+          reactionsUnknown,
+          box: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+          _htmlSnippet: node.innerHTML.substring(0, 200)
+        };
+      });
+
+      // Bubbles whose content gives them the same id — two "ок" from the same
+      // person in the same minute — are numbered in page order, the first
+      // keeping the plain id. The second used to be dropped as the same
+      // message. Voice messages keep their own "#vN" numbering.
+      const voiceCounts = new Map();
+      const sameCounts = new Map();
+      const legacyVoiceCounts = new Map();
+      const legacySameCounts = new Map();
+      for (const row of rows) {
+        if (row.rawId.startsWith('visible-')) continue;
+        if (!row.outgoing && (row.hasVoiceElement || row.hasRoundVideoElement || row.hasDuration)) {
+          const n = (voiceCounts.get(row.rawId) || 0) + 1;
+          voiceCounts.set(row.rawId, n);
+          if (n > 1) row.rawId = `${row.rawId}#v${n}`;
+          // The old ids numbered voice messages the same way (and nothing else).
+          const legacyN = (legacyVoiceCounts.get(row.legacyRawId) || 0) + 1;
+          legacyVoiceCounts.set(row.legacyRawId, legacyN);
+          if (legacyN > 1) row.legacyRawId = `${row.legacyRawId}#v${legacyN}`;
+          continue;
+        }
+        const key = `${row.outgoing ? 'out' : 'in'}\u0000${row.rawId}`;
+        const n = (sameCounts.get(key) || 0) + 1;
+        sameCounts.set(key, n);
+        if (n > 1) row.rawId = `${row.rawId}#d${n}`;
+        // The previous build numbered its ids the same way.
+        const legacyKey = `${row.outgoing ? 'out' : 'in'}\u0000${row.legacyRawId}`;
+        const legacyN = (legacySameCounts.get(legacyKey) || 0) + 1;
+        legacySameCounts.set(legacyKey, legacyN);
+        if (legacyN > 1) row.legacyRawId = `${row.legacyRawId}#d${legacyN}`;
+      }
+      return rows;
+    }, selectors, DOCUMENT_LINK_FALLBACK_SELECTOR, BUBBLE_DECOR);
   }
 
   // Telegram→MAX replies (v2): after sending our own text message into a MAX
@@ -687,13 +1528,16 @@ export class MaxWebClient {
     if (chatId && this.activeChatId !== chatId) return null;
     const deadline = Date.now() + 3000;
     const pollMs = 300;
-    const expected = String(sentText ?? '').trim();
+    // Whitespace-insensitive: a multi-line message's bubble text comes back
+    // without its line breaks (textContent of separate paragraphs).
+    const expected = withoutWhitespace(sentText);
+    if (!expected) return null;
     try {
       while (Date.now() < deadline) {
         const rows = await this.scrapeMessageRows();
         const outgoingRows = rows.filter((row) => row.outgoing);
         const last = outgoingRows.at(-1);
-        if (last && last.text === expected) {
+        if (last && withoutWhitespace(last.text) === expected) {
           if (last.rawId.startsWith('visible-')) return null;
           return last.rawId;
         }
@@ -706,9 +1550,26 @@ export class MaxWebClient {
     }
   }
 
+  // After a file went out: how to find that bubble again later (a reply or a
+  // reaction to it from Telegram) — by its CDN token, the part of the media
+  // URL that survives MAX re-signing its URLs on every page load. The bubble
+  // shows a local preview until the upload finishes, so this waits for the
+  // token. null when there is none (never an id that would not last).
+  async getLastOutgoingMediaFingerprint(chatId, { timeoutMs = 5000 } = {}) {
+    if (chatId && this.activeChatId !== chatId) return null;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const rows = await this.scrapeMessageRows().catch(() => []);
+      const token = mediaTokenOf(rows.filter((row) => row.outgoing).at(-1)?.mediaUrl);
+      if (token) return `media-token:${token}`;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+    return null;
+  }
+
   async readMessages(chatId, { isKnown = null } = {}) {
     await this.ensurePage();
-    if (chatId && this.activeChatId !== chatId) {
+    if (chatId && (this.activeChatId !== chatId || await this.activeChatMovedOn())) {
       await this.selectChat(chatId);
     }
 
@@ -723,7 +1584,7 @@ export class MaxWebClient {
     const hasNewUnresolvedReply = rawMessages.some((m) => {
       if (m.outgoing || !m.replyLinkPresent || m.replyToMediaUrl || m.replyToSnippet) return false;
       const id = stableId('max', this.activeChatId || chatId, m.rawId);
-      return !isKnown || !isKnown(id);
+      return !isKnown || !isKnown(id, m.rawId, m.legacyRawId !== m.rawId ? m.legacyRawId : undefined);
     });
     if (hasNewUnresolvedReply) {
       await new Promise((resolve) => setTimeout(resolve, 3500));
@@ -732,18 +1593,22 @@ export class MaxWebClient {
 
     logger.trace({ chatId, rawCount: rawMessages.length, selector: selectors.messageItem }, 'readMessages raw');
 
-    // Disambiguate voice messages that share the same rawId (same time, no text/media).
-    // Append #vN suffix so uniqueMessages() doesn't collapse them into one entry.
-    const voiceIdCounts = new Map();
-    for (const msg of rawMessages) {
-      if (msg.outgoing) continue;
-      if (!(msg.hasVoiceElement || msg.hasRoundVideoElement || msg.hasDuration)) continue;
-      if (msg.rawId.startsWith('visible-')) continue;
-      const base = msg.rawId;
-      const n = (voiceIdCounts.get(base) || 0) + 1;
-      voiceIdCounts.set(base, n);
-      if (n > 1) msg.rawId = `${base}#v${n}`;
+    // Bubbles sharing an id are already numbered by scrapeMessageRows ("#vN"
+    // for voice messages, "#dN" otherwise), so uniqueMessages() keeps them all.
+    // A group chat names the sender only on the first bubble of a run of
+    // messages from the same person; the others belong to the last name seen
+    // (our own bubbles end a run).
+    let runSender = '';
+    for (const row of rawMessages) {
+      if (row.outgoing) {
+        runSender = '';
+        continue;
+      }
+      if (row.sender) runSender = row.sender;
+      else row.sender = runSender;
     }
+    // Kept for readReactions, which the bridge calls right after this.
+    this.lastReactionScan = { chatId: this.activeChatId || chatId, at: Date.now(), rows: rawMessages.map(reactionRowOf) };
 
     const stickerIndices = rawMessages
       .filter((m) => m.stickerIndex >= 0)
@@ -772,7 +1637,7 @@ export class MaxWebClient {
       : [];
 
     const filtered = uniqueMessages(rawMessages
-      .filter((message) => !message.outgoing && (message.text || message.mediaUrl || message.type === 'sticker' || message.hasVoiceElement || message.hasRoundVideoElement || message.hasDuration))
+      .filter((message) => !message.outgoing && (message.text || message.mediaUrl || message.type === 'sticker' || message.type === 'document' || message.hasVoiceElement || message.hasRoundVideoElement || message.hasDuration))
       .map((message) => {
         if (message.type === 'sticker' && !message.mediaUrl) {
           const dataIdx = stickerIndices.indexOf(message.stickerIndex);
@@ -807,7 +1672,7 @@ export class MaxWebClient {
     }
 
     if (rawMessages.length > 0 && filtered.length === 0) {
-      await this.captureDiagnostics(`empty-filter-${chatId}`, { throttleMs: 60000 }).catch(() => null);
+      await this.captureDiagnostics(`empty-filter-${chatTag(chatId)}`, { throttleMs: 60000 }).catch(() => null);
       const bubbleHtml = await this.page.evaluate((sel) => {
         const el = document.querySelector(sel);
         return el ? el.innerHTML.substring(0, 3000) : 'not found';
@@ -821,7 +1686,7 @@ export class MaxWebClient {
     }
 
     if (stickerIndices.length > 0) {
-      await this.captureDiagnostics(`sticker-detected-${chatId}`, { throttleMs: 60000 }).catch(() => null);
+      await this.captureDiagnostics(`sticker-detected-${chatTag(chatId)}`, { throttleMs: 60000 }).catch(() => null);
       const stickerHtmls = await this.page.$$eval(selectors.messageItem, (nodes, indices) => {
         return indices.map((idx) => {
           const node = nodes[idx];
@@ -860,18 +1725,37 @@ export class MaxWebClient {
         createdAt: Date.now(),
         metadata: {
           author: message.author,
+          sender: message.sender || undefined,
+          legacyId: message.legacyRawId && message.legacyRawId !== message.rawId ? message.legacyRawId : undefined,
           time: message.time,
           replyToAuthor: message.replyToAuthor || undefined,
           replyToSnippet: message.replyToSnippet || undefined,
           replyToHasMedia: message.replyToHasMedia || undefined,
           replyToMediaUrl: message.replyToMediaUrl || undefined,
-          replyLinkPresent: message.replyLinkPresent || undefined
+          replyLinkPresent: message.replyLinkPresent || undefined,
+          fileSize: message.type === 'document' && message.documentSize ? message.documentSize : undefined,
+          fileUnavailable: message.type === 'document' && message.documentUnavailable ? true : undefined
         }
       }));
 
+    // Whether the bridge already has this message (then nothing is fetched
+    // for it) — told also how far from the newest message it is.
+    const knownMessage = (msg) => Boolean(isKnown
+      && isKnown(msg.id, msg.sourceMessageId, msg.metadata.legacyId, messages.length - 1 - messages.indexOf(msg)));
+
+    const stickerSourceFor = (msg) => filtered.find((f) => (f._stickerDataUrl || f._needsScreenshot)
+      && stableId('max', this.activeChatId || chatId, f.rawId) === msg.id);
+    // Network captures (a Lottie file, a sticker image) cannot be tied to a
+    // particular bubble: with two new stickers at once the newest capture went
+    // to the first one and the next to the second — the animations came out
+    // swapped. They are only used when a single sticker is waiting; otherwise
+    // each sticker is captured from its own canvas.
+    const pendingStickers = messages.filter((msg) => !(knownMessage(msg)) && stickerSourceFor(msg)).length;
+    const networkStickerUsable = pendingStickers <= 1;
+
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId)) continue;
-      const src = filtered.find((f) => (f._stickerDataUrl || f._needsScreenshot) && stableId('max', this.activeChatId || chatId, f.rawId) === msg.id);
+      if (knownMessage(msg)) continue;
+      const src = stickerSourceFor(msg);
       if (!src) continue;
 
       let saved = false;
@@ -880,7 +1764,7 @@ export class MaxWebClient {
       // Strategy 0a (preferred): render the Lottie JSON captured from the network
       // ourselves with lottie-web (reliable in headless) → PNG frames → the
       // bridge encodes a real animated .webm sticker.
-      if (!saved) {
+      if (!saved && networkStickerUsable) {
         let lottie = this.findNetworkLottie();
         if (!lottie?.buffer) {
           // Not intercepted (served from cache) — fetch it from the page.
@@ -934,7 +1818,9 @@ export class MaxWebClient {
           if (buffer.length > 2000) {
             const stickerPath = saveBuffer(this.mediaDir, `sticker-${msg.id}.png`, buffer);
             msg.mediaPath = stickerPath;
-            msg.type = 'photo';
+            // Kept a sticker (not a photo): the bridge sends it as a real
+            // Telegram sticker, transparent, instead of a picture.
+            msg.type = 'sticker';
             saved = true;
             logger.info({ chatId, stickerPath, size: buffer.length }, 'Sticker SAVED from canvas toDataURL');
           } else {
@@ -945,7 +1831,7 @@ export class MaxWebClient {
         }
       }
 
-      if (!saved) {
+      if (!saved && networkStickerUsable) {
         const networkSticker = this.findNetworkSticker();
         logger.debug({ chatId, hasNetworkSticker: Boolean(networkSticker), cacheSize: this.stickerUrls.size }, 'Sticker strategy 2: network intercept');
         if (networkSticker) {
@@ -953,7 +1839,7 @@ export class MaxWebClient {
             const ext = (networkSticker.contentType || '').includes('webp') ? 'webp' : 'png';
             const stickerPath = saveBuffer(this.mediaDir, `sticker-${msg.id}-${Date.now()}.${ext}`, networkSticker.buffer);
             msg.mediaPath = stickerPath;
-            msg.type = 'photo';
+            msg.type = 'sticker';
             saved = true;
             logger.info({ chatId, stickerPath, size: networkSticker.buffer.length, url: networkSticker.url }, 'Sticker SAVED from network');
           } catch (error) {
@@ -965,66 +1851,70 @@ export class MaxWebClient {
       // NOTE: the old "bubble screenshot" strategy was removed — it captured the
       // chat wallpaper behind an unrendered sticker and sent it as a photo.
 
-      if (!saved && src._needsScreenshot) {
+      if (!saved && src._needsScreenshot && src.stickerIndex >= 0) {
+        // The canvas INSIDE this sticker's bubble. `${messageItem} canvas`
+        // only appended " canvas" to the last selector of the list, so it
+        // matched every bubble — and the screenshot taken was of the chat's
+        // first bubble, whatever text it held.
+        let bubbles = [];
+        let canvas = null;
         try {
-          const selector = `${selectors.messageItem} canvas`;
-          const elements = await this.page.$$(selector);
-          const stickerIdx = stickerIndices.indexOf(src.stickerIndex);
-          const el = elements[stickerIdx];
-          logger.debug({ chatId, hasCanvasEl: Boolean(el), canvasCount: elements.length }, 'Sticker strategy: canvas element screenshot');
-          if (el) {
-            const screenshotBuffer = await el.screenshot({ type: 'png' });
+          bubbles = await this.page.$$(selectors.messageItem);
+          canvas = await bubbles[src.stickerIndex]?.$('canvas');
+          logger.debug({ chatId, hasCanvasEl: Boolean(canvas), stickerIndex: src.stickerIndex }, 'Sticker strategy: canvas element screenshot');
+          if (canvas) {
+            const screenshotBuffer = await canvas.screenshot({ type: 'png', omitBackground: true });
             if (screenshotBuffer && screenshotBuffer.length > 2000) {
               const stickerPath = saveBuffer(this.mediaDir, `sticker-${msg.id}.png`, screenshotBuffer);
               msg.mediaPath = stickerPath;
-              msg.type = 'photo';
+              msg.type = 'sticker';
               saved = true;
               logger.info({ chatId, stickerPath, size: screenshotBuffer.length }, 'Sticker SAVED via canvas screenshot');
             }
           }
         } catch (error) {
           logger.warn({ err: error, chatId }, 'Failed to screenshot sticker canvas');
+        } finally {
+          await disposeHandles(canvas, bubbles);
         }
       }
 
       if (!saved) {
-        msg.text = '[Sticker]';
+        msg.text = '[Стикер]';
         msg.type = 'text';
-        logger.info({ chatId, msgId: msg.id }, 'Sticker could not be captured — sent as [Sticker] text');
+        logger.info({ chatId, msgId: msg.id }, 'Sticker could not be captured — sent as [Стикер] text');
       }
     }
 
-    // Position of each voice bubble among the NON-OUTGOING voice bubbles in DOM
-    // order — exactly how triggerVoiceDownload indexes `voiceNodes` inside the
-    // page. This used to be counted inline while walking `messages`, which
-    // incremented for every already-known message of ANY type (text, photo…)
-    // while skipping unknown non-voice ones, so the counter drifted out of sync
-    // with the page: the click landed on a different voice bubble and its audio
-    // was saved onto this message, or the index ran past the end and the real
-    // voice was silently replaced by the '[Voice message]' placeholder.
-    const voiceOrdinalById = new Map();
-    let voiceOrdinal = 0;
-    for (const row of filtered) {
-      if (row.outgoing || !row.hasVoiceElement) continue;
-      voiceOrdinalById.set(stableId('max', this.activeChatId || chatId, row.rawId), voiceOrdinal);
-      voiceOrdinal += 1;
-    }
-
+    // Voice messages, video notes and files are fetched by clicking their own
+    // bubble (see clickInBubble). What MAX loaded before the click cannot be
+    // tied to a bubble, so — as for stickers — it is only used when a single
+    // message of its kind is waiting; otherwise two would swap.
+    const waitingOf = (predicate) => messages.filter((msg) => !msg.mediaPath
+      && !(knownMessage(msg)) && predicate(msg)).length;
+    const rowFor = (msg) => filtered.find((f) => stableId('max', this.activeChatId || chatId, f.rawId) === msg.id) || {};
+    const isVideoNoteRow = (row) => Boolean(row.hasRoundVideoElement || row.type === 'video_note');
+    const waitingVideoNotes = waitingOf((msg) => isVideoNoteRow(rowFor(msg)));
+    const waitingVoices = waitingOf((msg) => {
+      const row = rowFor(msg);
+      return !isVideoNoteRow(row) && Boolean(row.hasVoiceElement || row.type === 'voice');
+    });
+    const waitingDocuments = waitingOf((msg) => msg.type === 'document' && !msg.mediaUrl);
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId)) continue;
+      if (knownMessage(msg)) continue;
       if (msg.mediaPath) continue;
       if (msg.type !== 'text' && msg.type !== 'voice' && msg.type !== 'video_note') continue;
 
       const src = filtered.find((f) => (f.hasVoiceElement || f.hasRoundVideoElement || f.hasDuration) && stableId('max', this.activeChatId || chatId, f.rawId) === msg.id);
       if (!src) continue;
 
-      const msgIsKnown = isKnown && isKnown(msg.id, msg.sourceMessageId);
+      const msgIsKnown = knownMessage(msg);
 
       if (src.hasRoundVideoElement || src.type === 'video_note') {
         if (msgIsKnown) continue;
-        let networkVideo = this.findNetworkVideo();
+        let networkVideo = waitingVideoNotes === 1 ? this.findNetworkVideo() : null;
         if (!networkVideo) {
-          networkVideo = await this.triggerVideoNoteDownload(chatId);
+          networkVideo = await this.triggerVideoNoteDownload(chatId, src.rawId);
         }
         if (networkVideo) {
           try {
@@ -1036,18 +1926,19 @@ export class MaxWebClient {
             logger.debug({ chatId, videoPath, size: networkVideo.buffer.length, contentType: networkVideo.contentType }, 'Saved video note from network');
           } catch (error) {
             logger.warn({ err: error, chatId }, 'Failed to save network video note');
-            msg.text = '[Video note]';
+            msg.text = VIDEO_NOTE_MISSING;
+            msg.metadata.fileCaptureFailed = true;
           }
         } else {
-          msg.text = '[Video note]';
+          // Tried again on the next reads before this text goes out.
+          msg.text = VIDEO_NOTE_MISSING;
+          msg.metadata.fileCaptureFailed = true;
         }
       } else if (src.hasVoiceElement || src.type === 'voice') {
         if (msgIsKnown) continue;
-        let networkVoice = this.findNetworkVoice();
+        let networkVoice = waitingVoices === 1 ? this.findNetworkVoice() : null;
         if (!networkVoice) {
-          // Ordinal comes from the DOM-order map built above, so it always
-          // refers to this exact bubble regardless of what else was skipped.
-          networkVoice = await this.triggerVoiceDownload(src, chatId, voiceOrdinalById.get(msg.id) ?? 0);
+          networkVoice = await this.triggerVoiceDownload(src, chatId);
         }
         if (networkVoice) {
           try {
@@ -1063,64 +1954,70 @@ export class MaxWebClient {
             logger.debug({ chatId, voicePath, size: networkVoice.buffer.length, contentType: networkVoice.contentType }, 'Saved voice from network');
           } catch (error) {
             logger.warn({ err: error, chatId }, 'Failed to save network voice');
-            msg.text = '[Voice message]';
+            msg.text = VOICE_MISSING;
+            msg.metadata.fileCaptureFailed = true;
           }
         } else {
-          msg.text = '[Voice message]';
+          // Tried again on the next reads before this text goes out.
+          msg.text = VOICE_MISSING;
+          msg.metadata.fileCaptureFailed = true;
         }
       }
     }
 
-    // Handle documents (PDFs, etc.)
-    // Same DOM-order indexing as voice above: triggerDocumentDownload indexes
-    // non-outgoing document bubbles inside the page, so counting inline while
-    // walking `messages` (which incremented for known messages of any type)
-    // pointed the click at the wrong file — or none — and attached the wrong
-    // attachment to this message.
-    const docOrdinalById = new Map();
-    let docOrdinal = 0;
-    for (const row of filtered) {
-      if (row.outgoing || !row.hasDocumentElement) continue;
-      // triggerDocumentDownload skips voice/round-video bubbles before building
-      // its docNodes list, so mirror that here or the ordinals drift apart.
-      if (row.hasVoiceElement || row.hasRoundVideoElement) continue;
-      docOrdinalById.set(stableId('max', this.activeChatId || chatId, row.rawId), docOrdinal);
-      docOrdinal += 1;
-    }
-
+    // Handle documents (PDFs, etc.): fetched by clicking their own bubble
+    // (see clickInBubble).
     for (const msg of messages) {
-      if (isKnown && isKnown(msg.id, msg.sourceMessageId)) continue;
+      if (knownMessage(msg)) continue;
       if (msg.mediaPath) continue;
       if (msg.type !== 'document') continue;
-
-      const msgIsKnown = isKnown && isKnown(msg.id, msg.sourceMessageId);
-      if (msgIsKnown) continue;
-      const docIndex = docOrdinalById.get(msg.id) ?? 0;
 
       if (msg.mediaUrl) {
         // Document has a direct download URL — use it
         msg.mediaPath = msg.mediaUrl;
+      } else if (msg.metadata.fileUnavailable) {
+        // Deleted in MAX: there is nothing to download (the bridge says so).
+      } else if (msg.metadata.fileSize > MAX_DOCUMENT_BYTES) {
+        // Not downloaded at all: the bridge could not deliver it, and the
+        // browser would have filled the disk with it and the bridge its
+        // memory. The bridge sends a notice instead.
+        msg.metadata.fileTooBig = true;
       } else {
         // Need to trigger click to download
-        let networkDoc = this.findNetworkDocument();
+        let networkDoc = waitingDocuments === 1 ? this.findNetworkDocument() : null;
         if (!networkDoc) {
-          networkDoc = await this.triggerDocumentDownload(chatId, docIndex);
+          networkDoc = await this.triggerDocumentDownload(chatId, msg.sourceMessageId);
         }
-        if (networkDoc) {
+        if (networkDoc?.tooBig) {
+          msg.metadata.fileTooBig = true;
+          msg.metadata.fileSize = networkDoc.bytes;
+        } else if (networkDoc) {
           try {
-            const originalName = networkDoc.originalName || msg.originalFilename || '';
+            // The name MAX shows on the card first: a file downloaded again
+            // after a failed try comes out of the browser as "name (1).pdf".
+            const cardName = msg.originalFilename || '';
+            const downloadedExt = path.extname(networkDoc.originalName || '');
+            const originalName = cardName
+              ? (path.extname(cardName) || !downloadedExt ? cardName : `${cardName}${downloadedExt}`)
+              : (networkDoc.originalName || '');
             const ext = originalName ? path.extname(originalName) : this.guessDocExtension(networkDoc.contentType, networkDoc.url);
-            const filename = originalName ? safeName(originalName, 200) : `doc-${msg.id}${ext}`;
-            const docPath = saveBuffer(this.mediaDir, filename, networkDoc.buffer);
+            // A directory per message: named straight into mediaDir, two
+            // documents with the same name (or any two Cyrillic names, which
+            // the old ASCII-only sanitizer reduced to "_.pdf") read in one
+            // poll overwrote each other before either was forwarded.
+            const filename = originalName ? safeDisplayName(originalName) : `document${ext}`;
+            const docPath = saveBuffer(path.join(this.mediaDir, `doc-${msg.id}`), filename, networkDoc.buffer);
             msg.mediaPath = docPath;
             msg.originalFilename = originalName || filename;
             logger.debug({ chatId, docPath, originalName: msg.originalFilename, size: networkDoc.buffer.length, contentType: networkDoc.contentType }, 'Saved document from network');
           } catch (error) {
             logger.warn({ err: error, chatId }, 'Failed to save network document');
-            msg.text = msg.text || '[Document]';
+            msg.metadata.fileCaptureFailed = true;
           }
         } else {
-          msg.text = msg.text || '[Document]';
+          // Tried again on the next reads; after that the bridge says it could
+          // not fetch the file (it used to go out as the text "[Document]").
+          msg.metadata.fileCaptureFailed = true;
         }
       }
     }
@@ -1158,54 +2055,26 @@ export class MaxWebClient {
   // src can lazy-swap resolution (fn=w_180 -> fn=w_1280) between when it was
   // first read and when we search for it again — the token stays stable.
   async findAndHoverMessage(fingerprint) {
-    const selectors = this.selectors;
+    // The unstable index fallback can never be found again (see scrapeMessageRows).
+    if (!fingerprint || fingerprint.startsWith('visible-')) return null;
     const maxScrollAttempts = 8;
     const mediaTokenPrefix = 'media-token:';
     const mediaToken = fingerprint.startsWith(mediaTokenPrefix) ? fingerprint.slice(mediaTokenPrefix.length) : null;
     for (let attempt = 0; attempt <= maxScrollAttempts; attempt++) {
-      const box = await this.page.evaluate((sel, innerSelectors, target, tokenTarget, docLinkFallbackSelector) => {
-        const extractToken = (url) => {
-          const m = /[?&]r=([^&]+)/.exec(url || '');
-          return m ? m[1] : null;
-        };
-        const nodes = [...document.querySelectorAll(sel)];
-        for (let i = nodes.length - 1; i >= 0; i--) {
-          const node = nodes[i];
-          const bubbleContent = node.querySelector('.bubbleContent') || node;
-          const replyLink = bubbleContent.querySelector(':scope > .link') || node.querySelector('.bubbleContent > .link');
-          let textEl = bubbleContent.querySelector(':scope > .text') || bubbleContent.querySelector(':scope > [data-lexical-text]');
-          if (replyLink && textEl && replyLink.contains(textEl)) textEl = null;
-          const text = (textEl ? textEl.textContent : (node.querySelector(innerSelectors.messageText)?.textContent || '')).trim();
-          const author = node.querySelector(innerSelectors.messageAuthor)?.textContent?.trim() || '';
-          const timeNode = node.querySelector(innerSelectors.messageTime);
-          const time = timeNode?.getAttribute('aria-label') || timeNode?.textContent?.trim() || '';
-          const ownEl = (el) => (el && replyLink && replyLink.contains(el)) ? null : el;
-          const imgEl = ownEl(node.querySelector('img'));
-          const audioEl = ownEl(node.querySelector('audio'));
-          const videoEl = ownEl(node.querySelector('video'));
-          const sourceEl = ownEl(node.querySelector('source[type="video"], source[type="webm"]'));
-          const documentLink = ownEl(node.querySelector(innerSelectors.messageDocument))
-            || ownEl(node.querySelector(docLinkFallbackSelector));
-          const mediaUrl = imgEl?.src || audioEl?.src || videoEl?.src || sourceEl?.src || documentLink?.href || '';
-
-          if (tokenTarget) {
-            if (mediaUrl && extractToken(mediaUrl) === tokenTarget) {
-              const r = node.getBoundingClientRect();
-              return { x: r.x, y: r.y, w: r.width, h: r.height };
-            }
-            continue;
-          }
-
-          const explicitId = node.getAttribute('data-message-id') || node.getAttribute('data-id') || node.id || '';
-          const fallbackId = [author, time, text, mediaUrl].filter(Boolean).join('|');
-          const rawId = explicitId || fallbackId;
-          if (rawId && rawId === target) {
-            const r = node.getBoundingClientRect();
-            return { x: r.x, y: r.y, w: r.width, h: r.height };
-          }
-        }
-        return null;
-      }, selectors.messageItem, selectors, fingerprint, mediaToken, DOCUMENT_LINK_FALLBACK_SELECTOR);
+      // The same scrape readMessages uses, so a bubble is found under exactly
+      // the id it was given (numbering of identical bubbles included) — the
+      // two used to compute it separately and drift apart.
+      const rows = await this.scrapeMessageRows();
+      const exact = [...rows].reverse().find((candidate) => (mediaToken
+        ? mediaTokenOf(candidate.mediaUrl) === mediaToken
+        : candidate.rawId === fingerprint));
+      // A fingerprint stored before the time was part of ids is a bubble's
+      // legacy id — which every repeat of the text shares, so only a bubble
+      // alone with it on screen is taken (no quote rather than a wrong one).
+      const legacy = (exact || mediaToken) ? [] : rows.filter((candidate) => candidate.legacyRawId === fingerprint);
+      if (legacy.length > 1) return null;
+      const row = exact || legacy[0];
+      const box = row?.box;
 
       if (box) {
         const cx = box.x + box.w / 2;
@@ -1236,13 +2105,14 @@ export class MaxWebClient {
   // silently engaging reply mode on it instead.
   async replyToMessage(fingerprint) {
     if (!fingerprint) return false;
+    let candidates = [];
     try {
       const box = await this.findAndHoverMessage(fingerprint);
       if (!box) {
         logger.warn({ fingerprint }, 'replyToMessage: target bubble not found');
         return false;
       }
-      const candidates = await this.page.$$(this.selectors.messageReplyButton);
+      candidates = await this.page.$$(this.selectors.messageReplyButton);
       if (!candidates.length) {
         logger.warn({ fingerprint }, 'replyToMessage: Reply button not present after hover');
         return false;
@@ -1261,16 +2131,250 @@ export class MaxWebClient {
         return false;
       }
       await matches[0].click();
-      await this.page.waitForSelector(this.selectors.composerReplyActive, { timeout: 3000, visible: true });
+      await this.waitForSelectorFree(this.selectors.composerReplyActive, { timeout: 3000, visible: true });
       return true;
     } catch (error) {
       logger.warn({ err: error, fingerprint }, 'replyToMessage: failed to engage reply mode');
       return false;
+    } finally {
+      await disposeHandles(candidates);
     }
+  }
+
+  // Reactions of the bubbles on screen in the active chat, for the bridge to
+  // mirror into Telegram: [{ rawId, outgoing, reactions: [{ emoji, count,
+  // active }], reactionsUnknown }] (active = one of them is ours). Reuses what
+  // the last readMessages of this chat scraped moments ago, so a poll does not
+  // scrape twice. Bubbles whose id is not unique on screen are left out — they
+  // cannot be told apart. null when another chat is open.
+  async readReactions(chatId, { maxAgeMs = REACTION_SCAN_MAX_AGE_MS } = {}) {
+    if (!this.page || !chatId || this.activeChatId !== chatId) return null;
+    const cached = this.lastReactionScan;
+    const rows = cached && cached.chatId === chatId && Date.now() - cached.at <= maxAgeMs
+      ? cached.rows
+      : (await this.scrapeMessageRows()).map(reactionRowOf);
+    const counts = new Map();
+    for (const row of rows) counts.set(row.rawId, (counts.get(row.rawId) || 0) + 1);
+    return rows.filter((row) => !row.rawId.startsWith('visible-') && counts.get(row.rawId) === 1);
+  }
+
+  // Sets the owner's reaction on a MAX bubble to `emoji`, or takes it back
+  // (emoji null). MAX keeps one reaction of your own per message; choosing
+  // another replaces it. The ways, in order: a chip under the bubble already
+  // shows that emoji (clicking it toggles ours); otherwise the message menu —
+  // right click, or the "Message actions" button — whose top row lists the
+  // reactions, expanded when the emoji is not among the first ones.
+  // Resolves to { ok, changed, reason, available }; never throws for a
+  // missing button or emoji, only for a broken page.
+  async reactToMessage(chatId, fingerprint, emoji) {
+    await this.ensureActiveChat(chatId);
+    // A reaction, or several acceptable ones, best first; none = take back.
+    const candidates = (Array.isArray(emoji) ? emoji : [emoji]).map(normalizeEmojiInPage).filter(Boolean);
+    const wanted = candidates.length ? candidates : null;
+    try {
+      const found = await this.findAndHoverMessage(fingerprint);
+      if (!found) return { ok: false, reason: 'message-not-found' };
+      const box = await this.revealBubble(found);
+      const viewport = this.page.viewport() || { width: 1440, height: 980 };
+      const onScreen = (chip) => Boolean(chip) && chip.x > 0 && chip.y > 0 && chip.x < viewport.width && chip.y < viewport.height;
+      const chips = await this.reactionChipsAt(box);
+      const own = chips.find((chip) => chip.active);
+      if (!wanted) {
+        if (!own) return { ok: true, changed: false };
+        if (!onScreen(own)) return await this.pickReactionFromMenu(box, null);
+        await this.page.mouse.click(own.x, own.y);
+        return { ok: true, changed: true };
+      }
+      if (own && wanted.includes(normalizeEmojiInPage(own.emoji))) return { ok: true, changed: false, emoji: own.emoji };
+      for (const candidate of wanted) {
+        const existing = chips.find((chip) => normalizeEmojiInPage(chip.emoji) === candidate);
+        if (onScreen(existing)) {
+          await this.page.mouse.click(existing.x, existing.y);
+          return { ok: true, changed: true, emoji: existing.emoji };
+        }
+      }
+      return await this.pickReactionFromMenu(box, wanted);
+    } finally {
+      await this.closeMessageMenu();
+      await this.scrollMessageListToBottom();
+    }
+  }
+
+  // Brings the bubble at `box` (as findAndHoverMessage returned it) to the
+  // middle of the message list — its reaction chips sit below it — and
+  // hovers it again. Returns where it is now.
+  async revealBubble(box) {
+    const moved = await this.page.evaluate((sel, area) => {
+      const node = [...document.querySelectorAll(sel)].find((el) => {
+        const rect = el.getBoundingClientRect();
+        return Math.abs(rect.x - area.x) < 4 && Math.abs(rect.y - area.y) < 4 && Math.abs(rect.height - area.h) < 4;
+      });
+      if (!node) return null;
+      node.scrollIntoView({ block: 'center', inline: 'nearest' });
+      const rect = node.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+    }, this.selectors.messageItem, box).catch(() => null);
+    if (!moved) return box;
+    await this.page.mouse.move(moved.x + moved.w / 2, moved.y + Math.min(moved.h / 2, 24), { steps: 4 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return moved;
+  }
+
+  // The reaction chips of the bubble at `box`, with where to click them.
+  async reactionChipsAt(box) {
+    const rows = await this.scrapeMessageRows();
+    const row = rows.find((candidate) => candidate.box
+      && Math.abs(candidate.box.x - box.x) < 4 && Math.abs(candidate.box.y - box.y) < 4
+      && Math.abs(candidate.box.h - box.h) < 4);
+    return row?.reactions || [];
+  }
+
+  // Opens the bubble's message menu and picks the first of `wanted` its
+  // reaction row has (null: takes back the one marked as ours).
+  async pickReactionFromMenu(box, wanted) {
+    if (!await this.openMessageMenu(box)) {
+      logger.warn('reactToMessage: the message menu did not open');
+      await this.captureDiagnostics('reaction-no-menu', { throttleMs: 10 * 60 * 1000 }).catch(() => null);
+      return { ok: false, reason: 'menu-not-found' };
+    }
+    let picked = await this.clickReactionOption(wanted);
+    if (!picked.found && wanted && await this.clickFirstVisible(this.selectors.reactionExpand)) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      picked = await this.clickReactionOption(wanted);
+    }
+    if (picked.found) return { ok: true, changed: picked.clicked, emoji: picked.emoji };
+    if (!picked.available.length) {
+      await this.captureDiagnostics('reaction-no-options', { throttleMs: 10 * 60 * 1000 }).catch(() => null);
+      return { ok: false, reason: 'no-reactions-in-menu', available: [] };
+    }
+    return { ok: false, reason: 'emoji-not-available', available: picked.available };
+  }
+
+  // Right click on the bubble (MAX opens its message menu on contextmenu),
+  // else its "Message actions" button. True once the menu's reactions show.
+  async openMessageMenu(box) {
+    const cx = box.x + box.w / 2;
+    const cy = box.y + Math.min(box.h / 2, 24);
+    await this.page.mouse.click(cx, cy, { button: 'right' });
+    if (await this.waitForVisible(this.selectors.reactionOption, 1500)) return true;
+    await this.closeMessageMenu();
+    await this.page.mouse.move(cx, cy);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const clicked = await this.page.evaluate((sel, area) => {
+      try {
+        const top = area.y - 40;
+        const bottom = area.y + area.h + 40;
+        const button = [...document.querySelectorAll(sel)].find((el) => {
+          const rect = el.getBoundingClientRect();
+          const centerY = rect.y + rect.height / 2;
+          return rect.width > 0 && centerY >= top && centerY <= bottom;
+        });
+        if (!button) return false;
+        button.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }, this.selectors.messageActionsButton, box).catch(() => false);
+    return clicked && this.waitForVisible(this.selectors.reactionOption, 1500);
+  }
+
+  // Clicks the first of the reactions `wanted` the open menu has — unless it
+  // is already ours (clicking would take it back); with wanted null, clicks
+  // the one that is ours. In the page, so it works wherever MAX placed the
+  // menu. Resolves to { found, clicked, emoji, available }.
+  async clickReactionOption(wanted) {
+    return this.page.evaluate((sel, target) => {
+      const pictographic = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20E3/u;
+      const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+      const emojiIn = (value) => (segmenter ? [...segmenter.segment(value || '')].map((part) => part.segment) : Array.from(value || ''))
+        .filter((grapheme) => pictographic.test(grapheme));
+      const normalize = (value) => String(value || '').replace(/[\uFE0E\uFE0F]/gu, '').replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
+      let elements = [];
+      try {
+        elements = [...document.querySelectorAll(sel)];
+      } catch {
+        return { found: false, clicked: false, available: [] };
+      }
+      const options = elements.map((el) => {
+        const rect = el.getBoundingClientRect();
+        if (!rect.width || !rect.height) return null;
+        const labels = [...el.querySelectorAll('[data-lexical-animoji-emoji], [data-lexical-emoji], img[alt]')]
+          .map((node) => node.getAttribute('data-lexical-animoji-emoji') || node.getAttribute('data-lexical-emoji') || node.getAttribute('alt') || '');
+        const emoji = [...labels, el.getAttribute('aria-label') || '', el.getAttribute('title') || '', el.textContent || ''].flatMap(emojiIn)[0] || null;
+        const active = /(^|\s)[\w-]*--active(\s|$)/.test(el.getAttribute('class') || '') || el.getAttribute('aria-pressed') === 'true';
+        return { el, emoji, active };
+      }).filter(Boolean);
+      const available = [...new Set(options.map((option) => option.emoji).filter(Boolean))];
+      if (target === null) {
+        const ours = options.find((option) => option.active);
+        if (ours) ours.el.click();
+        return { found: options.length > 0, clicked: Boolean(ours), available };
+      }
+      const option = target.map((wanted) => options.find((candidate) => normalize(candidate.emoji) === wanted)).find(Boolean);
+      if (!option) return { found: false, clicked: false, available };
+      if (!option.active) option.el.click();
+      return { found: true, clicked: !option.active, emoji: option.emoji, available };
+    }, this.selectors.reactionOption, wanted).catch(() => ({ found: false, clicked: false, available: [] }));
+  }
+
+  async waitForVisible(selector, timeoutMs) {
+    if (!selector) return false;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const visible = await this.page.evaluate((sel) => {
+        try {
+          return [...document.querySelectorAll(sel)].some((el) => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          });
+        } catch {
+          return false;
+        }
+      }, selector).catch(() => false);
+      if (visible) return true;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return false;
+  }
+
+  async clickFirstVisible(selector) {
+    if (!selector) return false;
+    return this.page.evaluate((sel) => {
+      try {
+        const element = [...document.querySelectorAll(sel)].find((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+        if (!element) return false;
+        element.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }, selector).catch(() => false);
+  }
+
+  // Escape closes an open menu — but with no menu open, MAX takes it as
+  // "close this chat". So only when a menu is actually showing.
+  async closeMessageMenu() {
+    if (!this.page) return;
+    const open = await this.page.evaluate((sel) => {
+      try {
+        return [...document.querySelectorAll(sel)].some((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+      } catch {
+        return false;
+      }
+    }, this.selectors.messageMenu || '[role="menu"]').catch(() => false);
+    if (open) await this.page.keyboard.press('Escape').catch(() => {});
   }
 
   async sendText(chatId, text, replyToFingerprint = null) {
     await this.ensureActiveChat(chatId);
+    await this.clearComposer();
     if (replyToFingerprint) {
       const replied = await this.replyToMessage(replyToFingerprint);
       logger.debug({ chatId, replyToFingerprint, replied }, 'sendText: reply engagement result');
@@ -1285,15 +2389,17 @@ export class MaxWebClient {
     // below restores scroll-to-bottom on every exit path (success or throw),
     // not just the happy path — see Fix 1 in the reply-feature review.
     try {
-      await this.page.waitForSelector(this.selectors.composer, { timeout: 30000 });
+      await this.waitForSelectorFree(this.selectors.composer, { timeout: 30000 });
       await this.page.focus(this.selectors.composer);
-      const typeTimeout = this.config.protocolTimeoutMs || 60000;
-      await Promise.race([
-        this.page.keyboard.type(text, { delay: 1 }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Typing timeout')), typeTimeout))
-      ]);
+      await this.typeIntoComposer(text, { timeoutMs: this.config.protocolTimeoutMs || 60000 });
       await this.submitComposer();
+      await this.checkFirstMessageAccepted(chatId);
     } catch (error) {
+      // Whatever was typed stays in the composer as the chat's draft and went
+      // out together with the next message into this chat.
+      await this.clearComposer().catch((clearError) => {
+        logger.warn({ err: clearError, chatId }, 'sendText: could not clear the composer after a failed send');
+      });
       if (replyToFingerprint) {
         // A throw anywhere after reply mode was engaged would otherwise leave
         // the shared composer stuck in reply-to-X mode forever — there is no
@@ -1301,8 +2407,7 @@ export class MaxWebClient {
         // sent (to any chat) would silently become a wrong-target reply.
         // Best-effort cancel; never let a failure here mask the real error.
         try {
-          const closeBtn = await this.page.$(this.selectors.composerReplyActive);
-          if (closeBtn) await closeBtn.click();
+          await this.clickSelector(this.selectors.composerReplyActive);
         } catch (cancelError) {
           logger.warn({ err: cancelError, chatId }, 'sendText: failed to cancel reply mode after send failure');
         }
@@ -1315,8 +2420,64 @@ export class MaxWebClient {
     }
   }
 
-  async sendFile(chatId, filePath, caption = '') {
+  // Empties the composer. MAX keeps whatever is typed as the chat's draft, so
+  // the remains of a send that failed half-way used to be sent along with the
+  // next message into that chat (or as the caption of the next file).
+  async clearComposer() {
+    const hasContent = await this.page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return Boolean(el && ((el.textContent || '').trim() || el.querySelector('img, [data-lexical-decorator]')));
+    }, this.selectors.composer).catch(() => false);
+    if (!hasContent) return;
+    await this.page.focus(this.selectors.composer);
+    const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+    await this.page.keyboard.down(modifier);
+    try {
+      await this.page.keyboard.press('KeyA');
+    } finally {
+      await this.page.keyboard.up(modifier);
+    }
+    await this.page.keyboard.press('Backspace');
+    logger.info('Cleared text left over in the MAX composer');
+  }
+
+  // Types a message into the focused composer. Puppeteer's keyboard.type maps
+  // "\n" to the Enter key, and Enter SENDS in MAX's composer — typing a
+  // multi-line message used to fire one partial message per line (only the
+  // first carrying the reply quote). Line breaks are Shift+Enter instead, and
+  // tabs become spaces (Tab would move focus out of the composer, and the rest
+  // of the text would be typed into some other element).
+  //
+  // Typed in chunks with the deadline checked in between, so a timeout really
+  // stops the typing: racing one long type() against a timer only rejected
+  // the caller while the keystrokes kept flowing into the page after the lock
+  // had been released.
+  async typeIntoComposer(text, { timeoutMs = 60000, chunkSize = 200 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    const lines = String(text ?? '').replace(/\t/g, '    ').split(/\r\n|\r|\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        await this.page.keyboard.down('Shift');
+        try {
+          await this.page.keyboard.press('Enter');
+        } finally {
+          await this.page.keyboard.up('Shift');
+        }
+      }
+      const chars = Array.from(lines[i]);
+      for (let start = 0; start < chars.length; start += chunkSize) {
+        if (Date.now() > deadline) throw new Error('Typing timeout');
+        await this.page.keyboard.type(chars.slice(start, start + chunkSize).join(''), { delay: 1 });
+      }
+    }
+  }
+
+  // Sends the file alone: MAX's attach flow has no caption the bridge fills
+  // in, so the bridge sends a caption as a separate text message.
+  async sendFile(chatId, filePath) {
     await this.ensureActiveChat(chatId);
+    // Text left in the composer would go out as the file's caption.
+    await this.clearComposer();
 
     const absolutePath = path.resolve(filePath);
 
@@ -1326,18 +2487,16 @@ export class MaxWebClient {
     // else). Setting the input directly does nothing, so we drive the menu.
     const isImageOrVideo = /\.(jpe?g|png|gif|webp|bmp|heic|heif|mp4|webm|mov|m4v|mkv)$/i.test(absolutePath);
     const menuItemSel = isImageOrVideo ? this.selectors.attachMenuMedia : this.selectors.attachMenuFile;
-    const attachBtn = await this.page.$(this.selectors.attachButton);
-    if (!attachBtn) throw new Error(`sendFile: attach button not found (${this.selectors.attachButton})`);
-    await attachBtn.click();
-    await this.page.waitForSelector(menuItemSel, { timeout: 10000 });
+    if (!await this.clickSelector(this.selectors.attachButton)) {
+      throw new Error(`sendFile: attach button not found (${this.selectors.attachButton})`);
+    }
+    await this.waitForSelectorFree(menuItemSel, { timeout: 10000 });
     const [fileChooser] = await Promise.all([
       this.page.waitForFileChooser({ timeout: 15000 }),
       this.page.click(menuItemSel)
     ]);
     await fileChooser.accept([absolutePath]);
     logger.debug({ chatId, filePath: absolutePath }, 'File accepted via attach menu');
-
-    await this.captureDiagnostics('after-file-accept').catch(() => null);
 
     // --- Step 2: wait for evidence the attachment is staged in the composer ---
     // Poll up to 10 s for a preview/thumbnail element that appears after accept.
@@ -1371,10 +2530,7 @@ export class MaxWebClient {
     ).catch(() => 0);
 
     // --- Step 4: click send button (or fall back to Enter) ---
-    const sendBtn = await this.page.$(this.selectors.sendButton);
-    if (sendBtn) {
-      await sendBtn.click();
-    } else {
+    if (!await this.clickSelector(this.selectors.sendButton)) {
       await this.page.keyboard.press('Enter');
     }
 
@@ -1395,19 +2551,42 @@ export class MaxWebClient {
       await new Promise((r) => setTimeout(r, sendConfirmPollMs));
     }
 
-    await this.captureDiagnostics('after-send').catch(() => null);
-
     if (!confirmed) {
+      // Only on failure: two full-page screenshots + HTML dumps on EVERY file
+      // send were pure overhead, and pushed the dumps of real failures out of
+      // the retention window.
+      await this.captureDiagnostics('send-not-confirmed').catch(() => null);
       logger.error({ chatId, filePath: absolutePath, outgoingCountBefore, outgoingBubbleSel }, 'sendFile: no new outgoing message bubble detected after send');
       throw new Error(`sendFile: file send not confirmed — no new outgoing bubble appeared (chatId=${chatId}, file=${absolutePath}). Selector may need tuning; check diagnostics.`);
     }
+    await this.checkFirstMessageAccepted(chatId);
 
     logger.debug({ chatId, filePath: absolutePath }, 'Sent file');
   }
 
+  // Chats where someone is typing right now, as MAX's chat list shows it —
+  // "печатает", "Иван записывает аудио"… in place of the last message; the
+  // chat need not be open. [{ chatId, action }], action being the Telegram
+  // chat action for what they are doing.
+  async typingChats() {
+    if (!this.page || this.page.isClosed?.()) return [];
+    const found = await this.page.$$eval(this.selectors.chatItem, (nodes, sel) => nodes.map((node) => {
+      let typing = null;
+      try {
+        typing = node.querySelector(sel.chatTyping);
+      } catch {
+        return null;
+      }
+      if (!typing) return null;
+      const title = node.querySelector(sel.chatTitle)?.textContent?.trim() || '';
+      return title ? { title, label: (typing.textContent || '').replace(/\s+/g, ' ').trim() } : null;
+    }).filter(Boolean), this.selectors).catch(() => []);
+    return found.map(({ title, label }) => ({ chatId: title, action: typingAction(label) }));
+  }
+
   async isTyping() {
     await this.ensurePage();
-    return Boolean(await this.page.$(this.selectors.typing));
+    return this.page.evaluate((selector) => Boolean(document.querySelector(selector)), this.selectors.typing);
   }
 
   async healthCheck() {
@@ -1568,44 +2747,77 @@ export class MaxWebClient {
     });
   }
 
-  async triggerDocumentDownload(chatId, docIndex = 0) {
-    try {
-      const docCountBefore = this.documentUrls.size;
-      const selectors = this.selectors;
-
-      const clicked = await this.page.$$eval(selectors.messageItem, (nodes, innerArgs) => {
-        const docNodes = [];
-        for (let i = 0; i < nodes.length; i++) {
-          const node = nodes[i];
-          if (node.querySelector('.is-outgoing, .outgoing')) continue;
-          // Skip voice/video elements
-          if (node.querySelector('[class*="attachAudio"], [class*="wave"], [class*="roundVideo"], [class*="videoMessage"]')) continue;
-          const docEl = node.querySelector('[class*="fileIcon"], button[aria-label*="качать"], [class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [data-testid*="document"], [data-testid*="file"], a[href][download], a[href*="/file"]');
-          if (!docEl) continue;
-          docNodes.push({ node, docEl });
+  // Clicks the first element matching one of `targets` (tried in order)
+  // inside the bubble read as `rawId`. The bubble is found by the same scrape
+  // that gave it that id — counting bubbles of a kind in the page and in Node
+  // drifted apart (an outgoing bubble is marked on an ancestor, which the
+  // page-side count did not see), and the next file or voice message was
+  // fetched for this one. False when the bubble is gone or has no target.
+  async clickInBubble(rawId, targets) {
+    if (!rawId) return false;
+    const rows = await this.scrapeMessageRows();
+    // Only incoming bubbles are fetched, and ids are numbered per direction:
+    // our own file sent in the same minute may share the id.
+    const index = rows.findIndex((row) => !row.outgoing && row.rawId === rawId);
+    if (index < 0) return false;
+    return this.page.$$eval(this.selectors.messageItem, (nodes, i, box, selectorList) => {
+      const node = nodes[i];
+      if (!node) return false;
+      // The list must not have moved since it was read.
+      const rect = node.getBoundingClientRect();
+      if (box && (Math.abs(rect.x - box.x) > 2 || Math.abs(rect.y - box.y) > 2)) return false;
+      for (const selector of selectorList) {
+        let target = null;
+        try {
+          target = selector ? node.querySelector(selector) : null;
+        } catch {
+          target = null;
         }
-        const target = docNodes[innerArgs.docIndex];
-        if (!target) return false;
-        const downloadBtn = target.node.querySelector('button[aria-label*="качать"], button[aria-label*="Скачать"], a[href][download], a[href*="/file"], a[href*="/download"], button[class*="download"], [class*="download"]');
-        if (downloadBtn) {
-          downloadBtn.click();
+        if (target) {
+          target.click();
           return true;
         }
-        target.docEl.click();
-        return true;
-      }, { docIndex });
+      }
+      return false;
+    }, index, rows[index].box || null, targets).catch(() => false);
+  }
+
+  async triggerDocumentDownload(chatId, rawId) {
+    try {
+      const docCountBefore = this.documentUrls.size;
+      // Before the click: a file the browser saves is found as a new name in
+      // the downloads folder.
+      const downloadFilesBefore = new Set(fs.readdirSync(this.downloadDir));
+
+      const clicked = await this.clickInBubble(rawId, [
+        this.selectors.messageFileCard,
+        'button[aria-label*="качать"], button[aria-label*="Download"], a[href][download], button[class*="download"], [class*="download"]',
+        // A file link, never one in the text or its preview.
+        `:is(a[href*="/file"], a[href*="/download"]):not(:is(${this.selectors.messageText}, ${this.selectors.messageLinkPreview}) *)`,
+        '[class*="fileIcon"], [class*="document"], [class*="attachDoc"], [class*="file-info"], [class*="fileName"], [data-testid*="document"], [data-testid*="file"]'
+      ]);
 
       if (!clicked) {
-        logger.debug({ chatId, docIndex }, 'triggerDocumentDownload: no document element found');
+        logger.debug({ chatId }, 'triggerDocumentDownload: no document element found');
         return null;
       }
 
-      logger.debug({ chatId, docIndex }, 'triggerDocumentDownload: clicked, waiting for network response');
+      logger.debug({ chatId }, 'triggerDocumentDownload: clicked, waiting for network response');
 
-      // Track download directory for files that bypass network interception
-      const downloadFilesBefore = new Set(fs.readdirSync(this.downloadDir).filter((f) => !f.endsWith('.crdownload')));
+      const sizeOf = (name) => {
+        try {
+          return fs.statSync(path.join(this.downloadDir, name)).size;
+        } catch {
+          return 0;
+        }
+      };
 
-      for (let attempt = 0; attempt < 10; attempt++) {
+      // A few seconds for the download to start, then as long as it keeps
+      // growing: a file of a few MB used to be given up on after 5 seconds.
+      const startedAt = Date.now();
+      let deadline = startedAt + DOCUMENT_DOWNLOAD_START_MS;
+      let partialBytes = 0;
+      while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         if (this.documentUrls.size > docCountBefore) {
           const doc = this.findNetworkDocument();
@@ -1615,16 +2827,33 @@ export class MaxWebClient {
           }
         }
         // Check for new files in download dir (browser download)
-        const currentFiles = fs.readdirSync(this.downloadDir).filter((f) => !f.endsWith('.crdownload'));
-        const newFiles = currentFiles.filter((f) => !downloadFilesBefore.has(f));
+        const entries = fs.readdirSync(this.downloadDir).filter((f) => !downloadFilesBefore.has(f));
+        const newFiles = entries.filter((f) => !f.endsWith('.crdownload'));
         if (newFiles.length > 0) {
           const originalName = newFiles[0];
           const filePath = path.join(this.downloadDir, originalName);
+          const bytes = sizeOf(originalName);
+          if (bytes > MAX_DOCUMENT_BYTES) {
+            // Its card did not say how big it is: never read it into memory.
+            fs.rmSync(filePath, { force: true });
+            logger.info({ chatId, bytes }, 'triggerDocumentDownload: file is over the size limit, not forwarded');
+            return { tooBig: true, bytes, originalName };
+          }
           const buffer = fs.readFileSync(filePath);
           const ext = path.extname(originalName) || '.bin';
           logger.debug({ chatId, filePath, size: buffer.length, originalName }, 'triggerDocumentDownload: captured document from download dir');
           fs.unlinkSync(filePath);
           return { url: filePath, buffer, timestamp: Date.now(), contentType: `application/${ext.slice(1)}`, originalName };
+        }
+        const partial = entries.filter((f) => f.endsWith('.crdownload')).reduce((sum, f) => sum + sizeOf(f), 0);
+        if (partial > MAX_DOCUMENT_BYTES) {
+          // (The browser finishes it on its own; the downloads sweep removes it.)
+          logger.info({ chatId, bytes: partial }, 'triggerDocumentDownload: file is over the size limit, not forwarded');
+          return { tooBig: true, bytes: partial };
+        }
+        if (partial > partialBytes) {
+          partialBytes = partial;
+          deadline = Math.min(startedAt + DOCUMENT_DOWNLOAD_MAX_MS, Date.now() + DOCUMENT_DOWNLOAD_START_MS);
         }
       }
 
@@ -1636,30 +2865,15 @@ export class MaxWebClient {
     }
   }
 
-  async triggerVoiceDownload(src, chatId, voiceIndex = 0) {
+  async triggerVoiceDownload(src, chatId) {
     try {
       const voiceCountBefore = this.voiceUrls.size;
-      const selectors = this.selectors;
 
-      const clicked = await this.page.$$eval(selectors.messageItem, (nodes, innerSrc) => {
-        const voiceNodes = [];
-        for (let i = 0; i < nodes.length; i++) {
-          const node = nodes[i];
-          const voiceEl = node.querySelector('[class*="voice"], [data-testid*="voice"], [class*="audioMessage"], [class*="audio-player"], [class*="attachAudio"], [class*="wave"]');
-          if (!voiceEl) continue;
-          if (node.querySelector('.is-outgoing, .outgoing')) continue;
-          voiceNodes.push({ node, voiceEl });
-        }
-        const target = voiceNodes[innerSrc.voiceIndex];
-        if (!target) return false;
-        const playBtn = target.node.querySelector('button[class*="play"], button[aria-label*="Play"], button[aria-label*="play"], [class*="playBtn"], [class*="play-btn"], [data-testid*="play"], .play, button');
-        if (playBtn) {
-          playBtn.click();
-          return true;
-        }
-        target.voiceEl.click();
-        return true;
-      }, { time: src.time, voiceIndex });
+      const clicked = await this.clickInBubble(src.rawId, [
+        'button[class*="play"], button[aria-label*="Play"], button[aria-label*="play"], [class*="playBtn"], [class*="play-btn"], [data-testid*="play"], .play',
+        '[class*="attachAudio"] button, [class*="voice"] button, [class*="audioMessage"] button',
+        '[class*="voice"], [data-testid*="voice"], [class*="audioMessage"], [class*="audio-player"], [class*="attachAudio"], [class*="wave"]'
+      ]);
 
       if (!clicked) {
         logger.debug({ chatId }, 'triggerVoiceDownload: no voice play button found');
@@ -1690,22 +2904,14 @@ export class MaxWebClient {
     }
   }
 
-  async triggerVideoNoteDownload(chatId) {
+  async triggerVideoNoteDownload(chatId, rawId) {
     try {
       const videoCountBefore = this.videoUrls.size;
-      const selectors = this.selectors;
 
-      const clicked = await this.page.$$eval(selectors.messageItem, (nodes) => {
-        for (let i = nodes.length - 1; i >= 0; i--) {
-          const node = nodes[i];
-          if (node.querySelector('.is-outgoing, .outgoing')) continue;
-          const videoMsg = node.querySelector('[class*="videoMessage"], [class*="videoCanvas"], [class*="roundVideo"]');
-          if (!videoMsg) continue;
-          videoMsg.click();
-          return true;
-        }
-        return false;
-      }, selectors);
+      // (It used to be the newest video note on screen, whichever this was.)
+      const clicked = await this.clickInBubble(rawId, [
+        '[class*="videoMessage"], [class*="videoCanvas"], [class*="roundVideo"]'
+      ]);
 
       if (!clicked) {
         logger.debug({ chatId }, 'triggerVideoNoteDownload: no video note element found');
@@ -1774,7 +2980,11 @@ export class MaxWebClient {
       throw new Error('Lottie payload is not valid JSON');
     }
     if (!this._lottieScript) {
-      const scriptPath = path.join(process.cwd(), 'node_modules', 'lottie-web', 'build', 'player', 'lottie.min.js');
+      // The "light" canvas build has no expression support. The full build
+      // eval()s JavaScript embedded in the animation — and these animations
+      // come from other people (MAX stickers, Telegram .tgs), played in the
+      // tab that holds the logged-in MAX session.
+      const scriptPath = path.join(process.cwd(), 'node_modules', 'lottie-web', 'build', 'player', 'lottie_light_canvas.min.js');
       this._lottieScript = fs.readFileSync(scriptPath, 'utf8');
     }
 
@@ -1850,11 +3060,77 @@ export class MaxWebClient {
   }
 
   async stop() {
-    await this.browser?.close();
+    const browser = this.browser;
+    // Detach first: the 'disconnected' handler uses this to tell a requested
+    // close from a crash, and nothing may keep driving a page that is closing.
     this.browser = null;
     this.page = null;
     this.activeChatId = null;
+    this.activeChatTitle = null;
+    this.activeMaxChatId = null;
+    this.captureChatId = null;
     this.clearMediaCaches();
+    if (!browser) return;
+
+    const browserProcess = browser.process?.() || null;
+    let timer = null;
+    try {
+      await Promise.race([
+        browser.close(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`browser.close() timed out after ${BROWSER_CLOSE_TIMEOUT_MS}ms`)), BROWSER_CLOSE_TIMEOUT_MS);
+        })
+      ]);
+    } catch (error) {
+      logger.warn({ err: error?.message || String(error) }, 'Chrome did not close cleanly; killing the process');
+      try { browserProcess?.kill('SIGKILL'); } catch { /* already gone */ }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // False once the browser is gone or its page was closed (a crash, a failed
+  // relaunch). A crashed renderer can leave both looking alive, so callers
+  // that must notice that also count failing page calls.
+  isAlive() {
+    return Boolean(this.browser?.connected && this.page && !this.page.isClosed?.() && !this.pageCrashed);
+  }
+
+  // Memory held by the whole Chromium process tree (see measureProcessTreeMemory):
+  // { bytes, processes, method } or null when it cannot be measured (no local
+  // browser process, or no /proc).
+  async getBrowserMemoryUsage() {
+    const pid = this.browser?.process?.()?.pid;
+    if (!pid) return null;
+    const usage = await measureProcessTreeMemory(pid);
+    if (!usage) return null;
+    // DOM node count and JS heap of the MAX page: what the handle leak used to
+    // grow, so a regression shows up in /status and the logs.
+    const metrics = await this.page?.metrics().catch(() => null);
+    if (metrics) usage.page = { domNodes: metrics.Nodes, jsHeapBytes: metrics.JSHeapUsedSize };
+    return usage;
+  }
+
+  // Reloads the MAX page in place: drops the renderer's DOM, JS heap and
+  // DevTools network buffer (the network cap, the response listener and the
+  // download behaviour all survive a reload). Much cheaper than a browser
+  // relaunch. The caller holds the bridge's lock and waits for the chat list.
+  async reloadPage({ timeoutMs = 60000 } = {}) {
+    await this.ensurePage();
+    this.activeChatId = null;
+    this.activeChatTitle = null;
+    this.activeMaxChatId = null;
+    this.captureChatId = null;
+    this.clearMediaCaches();
+    // A beforeunload prompt would block the reload forever.
+    const acceptDialog = (dialog) => { dialog.accept().catch(() => {}); };
+    this.page.on('dialog', acceptDialog);
+    try {
+      await this.page.reload({ waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    } finally {
+      this.page.off('dialog', acceptDialog);
+    }
+    logger.info('Reloaded the MAX page');
   }
 
   async captureDiagnostics(reason, { throttleMs = 0 } = {}) {
@@ -1919,15 +3195,42 @@ export class MaxWebClient {
 
   async ensureActiveChat(chatId) {
     await this.ensurePage();
-    if (this.activeChatId !== chatId) {
+    if (this.activeChatId !== chatId || await this.activeChatMovedOn()) {
       await this.selectChat(chatId);
     }
-    const chat = (await this.listChats()).find((candidate) => candidate.id === chatId);
-    if (chat) await this.verifyActiveChat(chat);
+    // Always verify the header before typing. A chat scrolled out of MAX's
+    // virtualized list is not in listChats(), and skipping the check for it
+    // meant a send could go into whatever chat was really on screen; the
+    // title remembered when the chat was selected covers that case.
+    const chat = (await this.listChats()).find((candidate) => candidate.id === chatId)
+      || (this.activeChatId === chatId && this.activeChatTitle ? { id: chatId, title: this.activeChatTitle } : null);
+    if (!chat) throw new Error(`Cannot verify active Max chat before sending: ${chatId}`);
+    await this.verifyActiveChat(chat);
   }
 
   async ensurePage() {
     if (!this.page) throw new Error('Max Web page is not started');
+  }
+
+  // waitForSelector without keeping the handle it resolves to (see
+  // disposeHandles). Resolves true when the element appeared.
+  async waitForSelectorFree(selector, options) {
+    const handle = await this.page.waitForSelector(selector, options);
+    await disposeHandles(handle);
+    return Boolean(handle);
+  }
+
+  // Clicks the first match like a user would (real mouse events, which MAX's
+  // buttons need), then lets the handle go. False when nothing matched.
+  async clickSelector(selector) {
+    const handle = await this.page.$(selector);
+    if (!handle) return false;
+    try {
+      await handle.click();
+    } finally {
+      await disposeHandles(handle);
+    }
+    return true;
   }
 
   async verifyActiveChat(chat) {
@@ -1948,10 +3251,7 @@ export class MaxWebClient {
   }
 
   async submitComposer() {
-    const sendButton = await this.page.$(this.selectors.sendButton);
-    if (sendButton) {
-      await sendButton.click();
-    } else {
+    if (!await this.clickSelector(this.selectors.sendButton)) {
       await this.page.keyboard.press('Enter');
     }
 
@@ -1969,6 +3269,29 @@ export class MaxWebClient {
     }
   }
 }
+
+// For comparing a sent text with what the bubble shows: line breaks come back
+// as nothing (separate paragraphs), and an emoji may come back with or without
+// its U+FE0F variation selector.
+const withoutWhitespace = (value) => String(value ?? '').replace(/[\s\uFE0E\uFE0F]+/g, '');
+
+// Same normalisation as domain/reactions.js normalizeEmoji, for comparing with
+// what the page renders.
+const normalizeEmojiInPage = (emoji) => String(emoji ?? '')
+  .replace(/[\uFE0E\uFE0F]/gu, '')
+  .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '')
+  .trim();
+
+// A chat in a diagnostic file name: a short hash, not the contact's name —
+// /diagnostics uploads these files, names included, to the asking chat.
+const chatTag = (chatId) => crypto.createHash('sha256').update(String(chatId ?? '')).digest('hex').slice(0, 8);
+
+// The CDN identity of a MAX media URL (its r= parameter): the same for every
+// size of a picture, and across the re-signing of URLs on page loads.
+const mediaTokenOf = (url) => {
+  const match = /[?&]r=([^&]+)/.exec(url || '');
+  return match ? match[1] : null;
+};
 
 const normalizeMaxType = (type) => {
   if (Object.values(MessageType).includes(type)) return type;
@@ -2005,6 +3328,13 @@ const normalizeTitle = (value) => String(value || '')
   .replace(/\s+/g, ' ')
   .trim()
   .toLowerCase();
+
+// The open chat's name, as its (hidden) header reads: "Окно чата с {name}".
+const chatTitleFromHeader = (value) => String(value || '')
+  .replace(/\u00a0/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim()
+  .replace(/^(chat window with|окно чата с|чат с)\s+/i, '');
 
 const stripActiveChatPrefix = (value) => value.replace(
   /^(chat window with|окно чата с|чат с)\s+/,
@@ -2046,15 +3376,21 @@ const redactDiagnosticText = (html) => html
   // Redact unknown label-ish attribute values. Default-deny: a label MAX adds
   // later is redacted rather than silently leaking, and its length still shows
   // in the dump (run once with DIAGNOSTIC_REDACT_TEXT=false if the real value
-  // is needed to write a new selector).
+  // is needed to write a new selector). `value` carries typed text (a draft in
+  // the composer, a search query).
   .replace(
-    /\s(aria-label|title|alt|placeholder)\s*=\s*"([^"]*)"/gi,
+    /\s(aria-label|title|alt|placeholder|value)\s*=\s*"([^"]*)"/gi,
     (match, attribute, value) => {
       const trimmed = value.trim();
       if (!trimmed || SAFE_LABEL_VALUES.has(trimmed)) return match;
       return ` ${attribute}="[redacted ${trimmed.length} chars]"`;
     }
-  );
+  )
+  // MAX serves media over SIGNED URLs (…/i?r=<token>&expires=…): whoever holds
+  // one can fetch that private photo or file. Keep scheme, host and path —
+  // enough to see what an element points at — and drop the query everywhere
+  // (src, href, srcset, style url(), data-* attributes).
+  .replace(/(https?:\/\/[^\s"'<>?#)]+)\?[^\s"'<>#)]*/gi, '$1?[redacted]');
 
 // SVG children are dropped unconditionally — including with redaction turned
 // off. MAX renders the sign-in QR as inline SVG paths, so a dump taken on the

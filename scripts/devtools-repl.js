@@ -15,6 +15,15 @@
 // (clicks, typing) happens for real. Never calls browser.close() or
 // page.close(): this only observes/drives the existing session, it must
 // never terminate it.
+//
+// DANGER, learned the hard way: puppeteer.connect() defaults `defaultViewport`
+// to 800x600 and applies it to every page it attaches to. The override outlives
+// the disconnect, so merely *observing* the live page silently resized MAX Web
+// from the 1440x980 the app sets at launch down to 800x600. At that width MAX
+// collapses to its narrow layout, the chat list stops rendering the rows
+// selectChat() looks for, and the bridge fails every single chat with
+// "Max chat not found" until the container is restarted. `defaultViewport: null`
+// keeps the page exactly as the app left it — never remove it.
 
 import puppeteer from 'puppeteer';
 
@@ -25,7 +34,11 @@ if (!expression) {
 }
 
 const port = Number(process.env.MAX_REMOTE_DEBUGGING_PORT) || 9222;
-const browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${port}` });
+const browser = await puppeteer.connect({
+  browserURL: `http://127.0.0.1:${port}`,
+  // Never impose a viewport on the running app — see the DANGER note above.
+  defaultViewport: null,
+});
 try {
   const pages = await browser.pages();
   const page = pages.find((p) => p.url().includes('max.ru')) || pages[0];

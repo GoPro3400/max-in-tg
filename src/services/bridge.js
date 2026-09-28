@@ -1132,6 +1132,15 @@ export class BridgeService {
             // Media there may be on record under an id it had before, with a
             // since re-signed URL (see the re-forward guard).
             message.legacyMatchable = true;
+          } else if (fullAdoption && index < messages.length - unreadCount(chat)) {
+            // Media below the last known bubble too, on the first read: no
+            // photo is known by its old id then (the id holds the signed URL,
+            // re-issued with every page load), so a chat ending on photos —
+            // or made of them, like MAX's own notices — had nothing known
+            // above them, and a captioned or group photo, whose old prefix is
+            // not the new one, went out again. The guard still wants the same
+            // picture on record in this chat; the unread are new all the same.
+            message.legacyMatchable = true;
           }
           // Stop at the first message that cannot go out while Telegram's
           // flood control lasts, so the rest of the chat keeps its order.

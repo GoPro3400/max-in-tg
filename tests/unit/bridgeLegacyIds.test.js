@@ -189,3 +189,82 @@ describe('message ids with the time in them', () => {
     expect(known).toEqual([true, false]);
   });
 });
+
+// The old ids had no time, so "Ок" on Wednesday was taken for Monday's "Ок"
+// and never delivered. Both are on screen at the update: Monday's is known
+// by its old id, Wednesday's old id is now numbered ("Ок#d2") and on record
+// nowhere. It is history all the same — the update must not deliver it.
+describe('repeats the old ids took for an earlier text', () => {
+  it('does not deliver them on the first read after the update', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, CHAT);
+    setUnread(db, 1);
+    bridge.duplicateIdsSince = Date.now() - 60000;
+    recordLegacy(db, 'Ок', 501);
+    maxClient.readMessages.mockResolvedValue([
+      bubble('10:00', 'Ок'),
+      bubble('15:00', 'Ок', { legacyId: 'Ок#d2' }),
+      bubble('15:05', 'Новое')
+    ]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Новое']);
+    expect(db.getMessage(stableId('max', CHAT, '15:00|Ок')).metadata.primedAsBacklog).toBe(true);
+  });
+
+  it('does not deliver one the chat ends on', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, CHAT);
+    bridge.duplicateIdsSince = Date.now() - 60000;
+    recordLegacy(db, 'Ок', 501);
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Ок'), bubble('15:00', 'Ок', { legacyId: 'Ок#d2' })]);
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('delivers one that MAX counts as unread', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, CHAT);
+    setUnread(db, 1);
+    bridge.duplicateIdsSince = Date.now() - 60000;
+    recordLegacy(db, 'Ок', 501);
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Ок'), bubble('15:00', 'Ок', { legacyId: 'Ок#d2' })]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Ок']);
+    expect(db.getMessage(stableId('max', CHAT, '15:00|Ок')).telegramMessageId).not.toBe(501);
+  });
+
+  it('delivers one whose delivery was already tried', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, CHAT);
+    bridge.duplicateIdsSince = Date.now() - 60000;
+    recordLegacy(db, 'Ок', 501);
+    const retry = bubble('15:00', 'Ок', { legacyId: 'Ок#d2' });
+    db.updateDeliveryStatus(db.createDelivery(retry.id, 'max_to_tg'), 'failed', 'Telegram was down');
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Ок'), retry]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Ок']);
+  });
+
+  it('delivers a new repeat once the chat is on the new ids', async () => {
+    const { bridge, db, maxClient, telegramBot } = makeBridge();
+    linkChat(db, CHAT);
+    bridge.duplicateIdsSince = Date.now() - 60000;
+    recordLegacy(db, 'Ок', 501);
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Ок')]);
+    await bridge.pollMax();
+    expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Ок'), bubble('15:00', 'Ок', { legacyId: 'Ок#d2' })]);
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Ок']);
+  });
+});

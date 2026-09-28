@@ -1139,7 +1139,7 @@ export class BridgeService {
             readThrough = false;
             break;
           }
-          if (backlog.has(message.id) || this.isOldDuplicate(message)) {
+          if (backlog.has(message.id) || this.isOldDuplicate(message, { byLegacyId: fullAdoption && index <= adoptUpTo })) {
             this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
             continue;
           }
@@ -1443,12 +1443,14 @@ export class BridgeService {
   // the last bubble known by any id; later, the newest bubble known by its
   // own id, and only while legacyWindowOpen. Never one of the newest
   // `unread` bubbles: MAX counts those as not seen yet, so they are new,
-  // whatever old id they share ("Ок").
+  // whatever old id they share ("Ок"). A repeat the old ids took for an
+  // earlier text is known too (see isOldDuplicate): a chat often ends on one.
   legacyAdoptionEnd(chat, messages, fullAdoption) {
     if (!fullAdoption && !this.legacyWindowOpen(chat.id)) return -1;
     let end = -1;
     messages.forEach((message, index) => {
-      if (this.db.hasMessage(message.id) || (fullAdoption && this.legacyRecordOf(message))) end = index;
+      if (this.db.hasMessage(message.id)
+        || (fullAdoption && (this.legacyRecordOf(message) || this.isOldDuplicate(message, { byLegacyId: true })))) end = index;
     });
     return Math.min(end, messages.length - 1 - unreadCount(chat));
   }
@@ -1600,12 +1602,28 @@ export class BridgeService {
   // for the first and dropped; it now has its own id ("#dN", see
   // scrapeMessageRows). Those whose first copy was delivered before that
   // change are old news — they must not all arrive at once after the update.
-  isOldDuplicate(message) {
+  //
+  // `byLegacyId`: the bubble is history on its chat's first read since ids
+  // carry the time (above the last known bubble, see legacyAdoptionEnd). The
+  // old ids had no time, so ANY repeat of an earlier text of the chat — "Ок"
+  // on Wednesday after "Ок" on Monday, not only in the same minute — was
+  // dropped that way and never delivered. Its old id is numbered now
+  // ("Ок#d2"), which no record has, so adoptLegacyId cannot know it and it
+  // would all arrive at once with the update. Not one waiting for its quote
+  // or file, or whose delivery was tried: that one is new (as in
+  // adoptLegacyId).
+  isOldDuplicate(message, { byLegacyId = false } = {}) {
     if (!this.duplicateIdsSince) return false;
-    const match = /#d\d+$/.exec(message.sourceMessageId || '');
-    if (!match) return false;
-    const first = this.db.getMessage(stableId('max', message.chatId, message.sourceMessageId.slice(0, match.index)));
-    return Boolean(first && first.createdAt < this.duplicateIdsSince);
+    const rawIds = [message.sourceMessageId];
+    if (byLegacyId && !this.pendingSeenCounts.has(message.id) && !this.db.hasDelivery(message.id, 'max_to_tg')) {
+      rawIds.push(message.metadata?.legacyId);
+    }
+    return rawIds.some((rawId) => {
+      const match = /#d\d+$/.exec(rawId || '');
+      if (!match) return false;
+      const first = this.db.getMessage(stableId('max', message.chatId, rawId.slice(0, match.index)));
+      return Boolean(first && first.createdAt < this.duplicateIdsSince);
+    });
   }
 
   // Old history MAX shows in a chat the database knows nothing about, on a

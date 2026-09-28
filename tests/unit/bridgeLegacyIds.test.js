@@ -268,3 +268,76 @@ describe('repeats the old ids took for an earlier text', () => {
     expect(sentTexts(telegramBot)).toEqual(['Ок']);
   });
 });
+
+// A photo's id holds its signed URL, which MAX re-issues with every page load,
+// so no photo is known by its old id on the first read: only the re-forward
+// guard (same picture, same prefix) tells it was delivered. A captioned photo's
+// old prefix is its caption, the new one "time|caption".
+describe('photos on the first read after the update', () => {
+  const OLD_URL = 'https://i.oneme.ru/i?r=OLD&fn=w_1280';
+  const NEW_URL = 'https://i.oneme.ru/i?r=NEW&fn=w_1280';
+
+  // Delivered before the update (the harness's image hash is always this one).
+  const recordLegacyPhoto = (db, caption) => db.insertMessage({
+    ...maxMessage(stableId('max', CHAT, `${caption}|${OLD_URL}`), CHAT, { type: 'photo', text: caption, sourceMessageId: `${caption}|${OLD_URL}` }),
+    createdAt: Date.now() - 86400000,
+    telegramMessageId: 700,
+    mediaHash: 'a1b2c3d4e5f60718'
+  });
+
+  const photoBubble = (time, caption) => maxMessage(stableId('max', CHAT, `${time}|${caption}|${NEW_URL}`), CHAT, {
+    type: 'photo',
+    text: caption,
+    mediaUrl: NEW_URL,
+    sourceMessageId: `${time}|${caption}|${NEW_URL}`,
+    metadata: { time, legacyId: `${caption}|${NEW_URL}` }
+  });
+
+  const setup = () => {
+    const made = makeBridge();
+    linkChat(made.db, CHAT);
+    made.bridge.pageLoadedAt = Date.now() - 1000;
+    recordLegacy(made.db, 'Привет', 501);
+    recordLegacyPhoto(made.db, 'Смотри');
+    return made;
+  };
+
+  it('does not send one below the last known text again', async () => {
+    const { bridge, maxClient, telegramBot } = setup();
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Привет'), photoBubble('10:05', 'Смотри')]);
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not send again a chat made only of photos', async () => {
+    const { bridge, maxClient, telegramBot } = setup();
+    maxClient.readMessages.mockResolvedValue([photoBubble('05:36', 'Смотри')]);
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('sends one that MAX counts as unread', async () => {
+    const { bridge, db, maxClient, telegramBot } = setup();
+    setUnread(db, 1);
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Привет'), photoBubble('10:05', 'Смотри')]);
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends the same picture again once the chat is on the new ids', async () => {
+    const { bridge, maxClient, telegramBot } = setup();
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Привет')]);
+    await bridge.pollMax();
+
+    maxClient.readMessages.mockResolvedValue([bubble('10:00', 'Привет'), photoBubble('15:00', 'Смотри')]);
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});

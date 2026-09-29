@@ -17,6 +17,9 @@ on:
       - scripts/start.sh
       - scripts/smoke-image.sh
       - scripts/smoke-media.mjs
+      # What smoke-media.mjs runs: a change to how ffmpeg is called meets the
+      # image's ffmpeg here, not only at release time.
+      - src/services/mediaService.js
       - .github/workflows/image.yml
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']

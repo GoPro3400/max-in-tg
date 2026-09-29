@@ -268,7 +268,7 @@ fi
 if [ "$OWNERSHIP_OK" = 1 ]; then
   info "data/ tmp/ logs/ owned by uid $CONTAINER_UID"
 else
-  info "cannot chown directly - will do it through docker after the build"
+  info "cannot chown directly - will do it through docker once the image is there"
 fi
 
 # ------------------------------------------------------- 5. Build and start --

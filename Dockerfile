@@ -39,9 +39,10 @@ RUN apt-get update \
 # strangers send), and which a published image would carry without its licence
 # text or source. Debian's package brings its licence texts
 # (/usr/share/doc/ffmpeg/copyright), its source (`apt-get source ffmpeg`) and
-# its security fixes with every rebuild. FFMPEG_BIN makes ffmpeg-static use it
-# and skip the download; it stays set at run time, which is how the bridge
-# finds ffmpeg. scripts/smoke-media.mjs checks that the conversions work with it.
+# its security fixes whenever the image is rebuilt (at each release).
+# FFMPEG_BIN makes ffmpeg-static use it and skip the download; it stays set at
+# run time, which is how the bridge finds ffmpeg. scripts/smoke-media.mjs checks
+# that the conversions work with it.
 ENV FFMPEG_BIN=/usr/bin/ffmpeg
 
 COPY package*.json ./

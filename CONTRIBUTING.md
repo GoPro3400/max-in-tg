@@ -84,7 +84,10 @@ feat/<short-change-name>
    входа (иначе бот пошлёт пользователей обновляться на образ, которого они не видят). Один
    раз сделай пакет публичным: профиль → Packages → `max-in-tg` → Package settings → Change
    visibility → Public — и запусти упавшее задание заново (Actions → запуск → «Re-run failed
-   jobs»): повторится только оно, сборка не нужна.
+   jobs»): повторится только оно, сборка не нужна. Если же сама публикация упала с
+   `permission_denied: write_package`, значит, пакет с таким именем уже есть и не связан с
+   репозиторием: в его Package settings → Manage Actions access добавь этот репозиторий с
+   ролью Write.
 
 Пользователи узнают о новой версии из бота (`UPDATE_CHECK`, раз в сутки) и обновляются одной
 строкой `docker compose pull && docker compose up -d --no-build` — см. `docs/SETUP_GUIDE.md`

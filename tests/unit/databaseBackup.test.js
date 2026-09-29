@@ -241,7 +241,7 @@ describe('database copy before an upgrade', () => {
   it('copies nothing when there is no room for a copy, and says why', () => {
     open('0.1.0').close();
     opened.pop();
-    const statfs = vi.spyOn(fs, 'statfsSync').mockReturnValue({ bavail: 10, bsize: 1024 });
+    const statfs = vi.spyOn(fs, 'statfsSync').mockReturnValue({ bavail: 10, bfree: 10, blocks: 100000, bsize: 1024 });
     let db;
     try {
       db = open('0.2.0', quiet);
@@ -267,27 +267,211 @@ describe('database copy before an upgrade', () => {
     expect(backups()).toHaveLength(1);
   });
 
-  it('copies the same upgrade again when the earlier copy is more than a day old', () => {
+  // A start that fails in its migration, with the connection it leaves open
+  // handed back, so that a test can close it before it puts files about.
+  const failingStarts = (times, version = '0.2.0') => {
+    const leftOpen = [];
+    const migrate = vi.spyOn(AppDatabase.prototype, 'migrate').mockImplementation(function failing() {
+      leftOpen.push(this);
+      throw new Error('migration failed');
+    });
+    try {
+      for (let attempt = 0; attempt < times; attempt += 1) {
+        expect(() => new AppDatabase(file, { appVersion: version, logger: quiet })).toThrow('migration failed');
+      }
+    } finally {
+      migrate.mockRestore();
+    }
+    return { close: () => leftOpen.forEach((db) => db.db.close()) };
+  };
+  const noteInDatabase = () => {
+    const raw = new Database(file, { readonly: true });
+    try {
+      const row = raw.prepare("SELECT value FROM settings WHERE key = 'upgrade_backup'").get();
+      return row ? JSON.parse(row.value) : null;
+    } finally {
+      raw.close();
+    }
+  };
+
+  it('does not copy an upgrade again while its start keeps failing, however long that goes on', () => {
+    const before = open('0.1.0');
+    before.upsertChat({ id: 'Иван', title: 'Иван', metadata: {} });
+    before.close();
+    opened.pop();
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const day = 24 * 60 * 60 * 1000;
+      const failed = failingStarts(2);
+      // Days on (nobody at the server; the container restarts and restarts):
+      // still the first copy, which has the database as it was.
+      for (let days = 1; days <= 6; days += 1) {
+        vi.setSystemTime(Date.now() + day);
+        failingStarts(1).close();
+      }
+      failed.close();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const names = backups();
+    expect(names).toHaveLength(1);
+    expect(rowsIn(names[0])).toEqual(['Иван']);
+  });
+
+  it('keeps a note of the copy in the database while the upgrade is not through, and drops it when it is', () => {
     open('0.1.0').close();
     opened.pop();
-    // A month ago: the database was put back, and has been used since.
-    const old = putCopy('0.1.0', '0.2.0', '20200101T000000000Z');
 
+    failingStarts(1).close();
+    const [name] = backups();
+    expect(noteInDatabase()).toEqual({ from: '0.1.0', to: '0.2.0', file: name });
+    // The copy was made before the note, so it does not have it.
+    const copy = new Database(path.join(dir, 'backups', name), { readonly: true });
+    expect(copy.prepare("SELECT 1 FROM settings WHERE key = 'upgrade_backup'").get()).toBeUndefined();
+    copy.close();
+
+    open('0.2.0');
+    expect(noteInDatabase()).toBeNull();
+  });
+
+  it('copies the same upgrade afresh when the database has been put back from its copy', async () => {
+    const before = open('0.1.0');
+    before.upsertChat({ id: 'Иван', title: 'Иван', metadata: {} });
+    before.close();
+    opened.pop();
+
+    const failed = failingStarts(1);
+    failed.close();
+    const [first] = backups();
+    // The documented way back: the copy over the database, its -wal and -shm gone.
+    fs.rmSync(`${file}-wal`, { force: true });
+    fs.rmSync(`${file}-shm`, { force: true });
+    fs.copyFileSync(path.join(dir, 'backups', first), file);
+    await new Promise((resolve) => { setTimeout(resolve, 5); });
+
+    // The old version ran on it, and the upgrade is tried again: the database
+    // is not what the first copy has, and this copy has to be made.
     open('0.2.0');
 
     const names = backups();
     expect(names).toHaveLength(2);
-    expect(names).toContain(old);
+    expect(names).toContain(first);
   });
 
-  it('does not copy the same upgrade again within the day (a restart that fails, again and again)', () => {
+  it('copies another upgrade, even while the first is not through', () => {
     open('0.1.0').close();
     opened.pop();
-    const recent = putCopy('0.1.0', '0.2.0', stampNow());
 
-    open('0.2.0');
+    failingStarts(1).close();
+    // Not 0.2.0 after all: 0.3.0 is tried on the same database.
+    open('0.3.0');
 
-    expect(backups()).toEqual([recent]);
+    expect(backups().map((name) => /-(\d\.\d\.\d)-to-(\d\.\d\.\d)-/.exec(name).slice(1, 3).join('>')).sort())
+      .toEqual(['0.1.0>0.2.0', '0.1.0>0.3.0']);
+  });
+
+  it('does not take a note that could not be made for a copy that could not be made', () => {
+    open('0.1.0').close();
+    opened.pop();
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const note = vi.spyOn(AppDatabase.prototype, 'rememberUpgradeBackup').mockImplementation(() => {
+      throw new Error('database is locked');
+    });
+    let db;
+    try {
+      db = open('0.2.0', logger);
+    } finally {
+      note.mockRestore();
+    }
+    expect(backups()).toHaveLength(1);
+    expect(db.backupProblem).toBeNull();
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it('copies the same upgrade again when the earlier copy is gone', () => {
+    open('0.1.0').close();
+    opened.pop();
+
+    failingStarts(1).close();
+    for (const name of backups()) fs.rmSync(path.join(dir, 'backups', name));
+    failingStarts(1).close();
+
+    expect(backups()).toHaveLength(1);
+  });
+
+  it('keeps the copy it has just made, even when the clock has been set back', () => {
+    open('0.1.0').close();
+    opened.pop();
+    // Three copies that say they are from the far future.
+    const future = ['20990101T000000000Z', '20990102T000000000Z', '20990103T000000000Z'].map((stamp) => putCopy('0.0.1', '0.0.2', stamp));
+
+    const db = open('0.2.0');
+
+    const names = backups();
+    expect(names).toHaveLength(3);
+    expect(names.some((name) => /-0\.1\.0-to-0\.2\.0-/.test(name))).toBe(true);
+    expect(names).toEqual(expect.arrayContaining(future.slice(1)));
+    expect(db.backupProblem).toBeNull();
+  });
+
+  it('does not name a copy that does not check out', () => {
+    open('0.1.0').close();
+    opened.pop();
+    const pragma = Database.prototype.pragma;
+    const garbled = vi.spyOn(Database.prototype, 'pragma').mockImplementation(function check(source, options) {
+      return String(source).startsWith('quick_check') ? '*** in database main ***\nPage 3: never used' : pragma.call(this, source, options);
+    });
+    let db;
+    try {
+      db = open('0.2.0', quiet);
+    } finally {
+      garbled.mockRestore();
+    }
+    expect(backups()).toEqual([]);
+    expect(db.backupProblem).toMatch(/does not check out/);
+    expect(db.getSetting('app_version')).toBe('0.2.0');
+  });
+
+  it('puts the copy on the disk before it names it', () => {
+    open('0.1.0').close();
+    opened.pop();
+    const sync = vi.spyOn(fs, 'fsyncSync');
+    let syncs;
+    try {
+      open('0.2.0');
+      syncs = sync.mock.calls.length;
+    } finally {
+      sync.mockRestore();
+    }
+    // The copy itself and, after the rename, the folder.
+    expect(syncs).toBeGreaterThanOrEqual(2);
+  });
+
+  it('is not put off by a file system that reports no sizes at all, but is by one that is full', () => {
+    open('0.1.0').close();
+    opened.pop();
+    const zeros = vi.spyOn(fs, 'statfsSync').mockReturnValue({ bavail: 0, bfree: 0, blocks: 0, bsize: 4096 });
+    try {
+      open('0.2.0');
+    } finally {
+      zeros.mockRestore();
+    }
+    expect(backups()).toHaveLength(1);
+
+    opened.pop().close();
+    open('0.3.0').close();
+    opened.pop();
+    const full = vi.spyOn(fs, 'statfsSync').mockReturnValue({ bavail: 0, bfree: 0, blocks: 1000, bsize: 4096 });
+    let db;
+    try {
+      db = open('0.4.0', quiet);
+    } finally {
+      full.mockRestore();
+    }
+    expect(db.backupProblem).toMatch(/not enough free space/);
   });
 
   it('logs through the logger it is given', () => {

@@ -4,10 +4,15 @@ import Database from 'better-sqlite3';
 
 // How many copies made before an upgrade are kept (see backupBeforeUpgrade).
 const BACKUPS_KEPT = 3;
-// The same upgrade tried again within this long is not copied again.
-const SAME_UPGRADE_WINDOW_MS = 24 * 60 * 60 * 1000;
 // A copy needs room: its size and half as much again, plus this.
 const BACKUP_HEADROOM_BYTES = 64 * 1024 * 1024;
+// The settings row that remembers a copy made for an upgrade that has not got
+// through its migration yet.
+const UPGRADE_BACKUP_KEY = 'upgrade_backup';
+const CREATE_SETTINGS_TABLE = `CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )`;
 
 // What the database says when nobody gave it a logger (tests, scripts). The
 // storage layer does not import the app's logger: that would pull in its
@@ -26,22 +31,48 @@ const fileBytes = (file) => {
   }
 };
 
-// Free room where `directory` is, or null when the system does not say.
+// Free room where `directory` is, or null when the system does not say — or
+// says nothing but zeros, as some file systems do: that is not "full".
 const freeBytes = (directory) => {
   try {
     const stats = fs.statfsSync(directory);
+    if (!Number(stats.blocks)) return null;
     return Number(stats.bavail) * Number(stats.bsize);
   } catch {
     return null;
   }
 };
 
-// "20260929T165456641Z" (see backupBeforeUpgrade) → milliseconds; 0 if it is not one.
-const stampTime = (stamp) => {
-  const parts = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z$/.exec(stamp);
-  if (!parts) return 0;
-  const [year, month, day, hour, minute, second, millisecond] = parts.slice(1).map(Number);
-  return Date.UTC(year, month - 1, day, hour, minute, second, millisecond);
+// A copy that is on the disk, and a database that checks out. VACUUM INTO does
+// not sync what it writes, and after a power cut its output can be short or
+// garbled under a name that looks perfectly good.
+const settleCopy = (file) => {
+  const handle = fs.openSync(file, 'r+');
+  try {
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+  const copy = new Database(file, { readonly: true });
+  try {
+    const verdict = copy.pragma('quick_check', { simple: true });
+    if (verdict !== 'ok') throw new Error(`the copy does not check out (${String(verdict).slice(0, 120)})`);
+  } finally {
+    copy.close();
+  }
+};
+
+// The rename is on the disk too. Not possible everywhere (Windows); the copy is
+// whole all the same.
+const syncDirectory = (directory) => {
+  try {
+    const handle = fs.openSync(directory, 'r');
+    try {
+      fs.fsyncSync(handle);
+    } finally {
+      fs.closeSync(handle);
+    }
+  } catch { /* see above */ }
 };
 
 export class AppDatabase {
@@ -60,7 +91,12 @@ export class AppDatabase {
     if (appVersion) this.backupBeforeUpgrade(filename, appVersion);
     this.migrate();
     this.prepare();
-    if (appVersion) this.setSetting('app_version', appVersion);
+    if (appVersion) {
+      this.setSetting('app_version', appVersion);
+      // The migration is through: an upgrade that had been copied is done, and
+      // the next one is a new one.
+      this.db.prepare('DELETE FROM settings WHERE key = ?').run(UPGRADE_BACKUP_KEY);
+    }
   }
 
   // The first start of a version of the bridge other than the one the database
@@ -70,14 +106,18 @@ export class AppDatabase {
   // and says so in the log.
   //
   // A copy exists under its name only once it is whole: it is written as
-  // <name>.partial and renamed. A start that dies in the middle (no room, a
-  // kill, a docker stop) leaves a .partial file, which the next try removes —
-  // never a truncated copy that a restore would trust.
+  // <name>.partial, put on the disk, checked (VACUUM INTO does not sync its
+  // output, and after a power cut that can be short or garbled) and renamed. A
+  // start that dies in the middle (no room, a kill, a docker stop) leaves a
+  // .partial file, which the next try removes — never a truncated copy that a
+  // restore would trust.
   //
   // A start that then fails (a migration that throws, and the container's
   // restart policy trying again and again) does not make a copy on every try:
   // the one made before the first is the one that has the database as it was.
-  // That holds for a day; the same upgrade a longer time later is copied afresh.
+  // The database remembers it (a settings row, made after the copy, so the copy
+  // does not have it): until a start gets through, or the database is put back
+  // from a copy, the same upgrade is not copied again — however long that takes.
   backupBeforeUpgrade(filename, appVersion) {
     if (!filename || filename === ':memory:' || filename.startsWith('file:')) return null;
     try {
@@ -114,9 +154,10 @@ export class AppDatabase {
         .filter(Boolean)
         .sort((a, b) => b.stamp.localeCompare(a.stamp) || b.name.localeCompare(a.name));
 
-      const newest = ownCopies()[0];
-      if (newest && newest.from === from && newest.to === to && Date.now() - stampTime(newest.stamp) < SAME_UPGRADE_WINDOW_MS) {
-        this.log.info({ from, to, backup: newest.name }, 'The database was already copied for this upgrade');
+      const earlier = this.earlySetting(UPGRADE_BACKUP_KEY);
+      const earlierFile = typeof earlier?.file === 'string' ? path.basename(earlier.file) : null;
+      if (earlier?.from === from && earlier?.to === to && earlierFile && fs.existsSync(path.join(directory, earlierFile))) {
+        this.log.info({ from, to, backup: earlierFile }, 'The database was already copied for this upgrade');
         return null;
       }
 
@@ -138,15 +179,26 @@ export class AppDatabase {
         // consistent database.
         this.db.prepare('VACUUM INTO ?').run(partial);
         if (fileBytes(partial) === 0) throw new Error('the copy came out empty');
+        settleCopy(partial);
         fs.renameSync(partial, target);
+        syncDirectory(directory);
       } catch (error) {
         fs.rmSync(partial, { force: true });
         fs.rmSync(`${partial}-journal`, { force: true });
         throw error;
       }
       this.log.info({ from, to, backup: target }, 'Backed up the database before the upgrade');
+      try {
+        this.rememberUpgradeBackup({ from, to, file: path.basename(target) });
+      } catch (error) {
+        // The copy is fine; a next try of this upgrade may make another.
+        this.log.warn({ err: error }, 'Could not note the database copy in the settings');
+      }
 
-      for (const old of ownCopies().slice(BACKUPS_KEPT)) fs.rmSync(path.join(directory, old.name), { force: true });
+      // The newest few stay — and the one just made always, whatever its time
+      // says (a clock that has been set back would put it last).
+      const others = ownCopies().filter((copy) => copy.name !== path.basename(target));
+      for (const old of others.slice(BACKUPS_KEPT - 1)) fs.rmSync(path.join(directory, old.name), { force: true });
       return target;
     } catch (error) {
       this.backupProblem = error?.message || String(error);
@@ -155,19 +207,35 @@ export class AppDatabase {
     }
   }
 
-  // The version of the bridge that used this database last; null for a database
-  // from before versions were recorded.
-  storedAppVersion() {
+  // A settings row as it can be read before migrate() has made the table and
+  // prepared the statements: its value, or null when there is none.
+  earlySetting(key) {
     const table = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").get();
     if (!table) return null;
-    const row = this.db.prepare("SELECT value FROM settings WHERE key = 'app_version'").get();
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
     if (!row) return null;
     try {
-      const value = JSON.parse(row.value);
-      return typeof value === 'string' ? value : null;
+      return JSON.parse(row.value);
     } catch {
       return null;
     }
+  }
+
+  // Likewise for writing (the table may not exist yet in a database as old as
+  // that).
+  rememberUpgradeBackup(note) {
+    this.db.exec(CREATE_SETTINGS_TABLE);
+    this.db.prepare(`
+      INSERT INTO settings (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(UPGRADE_BACKUP_KEY, JSON.stringify(note));
+  }
+
+  // The version of the bridge that used this database last; null for a database
+  // from before versions were recorded.
+  storedAppVersion() {
+    const value = this.earlySetting('app_version');
+    return typeof value === 'string' ? value : null;
   }
 
   migrate() {
@@ -210,10 +278,7 @@ export class AppDatabase {
       );
 
 
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
+      ${CREATE_SETTINGS_TABLE};
     `);
 
     // Legacy message_deliveries carried a FOREIGN KEY that the current schema

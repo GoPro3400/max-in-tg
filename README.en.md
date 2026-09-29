@@ -190,7 +190,7 @@ The bot runs entirely in Docker: the image is built from `node:22-bookworm-slim`
 | Debian (Bookworm), x86_64/amd64 | Tested in production |
 | Ubuntu | Should run the same way (Debian-based, highest confidence); host OS doesn't matter — the container is always Debian Bookworm |
 | Other Linux distros with Docker (Fedora, etc.) | Should run the same way |
-| arm64 CPU | The ready image is built for arm64 too; before every release CI checks, under emulation, that Chromium, SQLite and image processing start. **Not yet verified** on a real arm64 server |
+| arm64 CPU | The ready image is built for arm64 too; before every release CI checks, under emulation, that Chromium, SQLite and image processing start. **Not yet verified** on a real arm64 server. There is no ready image for 32-bit ARM (armv7): build on the spot with `git pull && docker compose up -d --build` |
 | RAM | **2 GB minimum** (`mem_limit: 2048m`, `shm_size: 1gb`): Chromium runs there. The ready image is downloaded and nothing is built; if the image has to be built on the spot, on 1 GB the build dies with `Killed` / `exit code: 137` (better-sqlite3 is compiled) |
 | Disk | ~10 GB free, minimum, for the image and data |
 | Windows / macOS | Fine for development/testing via Docker Desktop; a Linux server is recommended for production (uptime, resources) |

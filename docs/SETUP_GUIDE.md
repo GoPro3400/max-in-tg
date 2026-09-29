@@ -610,8 +610,8 @@ docker compose logs -f                 # следить вживую; выйти
 docker compose restart                 # перезапустить (НЕ перечитывает .env)
 docker compose down                    # остановить
 docker compose up -d                   # запустить снова после down
-docker compose pull                    # скачать образ новой версии (обновление — §13)
-docker compose up -d --build           # только если образ собираешь сам (форк или свои правки)
+docker compose pull && docker compose up -d --no-build   # обновить до новой версии (§13)
+git pull && docker compose up -d --build                 # обновить, если образ собираешь сам (§13)
 docker compose up -d --force-recreate  # применить изменения .env
 ```
 

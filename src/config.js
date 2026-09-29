@@ -30,6 +30,15 @@ const int = (name, fallback) => {
   return parsed;
 };
 
+const DEFAULT_UPDATE_REPO = 'GoPro3400/max-in-tg';
+const updateCheckRepo = () => {
+  const value = String(process.env.UPDATE_CHECK_REPO || '').trim();
+  if (!value) return DEFAULT_UPDATE_REPO;
+  if (/^[\w.-]+\/[\w.-]+$/.test(value)) return value;
+  configWarnings.push(`UPDATE_CHECK_REPO=${value} is not in the form owner/name — using ${DEFAULT_UPDATE_REPO}`);
+  return DEFAULT_UPDATE_REPO;
+};
+
 const required = (name) => {
   const value = process.env[name];
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -191,5 +200,10 @@ export const config = {
   // Mirror reactions between MAX and Telegram (see BridgeService).
   reactionsEnabled: bool('SYNC_REACTIONS', true),
   // Show "typing…" in Telegram while someone types in MAX (see relayTyping).
-  typingEnabled: bool('SYNC_TYPING', true)
+  typingEnabled: bool('SYNC_TYPING', true),
+  // Once a day ask GitHub for the latest release and tell the owner, once,
+  // when there is a newer one (see UpdateChecker). The repository is only
+  // worth changing for a fork that publishes releases of its own.
+  updateCheck: bool('UPDATE_CHECK', true),
+  updateCheckRepo: updateCheckRepo()
 };

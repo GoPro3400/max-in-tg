@@ -1,15 +1,97 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { logger } from '../logger.js';
+
+// How many copies made before an upgrade are kept (see backupBeforeUpgrade).
+const BACKUPS_KEPT = 3;
 
 export class AppDatabase {
-  constructor(filename) {
+  // `appVersion`: the version of the bridge opening the database. When it is
+  // not the version that used the database last, a copy is made first.
+  constructor(filename, { appVersion = null } = {}) {
     fs.mkdirSync(path.dirname(filename), { recursive: true });
     this.db = new Database(filename);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
+    if (appVersion) this.backupBeforeUpgrade(filename, appVersion);
     this.migrate();
     this.prepare();
+    if (appVersion) this.setSetting('app_version', appVersion);
+  }
+
+  // The first start of a version of the bridge other than the one the database
+  // was last used by: a copy of it as it is, before migrate() changes it —
+  // what a failed update is rolled back from (data/backups/). The newest few
+  // are kept. It never stops the bridge: without a copy it starts all the same,
+  // and says so in the log.
+  //
+  // A start that then fails (a migration that throws, and the container's
+  // restart policy trying again and again) does not make a copy on every try:
+  // the one made before the first is the one that has the database as it was.
+  backupBeforeUpgrade(filename, appVersion) {
+    if (!filename || filename === ':memory:' || filename.startsWith('file:')) return null;
+    try {
+      const hasTables = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get();
+      if (!hasTables) return null; // a new database: nothing to lose
+      const previous = this.storedAppVersion();
+      if (previous === appVersion) return null;
+
+      const directory = path.join(path.dirname(filename), 'backups');
+      fs.mkdirSync(directory, { recursive: true });
+      const base = path.basename(filename).replace(/\.[^.]*$/, '');
+      const safe = (value) => String(value).replace(/[^0-9A-Za-z.+-]/g, '_');
+      const from = safe(previous || 'unknown');
+      const to = safe(appVersion);
+
+      // Only what this makes — <name>-<from>-to-<to>-<time>.sqlite, newest
+      // first — is ever looked at or removed: a copy someone put in the folder
+      // by hand stays.
+      const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const made = new RegExp(`^${escaped}-(.+)-to-(.+)-(\\d{8}T\\d+Z)\\.sqlite$`);
+      const ownCopies = () => fs.readdirSync(directory)
+        .map((name) => {
+          const match = made.exec(name);
+          return match && { name, from: match[1], to: match[2], stamp: match[3] };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.stamp.localeCompare(a.stamp) || b.name.localeCompare(a.name));
+
+      const newest = ownCopies()[0];
+      if (newest && newest.from === from && newest.to === to) {
+        logger.info({ from, to, backup: newest.name }, 'The database was already copied for this upgrade');
+        return null;
+      }
+
+      const stamp = new Date().toISOString().replace(/[-:.]/g, '');
+      const target = path.join(directory, `${base}-${from}-to-${to}-${stamp}.sqlite`);
+      // Not a file copy: the database is open in WAL mode, where the newest
+      // rows may still be in the -wal file. VACUUM INTO writes a whole,
+      // consistent database.
+      this.db.prepare('VACUUM INTO ?').run(target);
+      logger.info({ from, to, backup: target }, 'Backed up the database before the upgrade');
+
+      for (const old of ownCopies().slice(BACKUPS_KEPT)) fs.rmSync(path.join(directory, old.name), { force: true });
+      return target;
+    } catch (error) {
+      logger.error({ err: error }, 'Could not back up the database before the upgrade — carrying on without a copy');
+      return null;
+    }
+  }
+
+  // The version of the bridge that used this database last; null for a database
+  // from before versions were recorded.
+  storedAppVersion() {
+    const table = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").get();
+    if (!table) return null;
+    const row = this.db.prepare("SELECT value FROM settings WHERE key = 'app_version'").get();
+    if (!row) return null;
+    try {
+      const value = JSON.parse(row.value);
+      return typeof value === 'string' ? value : null;
+    } catch {
+      return null;
+    }
   }
 
   migrate() {

@@ -105,11 +105,11 @@ MAX Relay
 | **Active chat verify** | Title check before sending — prevents sending to wrong recipient |
 | **Startup priming** | On the first run all existing Max history is marked as seen and never forwarded to Telegram; later starts skip priming, so messages that arrived while the bridge was down are still delivered |
 | **Diagnostics** | Screenshot + HTML snapshots in `logs/diagnostics` |
-| **Media conversion** | ffmpeg-static + fluent-ffmpeg + sharp |
+| **Media conversion** | ffmpeg (Debian's package in the image, `ffmpeg-static` outside Docker) + fluent-ffmpeg + sharp |
 | **`/merge` / `/unmerge`** | Merge duplicate chats into one topic |
 | **Telegram-driven setup** | `/pair` instead of looking up your user id, MAX sign-in by QR right in the chat with the bot, relay group detected automatically when the bot is added |
 | **Docker** | `docker-compose.yml` (what the installer runs: memory cap, log rotation) plus the hardened `docker-compose.prod.yml`; the image ships a HEALTHCHECK, so `docker compose ps` shows `Up (healthy)` |
-| **Releases and updates** | A ready image of every release at `ghcr.io/gopro3400/max-in-tg` (amd64 and arm64): updating is `docker compose pull` and `docker compose up -d`. The bot tells you in Telegram about a new version (`UPDATE_CHECK`), and copies the database to `data/backups/` before the first start of a new version |
+| **Releases and updates** | A ready image of every release at `ghcr.io/gopro3400/max-in-tg` (amd64 and arm64): updating is `docker compose pull && docker compose up -d --no-build`. The bot tells you in Telegram about a new version (`UPDATE_CHECK`), and copies the database to `data/backups/` before the first start of a new version |
 | **Tests** | Unit and integration tests (vitest): messages, asyncLock, fileHelpers, networkCapture, config, database, mediaService, onboarding, and every delivery path over a real in-memory SQLite |
 
 ---
@@ -325,12 +325,14 @@ topics for every current chat.
 
 When a new version is out the bot tells you in Telegram: once a day it makes one request to
 `api.github.com` for the latest version number (nothing else is sent; `UPDATE_CHECK=false`
-in `.env` turns it off). Updating is two commands on the server, from the project folder:
+in `.env` turns it off). Updating is one line on the server, from the project folder:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose pull && docker compose up -d --no-build
 ```
+
+If the image cannot be pulled, `--no-build` keeps `up` from quietly building old code from the
+folder: the command stops with an error and the bridge keeps running on the version it had.
 
 `.env`, `data/` and the MAX sign-in are kept; no `/pair` or QR again. Before the first start
 of a new version the bridge copies the database to `data/backups/` (the last three copies
@@ -390,7 +392,7 @@ and [CHANGELOG.md](CHANGELOG.md). Pinning a version, rolling back and restoring 
   `docker-compose.yml` (what the installer brings up) caps memory and rotates logs
 - The hardened `docker-compose.prod.yml` adds `no-new-privileges`, `cap_drop: ALL`, a
   read-only root fs, `pids_limit` and tmpfs `/tmp`; run it explicitly with
-  `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d` (`up -d --build` builds the image yourself)
+  `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d --no-build` (`up -d --build` builds the image yourself)
 
 ### Routing safety principles
 
@@ -477,9 +479,9 @@ max-in-tg/
 
 Released under the **MIT License** — see the [LICENSE](LICENSE) file.
 
-Building the Docker image pulls in third-party components under other licences (ffmpeg,
-libvips) — see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). The image is meant to be
-built locally on your own server, not redistributed.
+The Docker image contains third-party components under other licences (ffmpeg from Debian —
+GPL, libvips — LGPL): what follows from that, and where their licence texts and source are —
+see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) (in Russian).
 
 ## Disclaimer
 

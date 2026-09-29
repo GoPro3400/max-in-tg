@@ -351,8 +351,23 @@ export class BridgeService {
       notify: (text) => this.notifyUpdate(text),
       currentVersion: APP_VERSION,
       repo: this.config.updateCheckRepo,
-      enabled: this.config.updateCheck === true
+      enabled: this.config.updateCheck === true,
+      pinnedVersion: this.config.pinnedVersion
     });
+  }
+
+  // The copy of the database that is made before an upgrade could not be made
+  // (AppDatabase.backupBeforeUpgrade): the bridge went on without one, and the
+  // owner should know — it is in the log, which nobody reads. Once.
+  async reportBackupProblem() {
+    const problem = this.db.backupProblem;
+    if (!problem) return;
+    this.db.backupProblem = null;
+    await this.notifyOwner(
+      `⚠️ Перед обновлением не удалось сделать копию базы: ${problem}.\n`
+      + 'Мост запущен и работает, но вернуть базу «как до обновления» не получится. '
+      + 'Освободи место на диске или проверь права на папку data/ и, если нужно, сделай бэкап вручную (SETUP_GUIDE §12).'
+    );
   }
 
   async notifyUpdate(text) {
@@ -375,6 +390,7 @@ export class BridgeService {
     await this.telegramBot.start();
     logger.info('Telegram bot started');
     await this.ensureOwner();
+    await this.reportBackupProblem();
 
     logger.info('Starting Max Web client');
     await this.startMaxClient();

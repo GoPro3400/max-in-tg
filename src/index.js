@@ -14,7 +14,7 @@ fs.mkdirSync(config.mediaDir, { recursive: true });
 fs.mkdirSync(config.diagnosticDir, { recursive: true });
 
 logger.info({ version: APP_VERSION }, 'Starting max-in-tg');
-const db = new AppDatabase(config.sqlitePath, { appVersion: APP_VERSION });
+const db = new AppDatabase(config.sqlitePath, { appVersion: APP_VERSION, logger });
 const mediaService = new MediaService(config.mediaDir);
 const maxClient = new MaxWebClient(config.max, {
   diagnosticDir: config.diagnosticDir,

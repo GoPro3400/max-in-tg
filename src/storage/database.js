@@ -1,15 +1,58 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { logger } from '../logger.js';
 
 // How many copies made before an upgrade are kept (see backupBeforeUpgrade).
 const BACKUPS_KEPT = 3;
+// The same upgrade tried again within this long is not copied again.
+const SAME_UPGRADE_WINDOW_MS = 24 * 60 * 60 * 1000;
+// A copy needs room: its size and half as much again, plus this.
+const BACKUP_HEADROOM_BYTES = 64 * 1024 * 1024;
+
+// What the database says when nobody gave it a logger (tests, scripts). The
+// storage layer does not import the app's logger: that would pull in its
+// configuration (a bot token) just to open a database.
+const quietLogger = {
+  info() {},
+  warn() {},
+  error: (fields, message) => console.error(message, fields?.err?.message ?? '')
+};
+
+const fileBytes = (file) => {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return 0;
+  }
+};
+
+// Free room where `directory` is, or null when the system does not say.
+const freeBytes = (directory) => {
+  try {
+    const stats = fs.statfsSync(directory);
+    return Number(stats.bavail) * Number(stats.bsize);
+  } catch {
+    return null;
+  }
+};
+
+// "20260929T165456641Z" (see backupBeforeUpgrade) → milliseconds; 0 if it is not one.
+const stampTime = (stamp) => {
+  const parts = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z$/.exec(stamp);
+  if (!parts) return 0;
+  const [year, month, day, hour, minute, second, millisecond] = parts.slice(1).map(Number);
+  return Date.UTC(year, month - 1, day, hour, minute, second, millisecond);
+};
 
 export class AppDatabase {
   // `appVersion`: the version of the bridge opening the database. When it is
   // not the version that used the database last, a copy is made first.
-  constructor(filename, { appVersion = null } = {}) {
+  // `logger`: pino's, when there is one.
+  constructor(filename, { appVersion = null, logger = quietLogger } = {}) {
+    this.log = logger;
+    // Why the copy before an upgrade was not made, if it was not: the bridge
+    // tells the owner once Telegram is up.
+    this.backupProblem = null;
     fs.mkdirSync(path.dirname(filename), { recursive: true });
     this.db = new Database(filename);
     this.db.pragma('journal_mode = WAL');
@@ -26,9 +69,15 @@ export class AppDatabase {
   // are kept. It never stops the bridge: without a copy it starts all the same,
   // and says so in the log.
   //
+  // A copy exists under its name only once it is whole: it is written as
+  // <name>.partial and renamed. A start that dies in the middle (no room, a
+  // kill, a docker stop) leaves a .partial file, which the next try removes —
+  // never a truncated copy that a restore would trust.
+  //
   // A start that then fails (a migration that throws, and the container's
   // restart policy trying again and again) does not make a copy on every try:
   // the one made before the first is the one that has the database as it was.
+  // That holds for a day; the same upgrade a longer time later is copied afresh.
   backupBeforeUpgrade(filename, appVersion) {
     if (!filename || filename === ':memory:' || filename.startsWith('file:')) return null;
     try {
@@ -49,6 +98,14 @@ export class AppDatabase {
       // by hand stays.
       const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const made = new RegExp(`^${escaped}-(.+)-to-(.+)-(\\d{8}T\\d+Z)\\.sqlite$`);
+      const unfinished = new RegExp(`^${escaped}-.+\\.sqlite\\.partial(-journal)?$`);
+
+      // What an earlier try left half done, and a copy of ours that is empty.
+      for (const name of fs.readdirSync(directory)) {
+        const file = path.join(directory, name);
+        if (unfinished.test(name) || (made.test(name) && fileBytes(file) === 0)) fs.rmSync(file, { force: true });
+      }
+
       const ownCopies = () => fs.readdirSync(directory)
         .map((name) => {
           const match = made.exec(name);
@@ -58,23 +115,42 @@ export class AppDatabase {
         .sort((a, b) => b.stamp.localeCompare(a.stamp) || b.name.localeCompare(a.name));
 
       const newest = ownCopies()[0];
-      if (newest && newest.from === from && newest.to === to) {
-        logger.info({ from, to, backup: newest.name }, 'The database was already copied for this upgrade');
+      if (newest && newest.from === from && newest.to === to && Date.now() - stampTime(newest.stamp) < SAME_UPGRADE_WINDOW_MS) {
+        this.log.info({ from, to, backup: newest.name }, 'The database was already copied for this upgrade');
         return null;
+      }
+
+      // Room for it: the copy is as big as the database (compacted, so not
+      // bigger), and a full disk stops the bridge writing at all.
+      const databaseBytes = fileBytes(filename) + fileBytes(`${filename}-wal`);
+      const free = freeBytes(directory);
+      if (free !== null && free < databaseBytes * 1.5 + BACKUP_HEADROOM_BYTES) {
+        const mb = (bytes) => Math.round(bytes / (1024 * 1024));
+        throw new Error(`not enough free space for a copy: ${mb(free)} MB free, the database takes ${mb(databaseBytes)} MB`);
       }
 
       const stamp = new Date().toISOString().replace(/[-:.]/g, '');
       const target = path.join(directory, `${base}-${from}-to-${to}-${stamp}.sqlite`);
-      // Not a file copy: the database is open in WAL mode, where the newest
-      // rows may still be in the -wal file. VACUUM INTO writes a whole,
-      // consistent database.
-      this.db.prepare('VACUUM INTO ?').run(target);
-      logger.info({ from, to, backup: target }, 'Backed up the database before the upgrade');
+      const partial = `${target}.partial`;
+      try {
+        // Not a file copy: the database is open in WAL mode, where the newest
+        // rows may still be in the -wal file. VACUUM INTO writes a whole,
+        // consistent database.
+        this.db.prepare('VACUUM INTO ?').run(partial);
+        if (fileBytes(partial) === 0) throw new Error('the copy came out empty');
+        fs.renameSync(partial, target);
+      } catch (error) {
+        fs.rmSync(partial, { force: true });
+        fs.rmSync(`${partial}-journal`, { force: true });
+        throw error;
+      }
+      this.log.info({ from, to, backup: target }, 'Backed up the database before the upgrade');
 
       for (const old of ownCopies().slice(BACKUPS_KEPT)) fs.rmSync(path.join(directory, old.name), { force: true });
       return target;
     } catch (error) {
-      logger.error({ err: error }, 'Could not back up the database before the upgrade — carrying on without a copy');
+      this.backupProblem = error?.message || String(error);
+      this.log.error({ err: error }, 'Could not back up the database before the upgrade — carrying on without a copy');
       return null;
     }
   }
@@ -244,8 +320,7 @@ export class AppDatabase {
           this.db.exec('DROP TABLE message_deliveries_legacy');
         })();
       } catch (error) {
-        // No logger here (it pulls in config, which tests must not require).
-        console.error('Failed to migrate legacy message_deliveries rows; legacy table kept:', error);
+        this.log.error({ err: error }, 'Failed to migrate legacy message_deliveries rows; legacy table kept');
       }
     }
 

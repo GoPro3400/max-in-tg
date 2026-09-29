@@ -53,12 +53,22 @@ check 'SQLite and image processing work (better-sqlite3, sharp)' \
     await sharp({ create: { width: 2, height: 2, channels: 3, background: '#ffffff' } }).png().toBuffer();
   "
 
-check 'ffmpeg runs' \
+# The ffmpeg the bridge runs is the distribution's (see the Dockerfile), and
+# there is no second, downloaded copy of it left in node_modules.
+check 'ffmpeg is the distribution'"'"'s package' \
   in_image node --input-type=module -e "
     const { default: ffmpegPath } = await import('ffmpeg-static');
+    const { existsSync } = await import('node:fs');
     const { execFileSync } = await import('node:child_process');
-    execFileSync(ffmpegPath, ['-version'], { stdio: 'ignore' });
+    if (ffmpegPath !== '/usr/bin/ffmpeg') throw new Error('the bridge would run ' + ffmpegPath);
+    if (existsSync('node_modules/ffmpeg-static/ffmpeg')) throw new Error('ffmpeg-static downloaded a build of its own');
+    console.log(execFileSync(ffmpegPath, ['-version']).toString().split('\n')[0]);
   "
+
+# Real files through the bridge's own MediaService: what a voice message, a
+# video note and the stickers go through, with this ffmpeg.
+check 'voice, video and stickers convert (scripts/smoke-media.mjs)' \
+  in_image node scripts/smoke-media.mjs
 
 check 'Chromium, Xvfb and tini are there' \
   in_image sh -c 'chromium --version && command -v Xvfb && command -v tini'

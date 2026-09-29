@@ -39,6 +39,8 @@ export class UpdateChecker {
     currentVersion,
     repo,
     enabled = false,
+    // MAX_IN_TG_VERSION from .env: the version the Docker image is pinned to.
+    pinnedVersion = '',
     fetchImpl = globalThis.fetch,
     now = () => Date.now(),
     intervalMs = DAY_MS
@@ -48,6 +50,7 @@ export class UpdateChecker {
     this.currentVersion = currentVersion;
     this.repo = repo;
     this.enabled = Boolean(enabled);
+    this.pinnedVersion = String(pinnedVersion ?? '').trim();
     this.fetchImpl = fetchImpl;
     this.now = now;
     this.intervalMs = intervalMs;
@@ -76,7 +79,11 @@ export class UpdateChecker {
     if (!parseVersion(this.currentVersion)) return { state: 'unknown-version' };
 
     let state = this.readState();
-    if (!state.checkedAt || this.now() - state.checkedAt >= this.intervalMs) {
+    // A time that is not one, or one in the future (the clock was set back),
+    // would keep the check off for good or until the clock caught up: it counts
+    // as stale.
+    const age = this.now() - state.checkedAt;
+    if (!Number.isFinite(age) || age < 0 || age >= this.intervalMs) {
       let latest;
       try {
         latest = await this.fetchLatest();
@@ -129,16 +136,30 @@ export class UpdateChecker {
     };
   }
 
+  // What to do when the image is pinned in .env (MAX_IN_TG_VERSION): a pull
+  // brings nothing newer than the pin, so the notice says so. A series pin
+  // ("0.2") follows the newest 0.2.x by itself and needs no words.
+  pinNote(latest) {
+    const pin = this.pinnedVersion;
+    if (!pin || pin === 'latest' || !/^[\w.-]{1,40}$/.test(pin)) return null;
+    const bare = pin.replace(/^v/, '');
+    if (latest.version === bare || latest.version.startsWith(`${bare}.`)) return null;
+    return `В .env закреплена версия ${pin} (MAX_IN_TG_VERSION): сначала поменяй её на ${latest.version} или удали эту строку — тогда будет всегда самая свежая.`;
+  }
+
   message(latest) {
+    const pin = this.pinNote(latest);
     return [
       `🆕 Вышла новая версия max-in-tg: ${latest.version} (сейчас ${this.currentVersion}).`,
       `Что нового: ${latest.url}`,
       '',
       'Обновить — на сервере, в папке проекта:',
-      'docker compose pull',
-      'docker compose up -d',
+      'docker compose pull && docker compose up -d --no-build',
+      'Если мост запущен из docker-compose.prod.yml, добавь к обеим командам -f docker-compose.prod.yml.',
+      ...(pin ? ['', pin] : []),
       '',
-      'Проверка идёт раз в сутки и состоит из одного запроса к api.github.com за номером последней версии. Отключить: UPDATE_CHECK=false в .env.'
+      'Перед первым запуском новой версии база копируется в data/backups/ — можно откатиться.',
+      'Проверка идёт раз в сутки: один запрос к api.github.com за номером последней версии. Отключить: UPDATE_CHECK=false в .env.'
     ].join('\n');
   }
 

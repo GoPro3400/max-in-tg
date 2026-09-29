@@ -3,7 +3,8 @@ name: Image
 # The Docker image people run. A change that can affect it is built (for amd64
 # and, emulated, arm64) and smoke-tested here, so a broken image shows up in
 # the pull request. A version tag (v0.2.0) also publishes the image to GitHub's
-# container registry and creates the release page — see CONTRIBUTING.md.
+# container registry and, once anyone can pull it, creates the release page —
+# see CONTRIBUTING.md.
 
 on:
   pull_request:
@@ -15,6 +16,7 @@ on:
       - package-lock.json
       - scripts/start.sh
       - scripts/smoke-image.sh
+      - scripts/smoke-media.mjs
       - .github/workflows/image.yml
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']
@@ -36,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      contents: write # the release page
+      contents: read
       packages: write # ghcr.io
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +50,7 @@ jobs:
         # ghcr.io wants it lower case (the account is GoPro3400).
         run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
+      # Before anything is built: a tag that cannot become a release stops here.
       - name: Check that the tag is a proper release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -61,14 +64,16 @@ jobs:
             echo "::error::The tag is not on main: releases are made from main."
             exit 1
           fi
-          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no section '## [$version]'."
+          if ! problem=$(scripts/release-notes.sh "$version" 2>&1 > /dev/null); then
+            echo "::error::$problem"
             exit 1
           fi
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
+      # The layer cache only saves time: a problem with it must not fail a build
+      # (ignore-error on cache-to).
       - name: Build for amd64
         uses: docker/build-push-action@v6
         with:
@@ -77,7 +82,7 @@ jobs:
           load: true
           tags: max-in-tg:smoke-amd64
           cache-from: type=gha,scope=amd64
-          cache-to: type=gha,mode=max,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64,ignore-error=true
           provenance: false
 
       - name: Smoke-test the amd64 image
@@ -94,7 +99,7 @@ jobs:
           load: true
           tags: max-in-tg:smoke-arm64
           cache-from: type=gha,scope=arm64
-          cache-to: type=gha,mode=max,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64,ignore-error=true
           provenance: false
 
       - name: Smoke-test the arm64 image
@@ -140,28 +145,54 @@ jobs:
             type=gha,scope=arm64
           provenance: false
 
-      - name: Release page
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          IMAGE: ${{ steps.name.outputs.image }}
+  # The release page is what the bot's update notice looks for: from the moment
+  # it exists, every running bridge tells its owner to `docker compose pull`. So
+  # it is made only once that works for someone who is not logged in — a package
+  # that has just been published is private until its owner makes it public (once,
+  # in the GitHub web interface; there is no way to do it from a workflow). It is
+  # a job of its own so that, after that, "Re-run failed jobs" repeats only this
+  # and not the hour of building.
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # the release page
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that anyone can pull the image
         run: |
           version="${GITHUB_REF_NAME#v}"
+          name="${GITHUB_REPOSITORY,,}"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json'
+          # No login: this is what `docker compose pull` on a user's server is.
+          for _ in 1 2 3; do
+            if token=$(curl -fsS "https://ghcr.io/token?scope=repository:$name:pull" | jq -er .token) \
+              && curl -fsS -o /dev/null -H "Authorization: Bearer $token" -H "Accept: $accept" "https://ghcr.io/v2/$name/manifests/$version"; then
+              echo "ghcr.io/$name:$version can be pulled without logging in."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::ghcr.io/$name:$version cannot be pulled without logging in: the package is private. Make it public once — GitHub, your profile, Packages, the package, Package settings, Change visibility, Public — and then run this job again (Re-run failed jobs). The release page waits for that, because the bot tells its users to update as soon as the page exists."
+          exit 1
+
+      - name: Release page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
           # The release's own text: what the changelog says about this version
           # before its first "###" heading.
-          awk -v version="$version" '
-            /^## \[/ { if (found) exit; found = index($0, "[" version "]") > 0; next }
-            found && /^### / { exit }
-            found { print }
-          ' CHANGELOG.md > notes.md
-          if ! grep -q '[^[:space:]]' notes.md; then
-            echo "::error::CHANGELOG.md has no summary for $version (the text between its ## line and the first ### line)."
-            exit 1
-          fi
+          scripts/release-notes.sh "$version" > notes.md
           {
             printf '\n---\n\n'
             printf 'Полный список изменений: [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n\n' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
-            printf 'Образ: `%s:%s` (amd64 и arm64).\n' "$IMAGE" "$version"
+            # shellcheck disable=SC2016 # the backticks are markdown, not a command
+            printf 'Образ: `%s:%s` (amd64 и arm64).\n' "$image" "$version"
           } >> notes.md
           flags=()
           case "$version" in *-*) flags+=(--prerelease) ;; esac

@@ -205,5 +205,9 @@ export const config = {
   // when there is a newer one (see UpdateChecker). The repository is only
   // worth changing for a fork that publishes releases of its own.
   updateCheck: bool('UPDATE_CHECK', true),
-  updateCheckRepo: updateCheckRepo()
+  updateCheckRepo: updateCheckRepo(),
+  // MAX_IN_TG_VERSION picks the Docker image compose runs (docker-compose.yml).
+  // The bridge only reads it to say, in the update notice, that a pinned
+  // version has to be changed first.
+  pinnedVersion: String(process.env.MAX_IN_TG_VERSION || '').trim()
 };

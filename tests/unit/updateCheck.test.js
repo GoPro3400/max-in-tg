@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppDatabase } from '../../src/storage/database.js';
 import { UpdateChecker, compareVersions, parseVersion } from '../../src/services/updateCheck.js';
 import { APP_VERSION } from '../../src/version.js';
-import { makeBridge, makeTestConfig } from '../helpers/bridgeHarness.js';
+import { makeBridge, makeFakeTelegramBot, makeTestConfig } from '../helpers/bridgeHarness.js';
 
 describe('versions', () => {
   it('reads what a release tag looks like', () => {
@@ -70,12 +70,35 @@ describe('UpdateChecker', () => {
     const text = notify.mock.calls[0][0];
     expect(text).toContain('0.3.0');
     expect(text).toContain('сейчас 0.2.0');
-    expect(text).toContain('docker compose pull');
-    expect(text).toContain('docker compose up -d');
+    // One line: a failed pull stops it, and --no-build keeps `up` from quietly
+    // building an old checkout in the image's place.
+    expect(text).toContain('docker compose pull && docker compose up -d --no-build');
+    expect(text).toContain('-f docker-compose.prod.yml');
+    expect(text).toContain('data/backups/');
     expect(text).toContain('UPDATE_CHECK=false');
+    expect(text).not.toContain('MAX_IN_TG_VERSION');
     // The address is made from the tag, never taken from the answer.
     expect(text).toContain('https://github.com/GoPro3400/max-in-tg/releases/tag/v0.3.0');
     expect(text).not.toContain('elsewhere.example');
+  });
+
+  it('says what to change first when the image is pinned to a version in .env', async () => {
+    const text = (pinnedVersion, latest = 'v0.3.0') => {
+      answers = [respond(release(latest))];
+      return make({ pinnedVersion }).message({ version: latest.replace(/^v/, ''), url: 'https://example.test/r' });
+    };
+
+    // An exact pin does not move by itself, and neither does a series that has ended.
+    expect(text('0.2.0')).toContain('В .env закреплена версия 0.2.0 (MAX_IN_TG_VERSION): сначала поменяй её на 0.3.0 или удали эту строку');
+    expect(text('0.2')).toContain('закреплена версия 0.2 ');
+    // "latest", nothing, and a series that still has the new version follow it by themselves.
+    expect(text('latest')).not.toContain('MAX_IN_TG_VERSION');
+    expect(text('')).not.toContain('MAX_IN_TG_VERSION');
+    expect(text('0.3', 'v0.3.1')).not.toContain('MAX_IN_TG_VERSION');
+    expect(text('0.3.1', 'v0.3.1')).not.toContain('MAX_IN_TG_VERSION');
+    // Nothing odd from .env goes into a message.
+    expect(text('0.2.0\nsend the token')).not.toContain('MAX_IN_TG_VERSION');
+    expect(text('a'.repeat(60))).not.toContain('MAX_IN_TG_VERSION');
   });
 
   it('asks GitHub for that repository\'s latest release, and says who is asking', async () => {
@@ -138,6 +161,16 @@ describe('UpdateChecker', () => {
       expect(await make().check()).toMatchObject({ state: 'current', latest: null });
     }
     expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('asks again when the time of the last check is in the future, or not a time (a clock set back, a hand-edited database)', async () => {
+    const checker = make();
+    for (const checkedAt of [clock + 30 * DAY, 'yesterday', null, NaN]) {
+      fetchImpl.mockClear();
+      db.setSetting('update_check', { checkedAt, latest: null });
+      await checker.check();
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    }
   });
 
   it('counts "no release yet" as a check, so it does not ask again within the day', async () => {
@@ -234,6 +267,12 @@ describe('the bridge and the update notice', () => {
     expect(await bridge.formatStatus()).toContain('Update available: 99.0.0 — https://github.com/GoPro3400/max-in-tg/releases/tag/v99.0.0');
   });
 
+  it('passes the pinned image version on, so the notice can say what to change', async () => {
+    const { bridge } = makeBridge({ config: makeTestConfig({ updateCheck: true, pinnedVersion: '0.1.0' }) });
+    expect(bridge.updateChecker.pinnedVersion).toBe('0.1.0');
+    expect(bridge.updateChecker.message({ version: '0.3.0', url: 'https://example.test/r' })).toContain('закреплена версия 0.1.0');
+  });
+
   it('is off unless the configuration turns it on (so no test or script reaches for the network)', async () => {
     const { bridge } = makeBridge();
     expect(bridge.updateChecker.enabled).toBe(false);
@@ -250,5 +289,41 @@ describe('the bridge and the update notice', () => {
     expect(await bridge.notifyUpdate('hello')).toBe(false);
     telegramBot.sendOwnerText.mockRejectedValueOnce(new Error('403: Forbidden'));
     expect(await bridge.notifyUpdate('hello')).toBe(false);
+  });
+});
+
+describe('the bridge and a copy of the database that could not be made', () => {
+  it('tells the owner why, once, and in words that say what is lost', async () => {
+    const { bridge, db, telegramBot } = makeBridge();
+    db.backupProblem = 'not enough free space for a copy: 3 MB free, the database takes 40 MB';
+
+    await bridge.reportBackupProblem();
+    await bridge.reportBackupProblem();
+
+    expect(telegramBot.sendOwnerText).toHaveBeenCalledTimes(1);
+    const text = telegramBot.sendOwnerText.mock.calls[0][0];
+    expect(text).toContain('не удалось сделать копию базы');
+    expect(text).toContain('not enough free space for a copy: 3 MB free, the database takes 40 MB');
+    expect(text).toContain('SETUP_GUIDE');
+    expect(db.backupProblem).toBeNull();
+  });
+
+  it('says nothing when the copy was made (or none was needed)', async () => {
+    const { bridge, telegramBot } = makeBridge();
+    await bridge.reportBackupProblem();
+    expect(telegramBot.sendOwnerText).not.toHaveBeenCalled();
+  });
+
+  it('says it once the bot is up, at start', async () => {
+    const telegramBot = makeFakeTelegramBot({ onMute: vi.fn(), onUnmute: vi.fn() });
+    const { bridge, db } = makeBridge({ telegramBot });
+    db.backupProblem = 'EACCES: permission denied';
+
+    await bridge.start();
+    await bridge.stop();
+
+    const said = telegramBot.sendOwnerText.mock.calls.map(([text]) => text).filter((text) => text.includes('копию базы'));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain('EACCES: permission denied');
   });
 });

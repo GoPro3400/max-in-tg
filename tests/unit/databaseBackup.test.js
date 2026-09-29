@@ -12,11 +12,22 @@ describe('database copy before an upgrade', () => {
   let dir;
   let file;
   const opened = [];
-  const open = (appVersion) => {
-    const db = new AppDatabase(file, appVersion === undefined ? {} : { appVersion });
+  // For the tests where the copy is meant to fail: the failure is not printed.
+  const quiet = { info() {}, warn() {}, error() {} };
+  const open = (appVersion, logger) => {
+    const db = new AppDatabase(file, appVersion === undefined ? {} : { appVersion, ...(logger ? { logger } : {}) });
     opened.push(db);
     return db;
   };
+  // A copy already in the folder, made like the bridge names them, with the
+  // database as it is now (closed first, so the file is whole).
+  const putCopy = (from, to, stamp) => {
+    fs.mkdirSync(path.join(dir, 'backups'), { recursive: true });
+    const name = `max-in-tg-${from}-to-${to}-${stamp}.sqlite`;
+    fs.copyFileSync(file, path.join(dir, 'backups', name));
+    return name;
+  };
+  const stampNow = () => new Date().toISOString().replace(/[-:.]/g, '');
   const backups = () => {
     const directory = path.join(dir, 'backups');
     return fs.existsSync(directory) ? fs.readdirSync(directory).sort() : [];
@@ -157,15 +168,138 @@ describe('database copy before an upgrade', () => {
       .toEqual(['0.1.0>0.2.0', '0.1.0>0.2.0', '0.2.0>0.1.0']);
   });
 
-  it('starts all the same when the copy cannot be made', () => {
+  it('starts all the same when the copy cannot be made, and keeps the reason for the owner', () => {
     open('0.1.0').close();
     opened.pop();
     // `backups` is a file, so the folder cannot be made.
     fs.writeFileSync(path.join(dir, 'backups'), 'not a folder');
 
     let db;
-    expect(() => { db = open('0.2.0'); }).not.toThrow();
+    expect(() => { db = open('0.2.0', quiet); }).not.toThrow();
     expect(db.getSetting('app_version')).toBe('0.2.0');
+    expect(db.backupProblem).toEqual(expect.any(String));
+  });
+
+  it('never leaves a half-made copy under a name a restore would trust', () => {
+    open('0.1.0').close();
+    opened.pop();
+
+    // The copy is written, and the move to its name fails (as a kill or a full
+    // disk would stop it a step earlier or later).
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+      throw new Error('no more room');
+    });
+    let db;
+    try {
+      expect(() => { db = open('0.2.0', quiet); }).not.toThrow();
+    } finally {
+      rename.mockRestore();
+    }
+
+    expect(backups()).toEqual([]);
+    expect(db.backupProblem).toBe('no more room');
+    expect(db.getSetting('app_version')).toBe('0.2.0');
+  });
+
+  it('does not keep a copy that came out empty', () => {
+    open('0.1.0').close();
+    opened.pop();
+    const stat = fs.statSync;
+    const empty = vi.spyOn(fs, 'statSync').mockImplementation((target, ...rest) => (
+      String(target).endsWith('.partial') ? { size: 0 } : stat(target, ...rest)
+    ));
+    let db;
+    try {
+      db = open('0.2.0', quiet);
+    } finally {
+      empty.mockRestore();
+    }
+    expect(backups()).toEqual([]);
+    expect(db.backupProblem).toMatch(/came out empty/);
+  });
+
+  it('removes what an earlier try left half done, and an empty copy, and copies', () => {
+    const before = open('0.1.0');
+    before.upsertChat({ id: 'Иван', title: 'Иван', metadata: {} });
+    before.close();
+    opened.pop();
+    fs.mkdirSync(path.join(dir, 'backups'));
+    // A copy that was killed midway, its journal, and an empty copy of this very upgrade.
+    fs.writeFileSync(path.join(dir, 'backups', 'max-in-tg-0.1.0-to-0.2.0-20260101T000000000Z.sqlite.partial'), 'half');
+    fs.writeFileSync(path.join(dir, 'backups', 'max-in-tg-0.1.0-to-0.2.0-20260101T000000000Z.sqlite.partial-journal'), 'half');
+    fs.writeFileSync(path.join(dir, 'backups', `max-in-tg-0.1.0-to-0.2.0-${stampNow()}.sqlite`), '');
+
+    open('0.2.0');
+
+    // The empty one did not count as "already copied": a whole copy was made.
+    const names = backups();
+    expect(names).toHaveLength(1);
+    expect(names[0]).toMatch(/^max-in-tg-0\.1\.0-to-0\.2\.0-\d{8}T\d+Z\.sqlite$/);
+    expect(rowsIn(names[0])).toEqual(['Иван']);
+  });
+
+  it('copies nothing when there is no room for a copy, and says why', () => {
+    open('0.1.0').close();
+    opened.pop();
+    const statfs = vi.spyOn(fs, 'statfsSync').mockReturnValue({ bavail: 10, bsize: 1024 });
+    let db;
+    try {
+      db = open('0.2.0', quiet);
+    } finally {
+      statfs.mockRestore();
+    }
+    expect(backups()).toEqual([]);
+    expect(db.backupProblem).toMatch(/not enough free space/);
+    expect(db.getSetting('app_version')).toBe('0.2.0');
+  });
+
+  it('is not put off by a system that does not say how much room there is', () => {
+    open('0.1.0').close();
+    opened.pop();
+    const statfs = vi.spyOn(fs, 'statfsSync').mockImplementation(() => {
+      throw new Error('not supported here');
+    });
+    try {
+      open('0.2.0');
+    } finally {
+      statfs.mockRestore();
+    }
+    expect(backups()).toHaveLength(1);
+  });
+
+  it('copies the same upgrade again when the earlier copy is more than a day old', () => {
+    open('0.1.0').close();
+    opened.pop();
+    // A month ago: the database was put back, and has been used since.
+    const old = putCopy('0.1.0', '0.2.0', '20200101T000000000Z');
+
+    open('0.2.0');
+
+    const names = backups();
+    expect(names).toHaveLength(2);
+    expect(names).toContain(old);
+  });
+
+  it('does not copy the same upgrade again within the day (a restart that fails, again and again)', () => {
+    open('0.1.0').close();
+    opened.pop();
+    const recent = putCopy('0.1.0', '0.2.0', stampNow());
+
+    open('0.2.0');
+
+    expect(backups()).toEqual([recent]);
+  });
+
+  it('logs through the logger it is given', () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    open('0.1.0', logger).close();
+    opened.pop();
+    open('0.2.0', logger);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ from: '0.1.0', to: '0.2.0', backup: expect.stringContaining('backups') }),
+      'Backed up the database before the upgrade'
+    );
+    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it('does nothing for an in-memory database', () => {

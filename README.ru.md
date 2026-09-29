@@ -106,11 +106,11 @@ MAX Relay
 | **Active chat verify** | Проверка заголовка перед отправкой — защита от отправки не тому |
 | **Startup priming** | На первом запуске вся существующая история Max помечается прочитанной и не пересылается в Telegram; на последующих запусках прайминг не делается, поэтому сообщения, пришедшие пока мост лежал, всё-таки доставляются |
 | **Diagnostics** | Screenshot + HTML снимки в `logs/diagnostics` |
-| **Media conversion** | ffmpeg-static + fluent-ffmpeg + sharp |
+| **Media conversion** | ffmpeg (в образе — пакет Debian, без Docker — `ffmpeg-static`) + fluent-ffmpeg + sharp |
 | **`/merge` / `/unmerge`** | Объединение дублированных чатов в один topic |
 | **Настройка из Telegram** | `/pair` вместо поиска user id, вход в MAX по QR прямо в чате с ботом, группа-релей определяется автоматически при добавлении бота |
 | **Docker** | `docker-compose.yml` (его поднимает установщик: лимит памяти, ротация логов) и hardened `docker-compose.prod.yml`; в образе есть HEALTHCHECK — `docker compose ps` показывает `Up (healthy)` |
-| **Релизы и обновление** | Готовый образ каждого релиза в `ghcr.io/gopro3400/max-in-tg` (amd64 и arm64): обновление — `docker compose pull` и `docker compose up -d`. Бот сам пишет в Telegram о новой версии (`UPDATE_CHECK`), а перед первым запуском новой версии копирует базу в `data/backups/` |
+| **Релизы и обновление** | Готовый образ каждого релиза в `ghcr.io/gopro3400/max-in-tg` (amd64 и arm64): обновление — `docker compose pull && docker compose up -d --no-build`. Бот сам пишет в Telegram о новой версии (`UPDATE_CHECK`), а перед первым запуском новой версии копирует базу в `data/backups/` |
 | **Тесты** | Unit- и интеграционные тесты (vitest): messages, asyncLock, fileHelpers, networkCapture, config, database, mediaService, онбординг и все пути доставки над реальной in-memory SQLite |
 | **Shared utilities** | `fileHelpers.js` и `networkCapture.js` — общие утилиты |
 
@@ -327,13 +327,15 @@ MAX, поэтому держи Telegram открытым на компьютер
 
 Когда выходит новая версия, бот сам напишет об этом в Telegram: раз в сутки он делает один
 запрос к `api.github.com` за номером последней версии (больше ничего не отправляется;
-`UPDATE_CHECK=false` в `.env` отключает проверку). Обновление — две команды на сервере, из
+`UPDATE_CHECK=false` в `.env` отключает проверку). Обновление — одна строка на сервере, из
 каталога проекта:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose pull && docker compose up -d --no-build
 ```
+
+Если образ не скачался, `--no-build` не даст `up` тихо собрать старый код из каталога: команда
+остановится с ошибкой, а мост продолжит работать на прежней версии.
 
 `.env`, `data/` и вход в MAX сохраняются, `/pair` и QR заново не нужны. Перед первым
 запуском новой версии мост сам копирует базу в `data/backups/` и хранит три последние
@@ -393,7 +395,7 @@ docker compose up -d
   `docker-compose.yml` (его поднимает установщик) ограничивает память и ротирует логи
 - Hardened-конфиг `docker-compose.prod.yml` добавляет `no-new-privileges`,
   `cap_drop: ALL`, read-only root fs, `pids_limit` и tmpfs `/tmp`; запускается отдельно:
-  `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d` (`up -d --build` — собрать образ самому)
+  `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d --no-build` (`up -d --build` — собрать образ самому)
 
 ### Принципы маршрутизации
 
@@ -459,9 +461,9 @@ cd max-in-tg
 
 Распространяется под лицензией **MIT** — см. файл [LICENSE](LICENSE).
 
-Сборка Docker-образа подтягивает сторонние компоненты под другими лицензиями (ffmpeg,
-libvips) — см. [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Образ рассчитан на
-локальную сборку у себя на сервере, а не на распространение.
+Docker-образ содержит сторонние компоненты под другими лицензиями (ffmpeg из Debian — GPL,
+libvips — LGPL): что из этого следует и где их лицензионные тексты и исходный код —
+в [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 ## Дисклеймер
 

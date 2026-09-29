@@ -140,7 +140,7 @@ MAX Relay
 | Telegram | Telegraf 4.x |
 | Browser automation | Puppeteer 24 + stealth plugin (его задача — не дать веб-клиенту MAX распознать автоматизацию) |
 | Database | better-sqlite3 |
-| Media processing | ffmpeg-static, fluent-ffmpeg, sharp |
+| Media processing | ffmpeg (в образе — пакет Debian, без Docker — `ffmpeg-static`), fluent-ffmpeg, sharp |
 | Process manager | Docker Compose; готовый образ каждого релиза — `ghcr.io/gopro3400/max-in-tg` |
 | Testing | Vitest |
 | Logging | Pino + pino-pretty |
@@ -291,12 +291,14 @@ QR-код тебе в личку. Сканировать надо камерой
 
 Когда выходит новая версия, бот сам напишет об этом в Telegram (раз в сутки он спрашивает
 у GitHub номер последней версии; `UPDATE_CHECK=false` в `.env` отключает). Обновление —
-две команды на сервере, из каталога проекта:
+одна строка на сервере, из каталога проекта:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose pull && docker compose up -d --no-build
 ```
+
+Если образ не скачался, `--no-build` не даст `up` тихо собрать старый код из каталога: команда
+остановится с ошибкой, а мост продолжит работать на прежней версии.
 
 `.env`, `data/` и вход в MAX сохраняются, `/pair` и QR заново не нужны. Перед первым
 запуском новой версии мост сам копирует базу в `data/backups/` (три последние копии). Что
@@ -451,7 +453,7 @@ max-in-tg/
 - Контейнер работает под non-root uid 10001 в обеих конфигурациях; `docker-compose.yml`
   (его поднимает установщик) ограничивает память и ротирует логи, а hardened-конфиг
   `docker-compose.prod.yml` добавляет `no-new-privileges`, `cap_drop: ALL`, read-only
-  root fs и `pids_limit` — запускается отдельно: `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d` (`up -d --build` — собрать образ самому)
+  root fs и `pids_limit` — запускается отдельно: `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d --no-build` (`up -d --build` — собрать образ самому)
 - Chrome profile = активная Max-сессия (хранить как пароль)
 
 ---
@@ -460,9 +462,9 @@ max-in-tg/
 
 Распространяется под лицензией **MIT** — см. файл [LICENSE](LICENSE).
 
-Сборка Docker-образа подтягивает сторонние компоненты под другими лицензиями (ffmpeg,
-libvips) — см. [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Образ рассчитан на
-локальную сборку у себя на сервере, а не на распространение.
+Docker-образ содержит сторонние компоненты под другими лицензиями (ffmpeg из Debian — GPL,
+libvips — LGPL): что из этого следует и где их лицензионные тексты и исходный код —
+в [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 ## Дисклеймер
 

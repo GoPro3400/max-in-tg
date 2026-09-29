@@ -55,7 +55,34 @@ feat/<short-change-name>
 5. Обновлять `CHANGELOG.md` (раздел `[Unreleased]`)
 
 `.github/workflows/ci.yml` прогоняет `npm test` на каждом PR — запусти `npx vitest run`
-локально перед отправкой.
+локально перед отправкой. Если PR меняет `Dockerfile`, `.dockerignore`, зависимости или
+скрипт запуска, `.github/workflows/image.yml` ещё и собирает образ (для amd64 и arm64) и
+проверяет его через `scripts/smoke-image.sh`.
+
+### Как выходит релиз
+
+Версии — `MAJOR.MINOR.PATCH`. Пока `0.x`: новая возможность или заметное изменение
+поведения — `MINOR`, исправление — `PATCH`. Релиз — это тег `vX.Y.Z` на коммите в `main`;
+остальное делает `.github/workflows/image.yml`.
+
+1. Отдельным PR «Релиз X.Y.Z»:
+   - `npm version X.Y.Z --no-git-tag-version` — меняет `package.json` и `package-lock.json`;
+   - в `CHANGELOG.md` раздел `[Unreleased]` становится `[X.Y.Z] - ГГГГ-ММ-ДД`, сверху
+     остаётся пустой `[Unreleased]`. Всё, что написано под заголовком версии до первого
+     `###`, станет текстом релиза на GitHub. Пиши там коротко и для тех, кто обновляется:
+     что нового, что проверить и — отдельной строкой — что нужно сделать руками (если нужно).
+2. После слияния — тег на `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Дальше автоматически: тесты, сборка образа для amd64 и arm64 с проверкой, публикация в
+   `ghcr.io/gopro3400/max-in-tg` (теги `X.Y.Z`, `X.Y` и `latest`) и страница релиза. Тег, у
+   которого версия не совпадает с `package.json`, который стоит не на `main` или для
+   которого нет раздела в `CHANGELOG.md`, workflow отклонит до сборки.
+4. После самого первого выпуска: GitHub создаёт пакет приватным. Один раз — профиль →
+   Packages → `max-in-tg` → Package settings → Change visibility → Public.
+
+Пользователи узнают о новой версии из бота (`UPDATE_CHECK`, раз в сутки) и обновляются
+командами `docker compose pull` и `docker compose up -d` — см. `docs/SETUP_GUIDE.md` §13.
+Если изменение требует от пользователя ручных действий при обновлении, напиши об этом в
+разделе `[Unreleased]` отдельной строкой «Что нужно сделать».
 
 ---
 

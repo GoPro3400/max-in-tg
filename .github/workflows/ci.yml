@@ -5,6 +5,8 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # The release workflow (image.yml) runs the tests first.
+  workflow_call:
 
 jobs:
   test:

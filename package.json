@@ -1,6 +1,6 @@
 {
   "name": "max-in-tg",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Two-way proxy between Max Messenger Web and Telegram Bot with media support.",
   "license": "MIT",
   "private": true,

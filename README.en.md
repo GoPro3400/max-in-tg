@@ -109,6 +109,7 @@ MAX Relay
 | **`/merge` / `/unmerge`** | Merge duplicate chats into one topic |
 | **Telegram-driven setup** | `/pair` instead of looking up your user id, MAX sign-in by QR right in the chat with the bot, relay group detected automatically when the bot is added |
 | **Docker** | `docker-compose.yml` (what the installer runs: memory cap, log rotation) plus the hardened `docker-compose.prod.yml`; the image ships a HEALTHCHECK, so `docker compose ps` shows `Up (healthy)` |
+| **Releases and updates** | A ready image of every release at `ghcr.io/gopro3400/max-in-tg` (amd64 and arm64): updating is `docker compose pull` and `docker compose up -d`. The bot tells you in Telegram about a new version (`UPDATE_CHECK`), and copies the database to `data/backups/` before the first start of a new version |
 | **Tests** | Unit and integration tests (vitest): messages, asyncLock, fileHelpers, networkCapture, config, database, mediaService, onboarding, and every delivery path over a real in-memory SQLite |
 
 ---
@@ -189,8 +190,8 @@ The bot runs entirely in Docker: the image is built from `node:22-bookworm-slim`
 | Debian (Bookworm), x86_64/amd64 | Tested in production |
 | Ubuntu | Should run the same way (Debian-based, highest confidence); host OS doesn't matter — the container is always Debian Bookworm |
 | Other Linux distros with Docker (Fedora, etc.) | Should run the same way |
-| arm64 CPU | Should work (the base image and the `chromium` apt package are available for arm64), but is **not yet verified** in practice |
-| RAM | **2 GB minimum** (`mem_limit: 2048m`, `shm_size: 1gb`). On 1 GB the build dies with `Killed` / `exit code: 137` — better-sqlite3 is compiled inside the container and Chromium runs there |
+| arm64 CPU | The ready image is built for arm64 too; before every release CI checks, under emulation, that Chromium, SQLite and image processing start. **Not yet verified** on a real arm64 server |
+| RAM | **2 GB minimum** (`mem_limit: 2048m`, `shm_size: 1gb`): Chromium runs there. The ready image is downloaded and nothing is built; if the image has to be built on the spot, on 1 GB the build dies with `Killed` / `exit code: 137` (better-sqlite3 is compiled) |
 | Disk | ~10 GB free, minimum, for the image and data |
 | Windows / macOS | Fine for development/testing via Docker Desktop; a Linux server is recommended for production (uptime, resources) |
 | Native install without Docker | Possible on Debian/Ubuntu (needs Node 22, Chromium, Xvfb, ffmpeg), but this is not the officially supported path |
@@ -210,8 +211,8 @@ are discovered at runtime and remembered in the bridge's own database (the `sett
 table), so a restart never asks again.
 
 Everything else it does for you: check Docker and Compose v2, write `.env` (the token is
-never echoed back to the terminal), prepare `data/ tmp/ logs/`, build the image and start
-the container. The bridge prints the pairing code from the next step into its log.
+never echoed back to the terminal), prepare `data/ tmp/ logs/`, download the ready image
+(build it if that fails) and start the container. The bridge prints the pairing code from the next step into its log.
 Re-running it is safe — an existing `.env` is never overwritten.
 
 ### Step 2: Claim the bot with `/pair`
@@ -320,6 +321,23 @@ Right after setup the group is empty — by design: on the first run all existin
 history is marked as seen, and topics appear as new messages arrive. `/sync` creates
 topics for every current chat.
 
+### Updating
+
+When a new version is out the bot tells you in Telegram: once a day it makes one request to
+`api.github.com` for the latest version number (nothing else is sent; `UPDATE_CHECK=false`
+in `.env` turns it off). Updating is two commands on the server, from the project folder:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+`.env`, `data/` and the MAX sign-in are kept; no `/pair` or QR again. Before the first start
+of a new version the bridge copies the database to `data/backups/` (the last three copies
+are kept). What is new: the [Releases](https://github.com/GoPro3400/max-in-tg/releases) page
+and [CHANGELOG.md](CHANGELOG.md). Pinning a version, rolling back and restoring the database:
+[SETUP_GUIDE §13](docs/SETUP_GUIDE.md) (Russian).
+
 > Full step-by-step guide: **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)**
 
 ---
@@ -372,7 +390,7 @@ topics for every current chat.
   `docker-compose.yml` (what the installer brings up) caps memory and rotates logs
 - The hardened `docker-compose.prod.yml` adds `no-new-privileges`, `cap_drop: ALL`, a
   read-only root fs, `pids_limit` and tmpfs `/tmp`; run it explicitly with
-  `docker compose -f docker-compose.prod.yml up -d --build`
+  `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d` (`up -d --build` builds the image yourself)
 
 ### Routing safety principles
 

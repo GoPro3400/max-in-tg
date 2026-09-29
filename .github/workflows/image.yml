@@ -1,0 +1,173 @@
+name: Image
+
+# The Docker image people run. A change that can affect it is built (for amd64
+# and, emulated, arm64) and smoke-tested here, so a broken image shows up in
+# the pull request. A version tag (v0.2.0) also publishes the image to GitHub's
+# container registry and creates the release page — see CONTRIBUTING.md.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - package.json
+      - package-lock.json
+      - scripts/start.sh
+      - scripts/smoke-image.sh
+      - .github/workflows/image.yml
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # A release is only made from code that passes the tests.
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: test
+    # `test` is skipped for a pull request, which must not skip this job too.
+    if: ${{ !cancelled() && needs.test.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write # the release page
+      packages: write # ghcr.io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the tag check below looks at main
+
+      - name: Name of the image
+        id: name
+        # ghcr.io wants it lower case (the account is GoPro3400).
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Check that the tag is a proper release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package_version=$(node -p "require('./package.json').version")
+          if [ "$package_version" != "$version" ]; then
+            echo "::error::The tag says $version, package.json says $package_version. Raise the version in a pull request first."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::The tag is not on main: releases are made from main."
+            exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section '## [$version]'."
+            exit 1
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build for amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: max-in-tg:smoke-amd64
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
+          provenance: false
+
+      - name: Smoke-test the amd64 image
+        run: |
+          expected=""
+          case "$GITHUB_REF" in refs/tags/v*) expected="${GITHUB_REF_NAME#v}" ;; esac
+          scripts/smoke-image.sh max-in-tg:smoke-amd64 linux/amd64 "$expected"
+
+      - name: Build for arm64 (emulated, so slow)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: max-in-tg:smoke-arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+          provenance: false
+
+      - name: Smoke-test the arm64 image
+        run: |
+          expected=""
+          case "$GITHUB_REF" in refs/tags/v*) expected="${GITHUB_REF_NAME#v}" ;; esac
+          scripts/smoke-image.sh max-in-tg:smoke-arm64 linux/arm64 "$expected"
+
+      - name: Log in to ghcr.io
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          # 0.2.0, 0.2 (the newest 0.2.x) and, for a release that is not a
+          # pre-release (no "-" in the tag), latest.
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Publish for amd64 and arm64
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # What the two builds above have just made.
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
+          provenance: false
+
+      - name: Release page
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.name.outputs.image }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The release's own text: what the changelog says about this version
+          # before its first "###" heading.
+          awk -v version="$version" '
+            /^## \[/ { if (found) exit; found = index($0, "[" version "]") > 0; next }
+            found && /^### / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no summary for $version (the text between its ## line and the first ### line)."
+            exit 1
+          fi
+          {
+            printf '\n---\n\n'
+            printf 'Полный список изменений: [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n\n' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+            printf 'Образ: `%s:%s` (amd64 и arm64).\n' "$IMAGE" "$version"
+          } >> notes.md
+          flags=()
+          case "$version" in *-*) flags+=(--prerelease) ;; esac
+          # Run again after a failure halfway, this edits the page instead of failing.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}"
+          fi

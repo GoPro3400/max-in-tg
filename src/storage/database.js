@@ -304,6 +304,17 @@ export class AppDatabase {
       LIMIT 1
     `);
 
+    // A media bubble on record under this fingerprint plus a media URL (see
+    // hasMediaBubbleWithPrefix).
+    this.hasMediaBubbleWithPrefixStmt = this.db.prepare(`
+      SELECT 1 FROM messages
+      WHERE chat_id = ?
+        AND direction = 'max_to_tg'
+        AND type != 'text'
+        AND source_message_id LIKE ? ESCAPE '\\'
+      LIMIT 1
+    `);
+
     this.recentMessagesStmt = this.db.prepare(`
       SELECT * FROM messages
       WHERE chat_id = ?
@@ -551,6 +562,16 @@ export class AppDatabase {
     // contains % or _ can't match unrelated rows.
     const escaped = prefix.replace(/[\\%_]/g, '\\$&');
     return Boolean(this.hasForwardedMediaCopyStmt.get(chatId, mediaHash, prefix, escaped + '|%', storedBefore));
+  }
+
+  // Whether the chat has a media message (photo, video, file...) whose
+  // fingerprint is `fingerprintPrefix` followed by its media URL — the bubble
+  // a text read of the same time and caption came from.
+  hasMediaBubbleWithPrefix(chatId, fingerprintPrefix) {
+    const prefix = String(fingerprintPrefix ?? '');
+    if (!chatId || !prefix) return false;
+    const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+    return Boolean(this.hasMediaBubbleWithPrefixStmt.get(chatId, escaped + '|%'));
   }
 
   // Returns the most recent stored message in a MAX chat whose text matches the

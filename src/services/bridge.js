@@ -1148,7 +1148,9 @@ export class BridgeService {
             readThrough = false;
             break;
           }
-          if (backlog.has(message.id) || this.isOldDuplicate(message, { byLegacyId: fullAdoption && index <= adoptUpTo })) {
+          if (backlog.has(message.id)
+            || this.isOldDuplicate(message, { byLegacyId: fullAdoption && index <= adoptUpTo })
+            || this.isTextReadingOfMediaBubble(message)) {
             this.db.insertMessage({ ...message, metadata: { ...message.metadata, primedAsBacklog: true } });
             continue;
           }
@@ -1633,6 +1635,21 @@ export class BridgeService {
       const first = this.db.getMessage(stableId('max', message.chatId, rawId.slice(0, match.index)));
       return Boolean(first && first.createdAt < this.duplicateIdsSince);
     });
+  }
+
+  // A photo (or a link's preview card) whose picture had not rendered when MAX
+  // Web was read is a text with the same time and caption: an id of its own,
+  // without the media URL, so it looks new although the bubble was delivered
+  // as media. The old ids (no time, no URL for a bubble read as text) joined
+  // both readings by accident, and after the update a bubble that flips
+  // between them arrives once more as text. Only while old ids count — a week
+  // from the chat's first read on the new ids — and never for a message whose
+  // delivery was already tried (as in adoptLegacyId).
+  isTextReadingOfMediaBubble(message) {
+    if (message.type !== MessageType.TEXT || !message.sourceMessageId || !message.metadata?.time) return false;
+    if (this.chatOnTimedIds(message.chatId) && !this.legacyWindowOpen(message.chatId)) return false;
+    if (this.pendingSeenCounts.has(message.id) || this.db.hasDelivery(message.id, 'max_to_tg')) return false;
+    return this.db.hasMediaBubbleWithPrefix(message.chatId, message.sourceMessageId);
   }
 
   // Old history MAX shows in a chat the database knows nothing about, on a

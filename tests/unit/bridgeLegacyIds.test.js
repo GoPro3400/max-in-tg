@@ -341,3 +341,70 @@ describe('photos on the first read after the update', () => {
     expect(telegramBot.sendMessage).toHaveBeenCalledTimes(1);
   });
 });
+
+// A photo (or a link's preview card) read before its picture rendered is a
+// text with the same time and caption — an id of its own, though it is the
+// bubble already delivered as media. The old ids joined both readings.
+describe('a text reading of a bubble delivered as media', () => {
+  const URL = 'https://i.oneme.ru/i?r=TOKEN&fn=w_1280';
+
+  const setup = ({ timedAgoMs = 60000 } = {}) => {
+    const made = makeBridge();
+    linkChat(made.db, CHAT);
+    made.db.setSetting(`timed_ids:${CHAT}`, String(Date.now() - timedAgoMs));
+    made.db.insertMessage({
+      ...maxMessage(stableId('max', CHAT, `15:00|Смотри|${URL}`), CHAT, { type: 'photo', text: 'Смотри', mediaUrl: URL, sourceMessageId: `15:00|Смотри|${URL}` }),
+      createdAt: Date.now() - 3600000,
+      telegramMessageId: 700
+    });
+    return made;
+  };
+
+  it('is recorded, not delivered again', async () => {
+    const { bridge, db, maxClient, telegramBot } = setup();
+    maxClient.readMessages.mockResolvedValue([bubble('15:00', 'Смотри')]);
+
+    await bridge.pollMax();
+
+    expect(telegramBot.sendMessage).not.toHaveBeenCalled();
+    expect(db.getMessage(stableId('max', CHAT, '15:00|Смотри')).metadata.primedAsBacklog).toBe(true);
+  });
+
+  it('is delivered when the media bubble is from another minute', async () => {
+    const { bridge, maxClient, telegramBot } = setup();
+    maxClient.readMessages.mockResolvedValue([bubble('15:01', 'Смотри')]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Смотри']);
+  });
+
+  it('is delivered when it only starts like a media caption', async () => {
+    const { bridge, maxClient, telegramBot } = setup();
+    maxClient.readMessages.mockResolvedValue([bubble('15:00', 'Смотри')].map((m) => ({ ...m, sourceMessageId: '15:00|Смотр', id: stableId('max', CHAT, '15:00|Смотр'), text: 'Смотр' })));
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Смотр']);
+  });
+
+  it('is delivered once old ids no longer count', async () => {
+    const { bridge, maxClient, telegramBot } = setup({ timedAgoMs: 8 * 24 * 3600 * 1000 });
+    maxClient.readMessages.mockResolvedValue([bubble('15:00', 'Смотри')]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Смотри']);
+  });
+
+  it('is delivered when its delivery was already tried', async () => {
+    const { bridge, db, maxClient, telegramBot } = setup();
+    const retry = bubble('15:00', 'Смотри');
+    db.updateDeliveryStatus(db.createDelivery(retry.id, 'max_to_tg'), 'failed', 'Telegram was down');
+    maxClient.readMessages.mockResolvedValue([retry]);
+
+    await bridge.pollMax();
+
+    expect(sentTexts(telegramBot)).toEqual(['Смотри']);
+  });
+});

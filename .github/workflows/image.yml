@@ -1,0 +1,207 @@
+name: Image
+
+# The Docker image people run. A change that can affect it is built (for amd64
+# and, emulated, arm64) and smoke-tested here, so a broken image shows up in
+# the pull request. A version tag (v0.2.0) also publishes the image to GitHub's
+# container registry and, once anyone can pull it, creates the release page —
+# see CONTRIBUTING.md.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - package.json
+      - package-lock.json
+      - scripts/start.sh
+      - scripts/smoke-image.sh
+      - scripts/smoke-media.mjs
+      # What smoke-media.mjs runs: a change to how ffmpeg is called meets the
+      # image's ffmpeg here, not only at release time.
+      - src/services/mediaService.js
+      - .github/workflows/image.yml
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # A release is only made from code that passes the tests.
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: test
+    # `test` is skipped for a pull request, which must not skip this job too.
+    if: ${{ !cancelled() && needs.test.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write # ghcr.io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the tag check below looks at main
+
+      - name: Name of the image
+        id: name
+        # ghcr.io wants it lower case (the account is GoPro3400).
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # Before anything is built: a tag that cannot become a release stops here.
+      - name: Check that the tag is a proper release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package_version=$(node -p "require('./package.json').version")
+          if [ "$package_version" != "$version" ]; then
+            echo "::error::The tag says $version, package.json says $package_version. Raise the version in a pull request first."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::The tag is not on main: releases are made from main."
+            exit 1
+          fi
+          if ! problem=$(scripts/release-notes.sh "$version" 2>&1 > /dev/null); then
+            echo "::error::$problem"
+            exit 1
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # The layer cache only saves time: a problem with it must not fail a build
+      # (ignore-error on cache-to).
+      - name: Build for amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: max-in-tg:smoke-amd64
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64,ignore-error=true
+          provenance: false
+
+      - name: Smoke-test the amd64 image
+        run: |
+          expected=""
+          case "$GITHUB_REF" in refs/tags/v*) expected="${GITHUB_REF_NAME#v}" ;; esac
+          scripts/smoke-image.sh max-in-tg:smoke-amd64 linux/amd64 "$expected"
+
+      - name: Build for arm64 (emulated, so slow)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: max-in-tg:smoke-arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64,ignore-error=true
+          provenance: false
+
+      - name: Smoke-test the arm64 image
+        run: |
+          expected=""
+          case "$GITHUB_REF" in refs/tags/v*) expected="${GITHUB_REF_NAME#v}" ;; esac
+          scripts/smoke-image.sh max-in-tg:smoke-arm64 linux/arm64 "$expected"
+
+      - name: Log in to ghcr.io
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          # 0.2.0, 0.2 (the newest 0.2.x) and, for a release that is not a
+          # pre-release (no "-" in the tag), latest.
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Publish for amd64 and arm64
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # What the two builds above have just made.
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
+          provenance: false
+
+  # The release page is what the bot's update notice looks for: from the moment
+  # it exists, every running bridge tells its owner to `docker compose pull`. So
+  # it is made only once that works for someone who is not logged in — a package
+  # that has just been published is private until its owner makes it public (once,
+  # in the GitHub web interface; there is no way to do it from a workflow). It is
+  # a job of its own so that, after that, "Re-run failed jobs" repeats only this
+  # and not the hour of building.
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # the release page
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that anyone can pull the image
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="${GITHUB_REPOSITORY,,}"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json'
+          # No login: this is what `docker compose pull` on a user's server is.
+          for _ in 1 2 3; do
+            if token=$(curl -fsS "https://ghcr.io/token?scope=repository:$name:pull" | jq -er .token) \
+              && curl -fsS -o /dev/null -H "Authorization: Bearer $token" -H "Accept: $accept" "https://ghcr.io/v2/$name/manifests/$version"; then
+              echo "ghcr.io/$name:$version can be pulled without logging in."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::ghcr.io/$name:$version cannot be pulled without logging in: the package is private. Make it public once — GitHub, your profile, Packages, the package, Package settings, Change visibility, Public — and then run this job again (Re-run failed jobs). The release page waits for that, because the bot tells its users to update as soon as the page exists."
+          exit 1
+
+      - name: Release page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          # The release's own text: what the changelog says about this version
+          # before its first "###" heading.
+          scripts/release-notes.sh "$version" > notes.md
+          {
+            printf '\n---\n\n'
+            printf 'Полный список изменений: [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n\n' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+            # shellcheck disable=SC2016 # the backticks are markdown, not a command
+            printf 'Образ: `%s:%s` (amd64 и arm64).\n' "$image" "$version"
+          } >> notes.md
+          flags=()
+          case "$version" in *-*) flags+=(--prerelease) ;; esac
+          # Run again after a failure halfway, this edits the page instead of failing.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}"
+          fi

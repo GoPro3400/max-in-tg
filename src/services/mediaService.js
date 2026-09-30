@@ -14,11 +14,12 @@ import sharp from 'sharp';
 import { logger } from '../logger.js';
 import { replaceExtension, safeDisplayName, safeName } from '../utils/fileHelpers.js';
 
-// FFMPEG_PATH wins over the bundled binary. Two reasons to use it: a distro
-// ffmpeg is often better optimised for the host, and — the licensing one —
-// ffmpeg-static ships a GPL-3.0 build, so anyone who wants to REDISTRIBUTE a
-// built image without taking on GPL obligations can drop that dependency and
-// point here instead (see THIRD_PARTY_LICENSES.md).
+// Which ffmpeg runs: FFMPEG_PATH when it is set, otherwise the path that
+// ffmpeg-static gives. In the Docker image that is Debian's /usr/bin/ffmpeg:
+// the Dockerfile sets FFMPEG_BIN, which ffmpeg-static returns as it is, and it
+// then downloads no build of its own. Anywhere else it is that download, made
+// when the packages are installed. See THIRD_PARTY_LICENSES.md for why the
+// image does not carry it.
 const resolvedFfmpegPath = process.env.FFMPEG_PATH || ffmpegPath;
 if (resolvedFfmpegPath) {
   ffmpeg.setFfmpegPath(resolvedFfmpegPath);
@@ -443,7 +444,7 @@ export const redactUrl = (url) => {
 // that would have the converter read local files or reach internal hosts.
 // Real media never starts like that; the protocol whitelist is the second
 // line of defence.
-const LOCAL_FILES_ONLY = ['-protocol_whitelist', 'file'];
+export const LOCAL_FILES_ONLY = ['-protocol_whitelist', 'file'];
 
 export const assertPlainMedia = async (filePath) => {
   const handle = await fsp.open(filePath, 'r');

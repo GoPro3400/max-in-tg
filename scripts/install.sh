@@ -4,8 +4,9 @@
 #   sh scripts/install.sh        (run from the repository root)
 #
 # Checks Docker, creates .env (asking only for the Telegram bot token), prepares
-# the bind-mounted directories, builds and starts the container, then waits for
-# the pairing code and prints what to do next.
+# the bind-mounted directories, gets the image (the ready one is downloaded; it
+# is built here only when that is not possible) and starts the container, then
+# waits for the pairing code and prints what to do next.
 #
 # Safe to re-run: an existing .env is never overwritten, directories are only
 # created if missing, and the bot token is never printed back to the terminal.
@@ -267,16 +268,24 @@ fi
 if [ "$OWNERSHIP_OK" = 1 ]; then
   info "data/ tmp/ logs/ owned by uid $CONTAINER_UID"
 else
-  info "cannot chown directly - will do it through docker after the build"
+  info "cannot chown directly - will do it through docker once the image is there"
 fi
 
 # ------------------------------------------------------- 5. Build and start --
-step 'Building the image and starting the container (first build takes minutes)'
+step 'Getting the image and starting the container'
 
-if ! docker compose build; then
-  die \
-    'docker compose build failed - the reason is in the output above.' \
-    'Usual suspects: no disk space, or no network access for apt/npm.'
+# The ready image of the latest release is downloaded (a minute or so). Only
+# when that is not possible - nothing published yet, a fork, no route to
+# ghcr.io, a CPU it is not built for - is it built here, which takes minutes.
+if docker compose pull; then
+  info 'downloaded the ready image'
+else
+  warn 'could not download the ready image (the reason is above) - building it here instead, this takes minutes'
+  if ! docker compose build; then
+    die \
+      'docker compose build failed - the reason is in the output above.' \
+      'Usual suspects: no disk space, or no network access for apt/npm.'
+  fi
 fi
 
 if [ "$OWNERSHIP_OK" != 1 ]; then

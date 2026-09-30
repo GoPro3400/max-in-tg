@@ -140,8 +140,8 @@ MAX Relay
 | Telegram | Telegraf 4.x |
 | Browser automation | Puppeteer 24 + stealth plugin (его задача — не дать веб-клиенту MAX распознать автоматизацию) |
 | Database | better-sqlite3 |
-| Media processing | ffmpeg-static, fluent-ffmpeg, sharp |
-| Process manager | Docker Compose |
+| Media processing | ffmpeg (в образе — пакет Debian, без Docker — `ffmpeg-static`), fluent-ffmpeg, sharp |
+| Process manager | Docker Compose; готовый образ каждого релиза — `ghcr.io/gopro3400/max-in-tg` |
 | Testing | Vitest |
 | Logging | Pino + pino-pretty |
 
@@ -174,8 +174,8 @@ MAX Relay
 | Docker Engine + Docker Compose v2 | **Единственное обязательное требование** |
 | Debian (Bookworm), x86_64/amd64 | Протестировано в production |
 | Ubuntu и другие Linux-дистрибутивы с Docker | Должны работать так же (хост-агностично, образ внутри всегда Debian Bookworm) |
-| arm64 (CPU) | Должно работать (базовый образ и `chromium` доступны для arm64), но пока не проверено на практике |
-| RAM | **Минимум 2 ГБ** (`mem_limit: 2048m`, `shm_size: 1gb`). На 1 ГБ сборка падает с `Killed` / `exit code: 137`: в контейнере компилируется better-sqlite3 и работает Chromium |
+| arm64 (CPU) | Готовый образ собирается и для arm64; перед каждым релизом в CI под эмуляцией проверяется, что Chromium, SQLite и обработка картинок запускаются. На живом arm64-сервере пока не проверялось. Для 32-разрядного ARM (armv7) готового образа нет — образ собирается на месте: `git pull && docker compose up -d --build` |
+| RAM | **Минимум 2 ГБ** (`mem_limit: 2048m`, `shm_size: 1gb`): работает Chromium. Готовый образ скачивается, собирать ничего не нужно; если образ приходится собирать на месте, на 1 ГБ сборка падает с `Killed` / `exit code: 137` (компилируется better-sqlite3) |
 | Диск | Минимум ~10 ГБ свободных под образ и данные |
 | Windows / macOS | Подходят для разработки/тестов через Docker Desktop; для продакшена рекомендуется Linux-сервер |
 | Без Docker (нативная установка) | Технически возможна на Debian/Ubuntu (Node 22, Chromium, Xvfb, ffmpeg), но это неофициальный путь — поддерживается только через Docker |
@@ -190,8 +190,9 @@ sh scripts/install.sh
 
 Установщик спросит токен бота (создай бота в [@BotFather](https://t.me/BotFather) через
 `/newbot`) — это единственное значение, которое нужно ввести. Дальше он всё сделает сам:
-проверит Docker, запишет `.env`, соберёт образ и поднимет контейнер. Код привязки из
-следующего шага мост печатает в логи. Всё остальное он выясняет сам и запоминает в базе.
+проверит Docker, запишет `.env`, скачает готовый образ (если скачать не выйдет — соберёт сам)
+и поднимет контейнер. Код привязки из следующего шага мост печатает в логи. Всё остальное он
+выясняет сам и запоминает в базе.
 
 ### 2. Привязать бота к себе — `/pair`
 
@@ -285,6 +286,24 @@ QR-код тебе в личку. Сканировать надо камерой
 Сразу после настройки группа будет пустой — так и задумано: при первом запуске вся
 существующая переписка MAX помечается прочитанной, а темы создаются по мере прихода
 новых сообщений. `/sync` создаст темы для всех текущих чатов.
+
+### Обновление
+
+Когда выходит новая версия, бот сам напишет об этом в Telegram (раз в сутки он спрашивает
+у GitHub номер последней версии; `UPDATE_CHECK=false` в `.env` отключает). Обновление —
+одна строка на сервере, из каталога проекта:
+
+```bash
+docker compose pull && docker compose up -d --no-build
+```
+
+Если образ не скачался, `--no-build` не даст `up` тихо собрать старый код из каталога: команда
+остановится с ошибкой, а мост продолжит работать на прежней версии.
+
+`.env`, `data/` и вход в MAX сохраняются, `/pair` и QR заново не нужны. Перед первым
+запуском новой версии мост сам копирует базу в `data/backups/` (три последние копии). Что
+нового — на странице [Releases](https://github.com/GoPro3400/max-in-tg/releases) и в
+[CHANGELOG.md](CHANGELOG.md). Откат и подробности — [SETUP_GUIDE §13](docs/SETUP_GUIDE.md).
 
 > Подробная пошаговая инструкция: [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)
 
@@ -434,7 +453,7 @@ max-in-tg/
 - Контейнер работает под non-root uid 10001 в обеих конфигурациях; `docker-compose.yml`
   (его поднимает установщик) ограничивает память и ротирует логи, а hardened-конфиг
   `docker-compose.prod.yml` добавляет `no-new-privileges`, `cap_drop: ALL`, read-only
-  root fs и `pids_limit` — запускается отдельно: `docker compose -f docker-compose.prod.yml up -d --build`
+  root fs и `pids_limit` — запускается отдельно: `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d --no-build` (`up -d --build` — собрать образ самому)
 - Chrome profile = активная Max-сессия (хранить как пароль)
 
 ---
@@ -443,9 +462,9 @@ max-in-tg/
 
 Распространяется под лицензией **MIT** — см. файл [LICENSE](LICENSE).
 
-Сборка Docker-образа подтягивает сторонние компоненты под другими лицензиями (ffmpeg,
-libvips) — см. [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Образ рассчитан на
-локальную сборку у себя на сервере, а не на распространение.
+Docker-образ содержит сторонние компоненты под другими лицензиями (ffmpeg из Debian — GPL,
+libvips — LGPL): что из этого следует и где их лицензионные тексты и исходный код —
+в [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 ## Дисклеймер
 

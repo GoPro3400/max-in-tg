@@ -171,4 +171,40 @@ describe('config helpers', () => {
       expect(configWarnings).toEqual([]);
     });
   });
+
+  describe('update notice settings', () => {
+    it('is on by default, for GoPro3400/max-in-tg, with no version pinned', async () => {
+      delete process.env.UPDATE_CHECK;
+      delete process.env.UPDATE_CHECK_REPO;
+      delete process.env.MAX_IN_TG_VERSION;
+      const { config, configWarnings } = await import('../../src/config.js?' + Date.now() + 'u1');
+      expect(config.updateCheck).toBe(true);
+      expect(config.updateCheckRepo).toBe('GoPro3400/max-in-tg');
+      expect(config.pinnedVersion).toBe('');
+      expect(configWarnings).toEqual([]);
+    });
+
+    it('can be turned off, and pointed at a fork', async () => {
+      process.env.UPDATE_CHECK = 'false';
+      process.env.UPDATE_CHECK_REPO = ' someone/max-in-tg-fork ';
+      const { config } = await import('../../src/config.js?' + Date.now() + 'u2');
+      expect(config.updateCheck).toBe(false);
+      expect(config.updateCheckRepo).toBe('someone/max-in-tg-fork');
+    });
+
+    it('keeps the default repository for one that is not owner/name, and says so', async () => {
+      for (const [index, bad] of ['just-a-name', 'a/b/c', 'https://github.com/a/b', 'a/b; rm -rf /'].entries()) {
+        process.env.UPDATE_CHECK_REPO = bad;
+        const { config, configWarnings } = await import('../../src/config.js?' + Date.now() + 'u3' + index);
+        expect(config.updateCheckRepo).toBe('GoPro3400/max-in-tg');
+        expect(configWarnings.some((warning) => warning.startsWith('UPDATE_CHECK_REPO='))).toBe(true);
+      }
+    });
+
+    it('reads the version the image is pinned to', async () => {
+      process.env.MAX_IN_TG_VERSION = ' 0.2.0 ';
+      const { config } = await import('../../src/config.js?' + Date.now() + 'u4');
+      expect(config.pinnedVersion).toBe('0.2.0');
+    });
+  });
 });

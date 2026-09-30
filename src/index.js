@@ -6,13 +6,15 @@ import { TelegramBotAdapter } from './adapters/telegramBot.js';
 import { AppDatabase } from './storage/database.js';
 import { MediaService } from './services/mediaService.js';
 import { BridgeService } from './services/bridge.js';
+import { APP_VERSION } from './version.js';
 
 for (const warning of configWarnings) logger.warn(`Configuration: ${warning}`);
 
 fs.mkdirSync(config.mediaDir, { recursive: true });
 fs.mkdirSync(config.diagnosticDir, { recursive: true });
 
-const db = new AppDatabase(config.sqlitePath);
+logger.info({ version: APP_VERSION }, 'Starting max-in-tg');
+const db = new AppDatabase(config.sqlitePath, { appVersion: APP_VERSION, logger });
 const mediaService = new MediaService(config.mediaDir);
 const maxClient = new MaxWebClient(config.max, {
   diagnosticDir: config.diagnosticDir,

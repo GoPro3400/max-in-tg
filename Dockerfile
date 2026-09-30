@@ -9,6 +9,7 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
     chromium \
+    ffmpeg \
     g++ \
     fonts-liberation \
     libasound2 \
@@ -31,6 +32,18 @@ RUN apt-get update \
     xdg-utils \
     xvfb \
   && rm -rf /var/lib/apt/lists/*
+
+# ffmpeg is Debian's package (above), not the build that the ffmpeg-static npm
+# package downloads during `npm ci`: that is a GPL static binary from a third
+# party's site, which nothing here would ever update (ffmpeg reads media that
+# strangers send), and which a published image would carry without its licence
+# text or source. Debian's package brings its licence texts
+# (/usr/share/doc/ffmpeg/copyright), its source (`apt-get source ffmpeg`) and
+# its security fixes whenever the image is rebuilt (at each release).
+# FFMPEG_BIN makes ffmpeg-static use it and skip the download; it stays set at
+# run time, which is how the bridge finds ffmpeg. scripts/smoke-media.mjs checks
+# that the conversions work with it.
+ENV FFMPEG_BIN=/usr/bin/ffmpeg
 
 COPY package*.json ./
 # npm ci = reproducible install pinned by package-lock.json (fails loudly if

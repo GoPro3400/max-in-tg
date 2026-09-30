@@ -1,5 +1,10 @@
 services:
   max-in-tg:
+    # As in docker-compose.yml: the ready image of a release, built here when
+    # there is none to fetch. Update with `docker compose -f
+    # docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml
+    # up -d --no-build`.
+    image: ghcr.io/gopro3400/max-in-tg:${MAX_IN_TG_VERSION:-latest}
     build:
       context: .
       dockerfile: Dockerfile

@@ -5,6 +5,8 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # The release workflow (image.yml) runs the tests first.
+  workflow_call:
 
 jobs:
   test:
@@ -37,3 +39,18 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      # The compose files are what people run. They must be valid, and must use
+      # the image the release workflow publishes: a fork that publishes its own
+      # has to change them, or its users would run this project's image.
+      - name: Check the compose files
+        run: |
+          cp .env.example .env
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          for file in docker-compose.yml docker-compose.prod.yml; do
+            docker compose -f "$file" config --quiet
+            if ! grep -q "image: $image:" "$file"; then
+              echo "::error file=$file::$file does not use the image $image, which the release workflow publishes."
+              exit 1
+            fi
+          done

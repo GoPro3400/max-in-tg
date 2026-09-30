@@ -5,7 +5,9 @@ import { MessageType, humanMessage, stableId } from '../domain/messages.js';
 import { reactionCandidates, toTelegramReaction } from '../domain/reactions.js';
 import { logger } from '../logger.js';
 import { listFilesByMtime } from '../utils/fileHelpers.js';
+import { APP_VERSION } from '../version.js';
 import { AsyncLock } from './asyncLock.js';
+import { UpdateChecker } from './updateCheck.js';
 
 // Extracts the stable CDN identity token from a MAX media URL
 // (e.g. https://i.oneme.ru/i?r=<TOKEN>&fn=w_1280 -> "<TOKEN>"). The same token
@@ -342,6 +344,39 @@ export class BridgeService {
     // Reaction problems already reported to the owner (reason → when), so a
     // run of reactions does not turn into a run of warnings.
     this.reactionNoticeAt = new Map();
+    // Tells the owner, once, when a newer release is out. Off unless the
+    // configuration turns it on (the real one does, by default).
+    this.updateChecker = new UpdateChecker({
+      db: this.db,
+      notify: (text) => this.notifyUpdate(text),
+      currentVersion: APP_VERSION,
+      repo: this.config.updateCheckRepo,
+      enabled: this.config.updateCheck === true,
+      pinnedVersion: this.config.pinnedVersion
+    });
+  }
+
+  // The copy of the database that is made before an upgrade could not be made
+  // (AppDatabase.backupBeforeUpgrade): the bridge went on without one, and the
+  // owner should know — it is in the log, which nobody reads. Once.
+  async reportBackupProblem() {
+    const problem = this.db.backupProblem;
+    if (!problem) return;
+    this.db.backupProblem = null;
+    await this.notifyOwner(
+      `⚠️ Перед обновлением не удалось сделать копию базы: ${problem}.\n`
+      + 'Мост запущен и работает, но вернуть базу «как до обновления» не получится. '
+      + 'Освободи место на диске или проверь права на папку data/ и, если нужно, сделай бэкап вручную (SETUP_GUIDE §12).'
+    );
+  }
+
+  async notifyUpdate(text) {
+    try {
+      return Boolean(await this.telegramBot.sendOwnerText(text));
+    } catch (error) {
+      logger.warn({ err: error?.message || String(error) }, 'Failed to send the update notice to the owner');
+      return false;
+    }
   }
 
   async start() {
@@ -355,6 +390,7 @@ export class BridgeService {
     await this.telegramBot.start();
     logger.info('Telegram bot started');
     await this.ensureOwner();
+    await this.reportBackupProblem();
 
     logger.info('Starting Max Web client');
     await this.startMaxClient();
@@ -406,6 +442,7 @@ export class BridgeService {
 
     this.running = true;
     this.schedulePoll(0);
+    this.updateChecker.start();
     logger.info('Bridge started');
   }
 
@@ -413,6 +450,7 @@ export class BridgeService {
     this.running = false;
     this.stopping = true;
     if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.updateChecker.stop();
     this.telegramBot.stop(signal);
     // Drain in-flight browser work before tearing the browser down: during a
     // container restart a TG→MAX send can be mid-flight, and closing the page
@@ -2946,7 +2984,10 @@ export class BridgeService {
     const validMappings = mappings.filter((mapping) => mapping.telegramThreadId);
     const pendingMappings = mappings.length - validMappings.length;
     const typing = selected ? await this.maxLock.run(() => this.maxClient.isTyping()).catch(() => false) : false;
+    const update = this.updateChecker.available();
     return [
+      `Version: ${APP_VERSION}`,
+      update ? `Update available: ${update.version} — ${update.url}` : null,
       `Running: ${this.running ? 'yes' : 'no'}`,
       `Chats: ${chats.length}`,
       `Routes: ${validMappings.length}`,

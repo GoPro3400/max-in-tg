@@ -1,5 +1,14 @@
 services:
   max-in-tg:
+    # The ready image, made for every release: `docker compose pull` fetches it.
+    # `build: .` makes the same image from this folder where there is none to
+    # fetch (a fork, a commit that is not a release). MAX_IN_TG_VERSION in .env
+    # picks the version: latest (the default), an exact one (0.2.0) or 0.2 for
+    # the newest 0.2.x.
+    # Update with `docker compose pull && docker compose up -d --no-build`: after
+    # a failed pull a plain `up -d` would build the code in this folder and run it
+    # as the new version.
+    image: ghcr.io/gopro3400/max-in-tg:${MAX_IN_TG_VERSION:-latest}
     build: .
     restart: unless-stopped
     # Graceful shutdown drains in-flight browser work and closes Chromium
